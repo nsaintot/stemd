@@ -1,0 +1,3 @@
+[submodule "vendor/mlx-rs-stemd"]
+	path = vendor/mlx-rs-stemd
+	url = https://github.com/nsaintot/mlx-rs-stemd.git

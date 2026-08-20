@@ -1,0 +1,19 @@
+[package]
+name = "stemd-mlx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The demucs v4 graph on Apple's MLX, replacing the TorchScript trace that ran
+# on MPS through `tch`. Deliberately free of stemd-core, for now: this is a
+# model, and keeping it standalone means its tests need nothing but weights.
+[dependencies]
+mlx-rs = { version = "0.25", features = ["metal", "safetensors"] }
+# For the allocator controls in `memory`, which mlx-rs does not wrap and does
+# not re-export the sys crate for. Reached through the same [patch.crates-io]
+# as mlx-rs, so both halves of the stack stay on the vendored fork.
+mlx-sys = "0.2"
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

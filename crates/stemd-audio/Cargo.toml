@@ -1,0 +1,15 @@
+[package]
+name = "stemd-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Audio file decoding shared by the stemd server and client."
+
+# Deliberately no stemd-core dependency. Both entrypoints need to turn a file on
+# disk into planar float, but only one of them separates: keeping this crate free
+# of stemd-core is what lets the command-line client build without libtorch.
+[dependencies]
+anyhow.workspace = true
+symphonia = { version = "0.5", features = ["mp3", "flac", "aac", "isomp4"] }

@@ -1,0 +1,32 @@
+[package]
+name = "stemd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Stem separation pipeline: PCM in, stems out, demucs v4 on MLX."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Errors surfaced to HTTP callers need to name the bad input precisely.
+thiserror.workspace = true
+tracing.workspace = true
+# The model. mlx-rs is a direct dependency too because this crate marshals
+# audio into and out of its arrays.
+stemd-mlx = { path = "../stemd-mlx" }
+mlx-rs = { version = "0.25", features = ["metal", "safetensors"] }
+flacenc = { version = "0.5.1", default-features = false, features = ["log", "par"] }
+rubato = "5.0.0"
+mp3lame-encoder = "0.2.4"
+
+[dev-dependencies]
+# A decoder written by someone else, so the FLAC round-trip test cannot agree
+# with the encoder about a misreading of the format.
+claxon = "0.4.3"
+# Likewise for mp3: choosing an encoder quality level is a claim about what the
+# output sounds like, and that has to be measured through a decoder nobody here
+# wrote.
+symphonia = { version = "0.5", features = ["mp3"] }

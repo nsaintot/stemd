@@ -1,0 +1,41 @@
+# Build-time tooling only. stemd itself is Rust — see crates/.
+#
+# Nothing here ships and nothing here runs at serve time. The server has no
+# Python, no venv and no libtorch: it is one static binary against the system
+# frameworks. This environment exists for two jobs that happen off to the side.
+#
+# Reading PyTorch checkpoints. Published model weights are PyTorch files, and
+# stemd runs MLX, so adding a model means converting its tensors to safetensors
+# once. That conversion has to be able to open the original, which is what torch
+# is here for — not to run anything.
+#
+# Scoring. `tools/eval/benchmark.py` scores model choices against MUSDB, which
+# is how the numbers in docs/evaluation.md were derived rather than guessed.
+
+[project]
+name = "stemd-export-tools"
+version = "0.1.0"
+description = "Weight conversion and ground-truth benchmarks for stemd. Not part of the server."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=1.26",
+    # Only ever asked to load a checkpoint and hand over its tensors, so the
+    # version is no longer pinned to what a Rust crate links against — there is
+    # no longer a Rust crate that links against it.
+    "torch>=2.4",
+    "torchaudio",
+    # Source of the pretrained demucs weights, for comparing a conversion
+    # against the original.
+    "demucs>=4.0",
+]
+
+[project.optional-dependencies]
+# Ground-truth scoring for model and tuning decisions. Not needed to build or
+# run stemd -- only to re-derive the numbers in docs/evaluation.md.
+eval = [
+    "musdb>=0.4",
+]
+
+[tool.uv]
+# Not an installable package — just an environment for the scripts.
+package = false

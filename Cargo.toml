@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+# The vendored MLX fork is reached through [patch.crates-io] below, not as a
+# member. Cargo claims any crate inside the workspace directory unless told
+# otherwise, and without this the build stops to say they are not listed.
+exclude = ["vendor"]
+members = [
+    "crates/stemd-audio",
+    "crates/stemd-core",
+    "crates/stemd-mlx",
+    "crates/stemd-server",
+    "crates/stemd-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Stated so cargo says "requires rustc 1.85" rather than failing to parse the
+# edition. It is the edition's floor, not a tested one.
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nsaintot/stemd"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# MLX, forked to build off Apple silicon. `mlx-sys` 0.2.0 emits Apple-only link
+# directives and bundles an mlx-c with no CUDA backend and no x86 half type;
+# 0.25.3 and 0.2.0 are the newest published versions of either and neither has a
+# `cuda` feature, so there is nothing to upgrade to. See vendor/mlx-rs-stemd.
+#
+# A clone needs `--recurse-submodules`, or `git submodule update --init` after
+# the fact. Without it these paths do not exist and cargo says so plainly.
+[patch.crates-io]
+mlx-sys = { path = "vendor/mlx-rs-stemd/mlx-sys" }
+mlx-rs = { path = "vendor/mlx-rs-stemd/mlx-rs" }

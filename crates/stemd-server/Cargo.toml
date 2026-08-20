@@ -1,0 +1,65 @@
+[package]
+name = "stemd-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Host-side stem separation service: HTTP, mDNS discovery and a content-addressed stem cache."
+
+[dependencies]
+stemd-core = { path = "../stemd-core" }
+stemd-audio = { path = "../stemd-audio" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["full"] }
+tower-http = { version = "0.7.0", features = ["trace"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.6", features = ["derive"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+parking_lot = "0.12.5"
+thiserror.workspace = true
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
+if-addrs = "0.15.0"
+# First-run model fetch: HTTP plus a pinned digest.
+ureq = "3.4.0"
+sha2 = "0.10"
+# The per-platform cache and data directories. See `cache::default_dir`.
+dirs = "6"
+
+# winit is eframe's window layer and otherwise an implementation detail. It is
+# named here for a single call: asking for the X11 backend, which is the only
+# one of the three winit implements file drag and drop on. See `ui::run`.
+[target.'cfg(windows)'.build-dependencies]
+# Only reached when the host is Windows, which is where the icon is wanted and
+# the only place the resource compiler exists.
+winresource = "0.1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }
+
+# Unpacking NVIDIA's redistributable archives, which is the only zip this reads.
+# `default-features = false` keeps out bzip2, zstd, lzma and the encryption
+# support: these archives are deflate, and the rest is attack surface for a
+# format we only ever read from one host. Windows only, because CUDA is a
+# download only there. See `cuda`.
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# `default-features = false` above is what keeps wgpu and accesskit out, but it
+# also drops `x11` and `wayland`, and those are not extras — winit has no Linux
+# backend without one of them and stops the build with "the platform you're
+# compiling for is not supported". Both, because a session may be either, and
+# winit picks at run time. macOS and Windows have a single backend that is not
+# behind a feature, so this stays off their dependency graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.35.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+

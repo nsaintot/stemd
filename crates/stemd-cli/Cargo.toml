@@ -1,0 +1,23 @@
+[package]
+name = "stemd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Command-line client for a stemd server."
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.6.6", features = ["derive"] }
+flacenc = { version = "0.5.1", default-features = false, features = ["log", "par"] }
+hound = "3.5.1"
+mdns-sd = "0.20.3"
+serde.workspace = true
+serde_json.workspace = true
+# Decoding is shared with the server; separation is not. Deliberately no
+# stemd-core dependency: the client is HTTP plus audio I/O and learns stem names
+# from /v1/health rather than compiling them in. Depending on stemd-core would
+# drag in libtorch, which this crate never calls.
+stemd-audio = { path = "../stemd-audio" }
+ureq = "3.4.0"
