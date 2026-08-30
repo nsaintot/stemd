@@ -73,6 +73,14 @@ pub enum PcmError {
     UnknownFormat(String),
     #[error("payload of {len} bytes is not a whole number of {channels}-channel frames")]
     Ragged { len: usize, channels: usize },
+    /// Channels of unequal length. Every reader takes the frame count from the
+    /// first channel, so this is a panic waiting for whichever one gets there.
+    #[error("channel {channel} has {found} samples where channel 0 has {frames}")]
+    RaggedChannels {
+        channel: usize,
+        found: usize,
+        frames: usize,
+    },
     #[error("expected {expected} channels, got {got}")]
     ChannelCount { expected: usize, got: usize },
     /// A sample that is NaN or infinite. See [`Audio::peak`] for why this is an
@@ -93,8 +101,45 @@ pub struct Audio {
 }
 
 impl Audio {
+    /// For data whose geometry the caller already knows to be rectangular,
+    /// which is every internal producer: they build each channel from the same
+    /// frame count in the same loop.
+    ///
+    /// The assertion is not idle. `frames()` is the first channel's length and
+    /// the rest are indexed with it, so a shorter one is a panic rather than a
+    /// wrong answer, and it lands in whichever of the model, the resampler or
+    /// the encoder reaches it first. Untrusted data goes through
+    /// [`Self::checked`] instead.
     pub fn new(data: Vec<Vec<f32>>, sample_rate: u32) -> Self {
+        debug_assert!(
+            data.iter().all(|c| c.len() == data.first().map_or(0, Vec::len)),
+            "Audio::new was handed ragged channels: {:?}",
+            data.iter().map(Vec::len).collect::<Vec<_>>()
+        );
         Self { data, sample_rate }
+    }
+
+    /// The same, for data that came from outside: a decoder, a file, a client.
+    ///
+    /// Refused rather than trimmed to the shortest channel. A decode that
+    /// disagrees with itself about how long the track is has already gone wrong,
+    /// and quietly dropping the difference would hand the model a track missing
+    /// a piece nobody chose to lose.
+    pub fn checked(data: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, PcmError> {
+        let frames = data.first().map_or(0, Vec::len);
+        if let Some((channel, found)) = data
+            .iter()
+            .enumerate()
+            .map(|(c, samples)| (c, samples.len()))
+            .find(|(_, len)| *len != frames)
+        {
+            return Err(PcmError::RaggedChannels {
+                channel,
+                found,
+                frames,
+            });
+        }
+        Ok(Self { data, sample_rate })
     }
 
     pub fn channels(&self) -> usize {
@@ -214,6 +259,56 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rectangular data is what almost everything is, and it must not become an
+    /// error on the way in.
+    #[test]
+    fn checked_accepts_rectangular_channels() {
+        let audio = Audio::checked(vec![vec![0.0, 0.5], vec![0.25, -0.25]], 44100)
+            .expect("equal channels are not ragged");
+        assert_eq!(audio.frames(), 2);
+        assert_eq!(audio.channels(), 2);
+        // Nothing is a shape either, and the model refuses it by frame count
+        // rather than here.
+        assert!(Audio::checked(Vec::new(), 44100).is_ok());
+        assert!(Audio::checked(vec![Vec::new(), Vec::new()], 44100).is_ok());
+    }
+
+    /// The shape behind the first crash report against a release: channel 0 with
+    /// samples in it and channel 1 empty. `frames()` reads channel 0, so every
+    /// reader downstream indexes channel 1 at 0 and panics with "the len is 0
+    /// but the index is 0". It has to be an error here, where the file can be
+    /// named, not a panic three crates later.
+    #[test]
+    fn checked_refuses_ragged_channels() {
+        let err = Audio::checked(vec![vec![0.1; 4096], Vec::new()], 44100)
+            .expect_err("an empty second channel is ragged");
+        assert!(matches!(
+            err,
+            PcmError::RaggedChannels {
+                channel: 1,
+                found: 0,
+                frames: 4096
+            }
+        ));
+        // The message names both lengths, because "ragged" alone does not tell
+        // anyone which channel came up short.
+        let text = err.to_string();
+        assert!(text.contains("channel 1"), "{text}");
+        assert!(text.contains("4096"), "{text}");
+
+        // A near miss is refused on the same terms as an empty one.
+        assert!(Audio::checked(vec![vec![0.1; 100], vec![0.1; 99]], 44100).is_err());
+    }
+
+    /// The reader that turned raggedness into a panic, held here so the
+    /// guarantee `checked` provides is the one the encoders rely on.
+    #[test]
+    fn a_rectangular_buffer_interleaves_every_frame() {
+        let audio = Audio::checked(vec![vec![0.0, 0.5], vec![0.25, -0.25]], 44100).unwrap();
+        let bytes = audio.to_interleaved(PcmFormat::F32le);
+        assert_eq!(bytes.len(), 2 * 2 * 4);
+    }
 
     #[test]
     fn interleaved_round_trip_f32() {

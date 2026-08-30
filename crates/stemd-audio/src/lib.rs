@@ -167,10 +167,7 @@ impl PlanarSink {
             .get_or_insert_with(|| SampleBuffer::<f32>::new(audio.capacity() as u64, spec));
         buffer.copy_interleaved_ref(audio);
 
-        let n = self.channels.len();
-        for (i, sample) in buffer.samples().iter().enumerate() {
-            self.channels[i % n].push(*sample);
-        }
+        spread(&mut self.channels, buffer.samples());
     }
 
     /// Fold to the stereo pair the model requires.
@@ -178,6 +175,23 @@ impl PlanarSink {
         let mut channels = self.channels;
         if channels.is_empty() || channels[0].is_empty() {
             bail!("decoded no audio from {label}");
+        }
+        // [`spread`] only ever writes whole frames, so this holds by
+        // construction. It is checked because everything downstream reads
+        // `frames()` off the first channel and indexes the rest with it, which
+        // turns any drift here into a panic several crates away rather than a
+        // decode that says what was wrong with the file.
+        let frames = channels[0].len();
+        if let Some((channel, found)) = channels
+            .iter()
+            .enumerate()
+            .map(|(c, samples)| (c, samples.len()))
+            .find(|(_, len)| *len != frames)
+        {
+            bail!(
+                "{label} decoded ragged: channel {channel} has {found} samples \
+                 where channel 0 has {frames}"
+            );
         }
 
         let data = match channels.len() {
@@ -194,6 +208,28 @@ impl PlanarSink {
             data,
             sample_rate: self.sample_rate,
         })
+    }
+}
+
+/// Deinterleave `samples` onto `channels`, round robin, whole frames only.
+///
+/// A packet carrying a partial frame is truncated rather than spread. Pushing
+/// the remainder would leave the earlier channels one sample longer than the
+/// rest, and since `frames()` is the first channel's length everywhere
+/// downstream, that one sample is the difference between a decode and an
+/// `index out of bounds` inside the model or the encoder.
+///
+/// No channels means nothing to spread onto, which is a file that declared none.
+/// `finish` reports it; the early return is here because `i % 0` would abort
+/// first.
+fn spread(channels: &mut [Vec<f32>], samples: &[f32]) {
+    let n = channels.len();
+    if n == 0 {
+        return;
+    }
+    let whole = samples.len() - samples.len() % n;
+    for (i, sample) in samples[..whole].iter().enumerate() {
+        channels[i % n].push(*sample);
     }
 }
 
@@ -242,7 +278,43 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::elst_media_time;
+    use super::{elst_media_time, spread};
+
+    /// The ordinary case: interleaved in, planar out, order preserved.
+    #[test]
+    fn whole_frames_are_spread_in_channel_order() {
+        let mut channels = vec![Vec::new(), Vec::new()];
+        spread(&mut channels, &[1.0, -1.0, 2.0, -2.0]);
+        assert_eq!(channels, vec![vec![1.0, 2.0], vec![-1.0, -2.0]]);
+    }
+
+    /// The bug this guards. A packet holding a partial frame used to push the
+    /// remainder anyway, leaving channel 0 one sample longer than channel 1.
+    /// `frames()` reads channel 0, so that sample became an out-of-bounds index
+    /// in the model or the encoder, a crate or two away from the cause.
+    #[test]
+    fn a_partial_frame_leaves_the_channels_the_same_length() {
+        for samples in 0..16usize {
+            for n in 1..5usize {
+                let mut channels = vec![Vec::new(); n];
+                let data: Vec<f32> = (0..samples).map(|i| i as f32).collect();
+                spread(&mut channels, &data);
+                let lengths: Vec<usize> = channels.iter().map(Vec::len).collect();
+                assert!(
+                    lengths.iter().all(|l| *l == lengths[0]),
+                    "{samples} samples over {n} channels left {lengths:?}"
+                );
+                assert_eq!(lengths[0], samples / n, "{samples} over {n} lost a frame");
+            }
+        }
+    }
+
+    /// A file declaring no channels is reported by `finish`, but only if this
+    /// returns rather than dividing by zero on the way there.
+    #[test]
+    fn no_channels_is_not_a_division_by_zero() {
+        spread(&mut [], &[1.0, 2.0]);
+    }
 
     /// version 0 box: 4 size + 4 type + 1 version + 3 flags + 4 count,
     /// then per entry 4 duration + 4 media_time + 4 rate.
