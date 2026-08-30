@@ -227,7 +227,12 @@ fn run(state: &Arc<AppState>, item: &Arc<Dropped>) -> Result<()> {
 /// way out is the same one.
 fn read(state: &AppState, path: &Path) -> Result<Audio> {
     let decoded = stemd_audio::decode(path)?;
-    let audio = Audio::new(decoded.data, decoded.sample_rate);
+    // The only mix in the server that is not built from a shape this process
+    // chose: the upload path lays its channels out from one frame count in
+    // `Audio::from_interleaved`, while this one is whatever came back off a
+    // file. See `Audio::checked`.
+    let audio = Audio::checked(decoded.data, decoded.sample_rate)
+        .with_context(|| format!("decoding {}", path.display()))?;
 
     let secs = audio.duration_secs();
     if secs > state.max_track_secs {
