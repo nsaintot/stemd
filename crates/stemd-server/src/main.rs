@@ -23,6 +23,7 @@ mod ident;
 mod jobs;
 mod logbuf;
 mod models;
+mod panics;
 mod precision;
 mod queue;
 mod serve;
@@ -45,6 +46,8 @@ fn main() -> Result<()> {
     adopt_parent_console();
     let args = cli::Args::from_process();
     let logs = init_logging();
+    // After the subscriber exists, or the first panic is reported to nothing.
+    panics::install();
     if args.install_cuda {
         return install_cuda();
     }
