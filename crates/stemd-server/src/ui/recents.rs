@@ -92,7 +92,12 @@ fn row(
     // shifts whenever the list above changes shape, and an id that changes
     // between frames cannot correlate a press with its release, which is
     // exactly a row that highlights on hover and does nothing when clicked.
-    let id = ui.id().with(("recent", &item.title));
+    //
+    // Keyed on the source path rather than the title: two different files can
+    // share a title (different folders, same name), and `title` alone would
+    // hand both rows the same id, colliding in exactly the way this comment
+    // warns about.
+    let id = ui.id().with(("recent", &item.source));
     let response = ui.interact(rect, id.with("row"), egui::Sense::click());
 
     // Registered after the row and overlapping it, so egui hands it the pointer
