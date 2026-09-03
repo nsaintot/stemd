@@ -404,21 +404,6 @@ impl Inner {
     }
 }
 
-/// What a caught panic said, as far as it can be recovered.
-///
-/// A payload is `Any`, and the two shapes `panic!` produces are the only ones
-/// worth naming. Anything else is a custom payload whose message, if it has
-/// one, is not reachable from here.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&'static str>() {
-        return (*text).to_owned();
-    }
-    if let Some(text) = payload.downcast_ref::<String>() {
-        return text.clone();
-    }
-    "no message".to_owned()
-}
-
 /// Take work until asked to stop.
 ///
 /// Nothing a separator does may end this loop. Both callees are caught, so a track
@@ -442,7 +427,7 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                     // `build_here` has already sent whatever it failed with.
                     Ok(None) => {}
                     Err(payload) => {
-                        let what = panic_message(&*payload);
+                        let what = crate::panics::message(&*payload);
                         tracing::error!(
                             "the model build panicked: {what}. Staying on {}",
                             separator.info().model
@@ -457,7 +442,7 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                     separate_one(separator.as_mut(), &claimed, cache)
                 }));
                 if let Err(payload) = separating {
-                    let what = panic_message(&*payload);
+                    let what = crate::panics::message(&*payload);
                     tracing::error!(job = %claimed.work.job.id, "the separation panicked: {what}");
                     // Terminal, so a client polling this job stops waiting for
                     // something that is never going to arrive.
