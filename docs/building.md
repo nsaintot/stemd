@@ -71,7 +71,7 @@ and then finds no execution plan for any graph at run time. Debian's own
 
 ```bash
 ./scripts/bundle-app.sh          # macOS: dist/stemd.app, about 29 MB
-./scripts/package-mac.sh         # macOS: a signed, notarized, stapled .dmg
+./scripts/bundle.sh              # macOS: a signed, notarized, stapled .dmg
 ./scripts/bundle-windows.ps1     # Windows: dist/stemd-windows
 ./scripts/package-windows.ps1    # Windows: an installer and a zip
 ./scripts/package-deb.sh         # Linux: a .deb
@@ -122,7 +122,7 @@ carries no weights.
 `bundle-app.sh` signs with the first Developer ID in the keychain, under the
 hardened runtime, and falls back to ad-hoc when there is none. Ad-hoc launches
 on the machine that built it and nowhere else, so it is for development only.
-`package-mac.sh` takes a Developer ID bundle the rest of the way: a disk image
+`bundle.sh` takes a Developer ID bundle the rest of the way: a disk image
 with a drag target, signed, notarized and stapled. Stapling is the step that is
 easy to skip and the one that decides whether a Mac offline at first launch has
 to ask Apple.
@@ -135,7 +135,7 @@ xcrun notarytool store-credentials stemd-notary \
     --apple-id <apple id> --team-id <team id>
 ```
 
-`STEMD_NOTARY_PROFILE` names a different one. Without a profile `package-mac.sh`
+`STEMD_NOTARY_PROFILE` names a different one. Without a profile `bundle.sh`
 still produces a signed image and stops with what is missing, so an unnotarized
 release takes a deliberate act.
 
