@@ -34,20 +34,20 @@ track bit for bit.
 
 | | |
 | --- | --- |
-| macOS | Apple silicon |
+| macOS | 14 or later, Apple silicon |
 | Windows | NVIDIA card and driver 580 or later, else CPU |
 | Linux | Debian 13 or Ubuntu 24.04, NVIDIA card, driver 580 or later |
 | disk | 168 MB to 942 MB of model weights, downloaded on first run |
 
 ## Install
 
-**macOS.** Open `stemd-0.1.0-macos-arm64.dmg` from the
-[releases page](https://github.com/nsaintot/stemd/releases) and drag stemd to
-Applications. Apple silicon. Signed and notarized, and the ticket is stapled to
-the app as well as to the image, so it opens without argument and the first
-launch does not need a network.
+**macOS.** Open the `macos-arm64` disk image from the
+[latest release](https://github.com/nsaintot/stemd/releases/latest) and drag
+stemd to Applications. Signed and notarized, and the ticket is stapled to the
+app as well as to the image, so it opens without argument and the first launch
+does not need a network.
 
-**Windows.** Run `stemd-0.1.0-setup.exe` from the same page. It installs for you
+**Windows.** Run the `setup.exe` from the same page. It installs for you
 alone by default and asks for no administrator; the first page offers all users
 instead. There is a zip beside it for anyone who would rather not run an
 installer.
@@ -57,14 +57,14 @@ On a machine with an NVIDIA card, tick the box at the end of the installer or ru
 once and pinned by digest. No toolkit and no repository. Without it stemd runs on
 the CPU, correctly and far slower.
 
-**Linux.** Take `stemd_0.1.0_amd64.deb` from the
-[releases page](https://github.com/nsaintot/stemd/releases). It wants the CUDA 13
-runtime and cuDNN 9.5 or later, both from
+**Linux.** Take the `amd64.deb` from the
+[latest release](https://github.com/nsaintot/stemd/releases/latest). It wants
+the CUDA 13 runtime and cuDNN 9.5 or later, both from
 [NVIDIA's own repositories](https://developer.download.nvidia.com/compute/cuda/repos/),
 so add those first.
 
 ```bash
-sudo apt install ./stemd_0.1.0_amd64.deb
+sudo apt install ./stemd_*_amd64.deb
 ```
 
 Debian 13 takes one more step. NVIDIA publish no cuDNN package for it yet, so
@@ -76,7 +76,7 @@ separation.
 ```bash
 echo /opt/cudnn13/lib | sudo tee /etc/ld.so.conf.d/cudnn.conf
 sudo ldconfig
-sudo dpkg -i --force-depends ./stemd_0.1.0_amd64.deb
+sudo dpkg -i --force-depends ./stemd_*_amd64.deb
 ```
 
 ## Use it

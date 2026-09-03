@@ -21,8 +21,30 @@ or later. MLX builds from source on the first `cargo build`.
 
 ## Per platform
 
-**macOS**, Apple silicon, Metal. The Xcode command line tools and
-`brew install cmake`. About four minutes, which is what those two are for.
+**macOS** 14 or later, Apple silicon, Metal. The Xcode command line tools,
+`brew install cmake`, and the Metal shader compiler. About four minutes, which
+is what those are for.
+
+`metal` is the one that catches people out. MLX compiles its kernels during the
+build, and the compiler no longer comes with the command line tools: it is a
+separate component installed under an Xcode, so a machine can carry Xcode and a
+current SDK and still not have it. `xcrun --find metal` says whether this one
+does, and
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+installs it if not. `scripts/bundle-app.sh` looks for it before building and
+says this if it cannot find one.
+
+The bundle is built against macOS 14 rather than against whatever SDK is to
+hand. That is not tidiness: MLX bakes its Metal shaders in at build time and
+does not compile them at runtime, so a floor taken from the build machine ships
+an artefact that launches on an older Mac and then fails the first time it
+wants the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
+`MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` are the two
+halves of saying it, and they have to agree.
 
 **Windows**, x86-64, CUDA or CPU. MSVC, the CUDA toolkit, cuDNN, and LLVM for
 `libclang`. Use `scripts/bundle-windows.ps1` rather than setting the

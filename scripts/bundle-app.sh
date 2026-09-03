@@ -26,8 +26,52 @@ if [ "${STEMD_LINK_MODELS:-0}" = "1" ] || [ "${STEMD_EMBED_MODELS:-0}" = "1" ]; 
   fi
 fi
 
-echo "building release binary..."
-cargo build --release -p stemd-server --manifest-path "$ROOT/Cargo.toml"
+# The oldest macOS this bundle claims to run on, and it has to be said out loud
+# in three places that must agree: here for the Rust side's `minos`, in
+# mlx-sys's build.rs for the Metal shaders, and in LSMinimumSystemVersion below.
+# Unset, each of them picks up the SDK of whatever machine ran this script, and
+# the result launches on an older Mac and then fails the first time it touches
+# the GPU. See MACOS_DEPLOYMENT_TARGET in vendor/mlx-rs-stemd/mlx-sys/build.rs.
+MACOS_MIN="14.0"
+
+# MLX compiles its Metal kernels at build time, so `metal` has to be reachable
+# or the build stops part way through with a compiler error per kernel.
+#
+# Found rather than named, because where it lives moved. It used to come with
+# the Command Line Tools; it is now a separate component installed under an
+# Xcode and mounted from a MobileAsset cryptex, so a machine can have Xcode, a
+# current SDK and no shader compiler at all. The selection in effect is tried
+# first, so anyone whose xcode-select already points at a full Xcode never
+# enters the loop and nothing here overrides a deliberate choice.
+ensure_metal() {
+  if xcrun --find metal >/dev/null 2>&1; then
+    return 0
+  fi
+  for candidate in /Applications/Xcode*.app/Contents/Developer; do
+    [ -d "$candidate" ] || continue
+    if DEVELOPER_DIR="$candidate" xcrun --find metal >/dev/null 2>&1; then
+      export DEVELOPER_DIR="$candidate"
+      echo "  metal: via $candidate"
+      return 0
+    fi
+  done
+  cat >&2 <<'NOMETAL'
+no Metal shader compiler found, and MLX cannot be built without one.
+
+`metal` no longer ships with the Command Line Tools. Install it under an Xcode:
+
+  xcodebuild -downloadComponent MetalToolchain
+
+then either point xcode-select at that Xcode or leave it under /Applications,
+where this script looks.
+NOMETAL
+  return 1
+}
+ensure_metal
+
+echo "building release binary (macOS $MACOS_MIN and up)..."
+MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN" \
+  cargo build --release -p stemd-server --manifest-path "$ROOT/Cargo.toml"
 
 echo "assembling $APP"
 rm -rf "$APP"
@@ -85,7 +129,7 @@ $ICON_PLIST
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
     <key>CFBundleVersion</key>               <string>$VERSION</string>
-    <key>LSMinimumSystemVersion</key>        <string>11.0</string>
+    <key>LSMinimumSystemVersion</key>        <string>$MACOS_MIN</string>
     <key>NSHighResolutionCapable</key>       <true/>
     <!-- Advertises _stemd._tcp and serves on the LAN. -->
     <key>NSLocalNetworkUsageDescription</key>
