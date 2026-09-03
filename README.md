@@ -34,7 +34,7 @@ track bit for bit.
 
 | | |
 | --- | --- |
-| macOS | Apple silicon |
+| macOS | 14 or later, Apple silicon |
 | Windows | NVIDIA card and driver 580 or later, else CPU |
 | Linux | Debian 13 or Ubuntu 24.04, NVIDIA card, driver 580 or later |
 | disk | 168 MB to 942 MB of model weights, downloaded on first run |
