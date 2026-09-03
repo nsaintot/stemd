@@ -26,8 +26,17 @@ if [ "${STEMD_LINK_MODELS:-0}" = "1" ] || [ "${STEMD_EMBED_MODELS:-0}" = "1" ]; 
   fi
 fi
 
-echo "building release binary..."
-cargo build --release -p stemd-server --manifest-path "$ROOT/Cargo.toml"
+# The oldest macOS this bundle claims to run on, and it has to be said out loud
+# in three places that must agree: here for the Rust side's `minos`, in
+# mlx-sys's build.rs for the Metal shaders, and in LSMinimumSystemVersion below.
+# Unset, each of them picks up the SDK of whatever machine ran this script, and
+# the result launches on an older Mac and then fails the first time it touches
+# the GPU. See MACOS_DEPLOYMENT_TARGET in vendor/mlx-rs-stemd/mlx-sys/build.rs.
+MACOS_MIN="14.0"
+
+echo "building release binary (macOS $MACOS_MIN and up)..."
+MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN" \
+  cargo build --release -p stemd-server --manifest-path "$ROOT/Cargo.toml"
 
 echo "assembling $APP"
 rm -rf "$APP"
@@ -85,7 +94,7 @@ $ICON_PLIST
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
     <key>CFBundleVersion</key>               <string>$VERSION</string>
-    <key>LSMinimumSystemVersion</key>        <string>11.0</string>
+    <key>LSMinimumSystemVersion</key>        <string>$MACOS_MIN</string>
     <key>NSHighResolutionCapable</key>       <true/>
     <!-- Advertises _stemd._tcp and serves on the LAN. -->
     <key>NSLocalNetworkUsageDescription</key>
