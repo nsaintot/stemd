@@ -114,6 +114,19 @@ pub struct Drops {
     recent: Mutex<Vec<Arc<Dropped>>>,
 }
 
+/// Put a fresh drop at the top of the list, replacing any row already there
+/// for the same source rather than duplicating it.
+///
+/// Dropping a track that is still in the list is a re-run, not a new entry:
+/// the old row is what the user just dragged again, so it moves to the top
+/// with the new run's state instead of sitting alongside a second copy of
+/// itself.
+fn remember(recent: &mut Vec<Arc<Dropped>>, dropped: Arc<Dropped>) {
+    recent.retain(|other| other.source != dropped.source);
+    recent.insert(0, dropped);
+    recent.truncate(REMEMBERED);
+}
+
 impl Drops {
     /// Take a file and start working on it. Returns the entry the window draws.
     ///
@@ -127,11 +140,7 @@ impl Drops {
             state: Mutex::new(State::Reading),
         });
 
-        {
-            let mut recent = self.recent.lock();
-            recent.insert(0, Arc::clone(&dropped));
-            recent.truncate(REMEMBERED);
-        }
+        remember(&mut self.recent.lock(), Arc::clone(&dropped));
 
         let state = Arc::clone(state);
         let started = Arc::clone(&dropped);
@@ -503,5 +512,32 @@ mod tests {
     #[test]
     fn a_file_with_no_parent_still_gets_a_folder() {
         assert_eq!(output_dir(Path::new("track.wav")), Path::new("track-stems"));
+    }
+
+    /// Re-dropping a track already in the list moves it to the top instead of
+    /// adding a second row for it; this is also what keeps two rows from ever
+    /// sharing the window's per-row egui id, which is derived from the source.
+    #[test]
+    fn re_dropping_a_track_replaces_its_row_instead_of_duplicating() {
+        let mut recent = Vec::new();
+        let other = finished_drop(Path::new("/b"));
+        remember(&mut recent, Arc::clone(&other));
+        let first_run = finished_drop(Path::new("/a"));
+        remember(&mut recent, Arc::clone(&first_run));
+        assert_eq!(recent.len(), 2);
+
+        let second_run = finished_drop(Path::new("/a"));
+        remember(&mut recent, Arc::clone(&second_run));
+
+        assert_eq!(
+            recent.len(),
+            2,
+            "dropping the same track again duplicated its row"
+        );
+        assert!(
+            Arc::ptr_eq(&recent[0], &second_run),
+            "the re-run did not move to the top"
+        );
+        assert!(Arc::ptr_eq(&recent[1], &other), "an unrelated row moved");
     }
 }
