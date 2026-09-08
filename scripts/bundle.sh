@@ -11,6 +11,24 @@ DIST="$ROOT/dist"
 APP="$DIST/stemd.app"
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 DMG="$DIST/stemd-$VERSION-macos-arm64.dmg"
+VOLNAME="stemd $VERSION"
+
+# The image's window is the artwork's. resources/stemd-dmg.png is the 2x
+# rendition of a 640 by 400 window with two placeholder squares drawn on it,
+# and the numbers below are where those squares are, as icon centres in
+# window points. Move a square in the artwork, move its number here.
+#
+# Finder's window bounds are the frame, title bar included, so the content
+# area only comes out the size of the artwork if the title bar is added on.
+BACKGROUND="$ROOT/resources/stemd-dmg.png"
+WINDOW_W=640
+WINDOW_H=400
+TITLE_BAR=28
+ICON_SIZE=100
+APP_X=149
+APP_Y=173
+APPS_X=491
+APPS_Y=173
 PROFILE="${STEMD_NOTARY_PROFILE:-stemd-notary}"
 
 say() { printf '  %s\n' "$*"; }
@@ -69,13 +87,87 @@ say "app stapled"
 
 echo "assembling $DMG"
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"
+MOUNT=""
+# An interrupted run must not leave the writable image mounted: the volume
+# would sit on the desktop and hold the stage directory open.
+cleanup() {
+  [ -n "$MOUNT" ] && [ -d "$MOUNT" ] && hdiutil detach "$MOUNT" -quiet -force || true
+  rm -rf "$STAGE"
+}
+trap cleanup EXIT
+VOL="$STAGE/vol"
+mkdir -p "$VOL/.background"
+cp -R "$APP" "$VOL/"
+ln -s /Applications "$VOL/Applications"
+
+# Finder picks the rendition for the screen out of a TIFF that carries both,
+# and the artwork is the 2x one, so the 1x is derived here rather than kept.
+sips -Z "$WINDOW_W" "$BACKGROUND" --out "$STAGE/background-1x.png" >/dev/null
+tiffutil -cathidpicheck "$STAGE/background-1x.png" "$BACKGROUND" \
+  -out "$VOL/.background/stemd.tiff" 2>/dev/null
+
+# Built writable, laid out, then compressed. The layout is a .DS_Store at the
+# root of the volume, and Finder is the only thing that writes one, so the
+# image is mounted and Finder is told what the window should look like.
+#
+# APFS rather than HFS+: on macOS 26 an HFS+ volume loses its .VolumeIcon.icns
+# and the custom-icon flag when it is unmounted, so the image would come out
+# with a plain disk icon. Every macOS the bundle runs on mounts APFS.
+RW="$STAGE/rw.dmg"
+hdiutil create -volname "$VOLNAME" -srcfolder "$VOL" -fs APFS -format UDRW \
+  -ov -quiet "$RW"
+MOUNT="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" \
+  | sed -n 's/.*\(\/Volumes\/.*\)$/\1/p')"
+[ -d "$MOUNT" ] || { echo "the writable image did not mount" >&2; exit 1; }
+
+osascript - "$VOLNAME" "$WINDOW_W" "$((WINDOW_H + TITLE_BAR))" "$ICON_SIZE" \
+  "$APP_X" "$APP_Y" "$APPS_X" "$APPS_Y" <<'LAYOUT'
+on run argv
+  set volname to item 1 of argv
+  set w to (item 2 of argv) as integer
+  set h to (item 3 of argv) as integer
+  set iconSize to (item 4 of argv) as integer
+  set appX to (item 5 of argv) as integer
+  set appY to (item 6 of argv) as integer
+  set appsX to (item 7 of argv) as integer
+  set appsY to (item 8 of argv) as integer
+  tell application "Finder"
+    tell disk volname
+      open
+      set current view of container window to icon view
+      set toolbar visible of container window to false
+      set statusbar visible of container window to false
+      set bounds of container window to {200, 120, 200 + w, 120 + h}
+      set opts to icon view options of container window
+      set arrangement of opts to not arranged
+      set icon size of opts to iconSize
+      set text size of opts to 12
+      set label position of opts to bottom
+      set background picture of opts to file ".background:stemd.tiff"
+      set position of item "stemd.app" of container window to {appX, appY}
+      set position of item "Applications" of container window to {appsX, appsY}
+      close
+      open
+      update without registering applications
+      delay 1
+      close
+    end tell
+  end tell
+end run
+LAYOUT
+
+# The mounted volume wears the app's icon on the desktop and in the sidebar.
+# After the layout, not before: Finder on macOS 26 deletes .VolumeIcon.icns
+# and clears the custom-icon flag when it writes the window's .DS_Store, and
+# an icon placed afterwards is left alone.
+cp "$APP/Contents/Resources/stemd.icns" "$MOUNT/.VolumeIcon.icns"
+SetFile -a C "$MOUNT"
+
+sync
+hdiutil detach "$MOUNT" -quiet
 
 rm -f "$DMG"
-hdiutil create -volname "stemd $VERSION" -srcfolder "$STAGE" \
-  -fs HFS+ -format UDZO -ov -quiet "$DMG"
+hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -quiet -o "$DMG"
 say "$(du -h "$DMG" | cut -f1)"
 
 # A ticket can only be stapled to something signed.
@@ -94,4 +186,3 @@ spctl -a -t open --context context:primary-signature -vv "$DMG"
 
 echo
 echo "done: $DMG"
-echo "  signed, notarized and stapled: opens on a Mac that has never seen this"

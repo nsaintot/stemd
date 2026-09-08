@@ -123,7 +123,12 @@ carries no weights.
 hardened runtime, and falls back to ad-hoc when there is none. Ad-hoc launches
 on the machine that built it and nowhere else, so it is for development only.
 `bundle.sh` takes a Developer ID bundle the rest of the way: a disk image
-with a drag target, signed, notarized and stapled. Stapling is the step that is
+with a drag target, signed, notarized and stapled. Its window is drawn by
+`resources/stemd-dmg.png`, the 2x rendition of a 640 by 400 window with two
+placeholder squares on it; the icon positions at the top of the script are
+those squares' centres in points, and follow the artwork if it moves them.
+The image is laid out by Finder itself on a writable copy, which is what
+writes a `.DS_Store`, and then compressed. Stapling is the step that is
 easy to skip and the one that decides whether a Mac offline at first launch has
 to ask Apple.
 
