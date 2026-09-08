@@ -6,10 +6,11 @@
 # in Contents/Resources for an offline install, which is also why --models
 # resolves relative to the exe.
 #
-# There is nothing to vendor. MLX links statically and its Metal shaders are
-# embedded in the binary, so the executable depends on system frameworks alone,
-# no Frameworks directory, no rpath surgery, no venv. It used to carry 223 MB of
-# libtorch dylibs that had to be signed inside-out before the bundle could be.
+# Almost nothing to vendor. MLX links statically, so the executable depends on
+# system frameworks alone: no Frameworks directory, no rpath surgery, no venv.
+# It used to carry 223 MB of libtorch dylibs that had to be signed inside-out
+# before the bundle could be. The one thing that does travel is mlx.metallib,
+# the compiled Metal kernels, see below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,6 +80,33 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$ROOT/target/release/stemd-server" "$APP/Contents/MacOS/stemd"
 
+# The Metal kernels are not in the binary. MLX compiles them to mlx.metallib
+# and loads that at run time, first from the directory holding its own code,
+# which for a static link is the directory of the executable, and failing that
+# from the absolute path of the build tree that is compiled into it. On the
+# machine that built the bundle the second path exists, so the app works there
+# and every test passes; on any other Mac the first array touched by the GPU
+# comes back empty and the separation panics on an index into nothing. 0.1.0
+# and 0.1.1 both shipped that way.
+#
+# Taken from the path the binary carries rather than from a guess at cargo's
+# output directory, so the library shipped is the one this executable was
+# built against and not a sibling from an older build.
+#
+# The file itself lives in Resources, where codesign seals it as data; a
+# non-code file directly in MacOS fails verification as unsigned nested code.
+# The symlink is what MLX finds, and codesign seals symlinks as symlinks.
+METALLIB="$(strings -n 8 "$APP/Contents/MacOS/stemd" | grep '/mlx\.metallib$' | head -1)"
+if [ -z "$METALLIB" ] || [ ! -f "$METALLIB" ]; then
+  echo "the binary names no mlx.metallib that exists (got '${METALLIB:-nothing}')." >&2
+  echo "Without it the app only runs on this machine. Build with MLX_METAL_JIT=OFF" >&2
+  echo "and check target/release/build/mlx-sys-*/out/build/lib/mlx.metallib." >&2
+  exit 1
+fi
+cp "$METALLIB" "$APP/Contents/Resources/mlx.metallib"
+ln -s ../Resources/mlx.metallib "$APP/Contents/MacOS/mlx.metallib"
+echo "  metal kernels: mlx.metallib ($(du -h "$APP/Contents/Resources/mlx.metallib" | cut -f1))"
+
 # Weights are fetched on first run into Application Support, so the bundle does
 # not carry 170 MB that never changes. STEMD_LINK_MODELS symlinks a local copy
 # for development; STEMD_EMBED_MODELS copies it in for an offline install.
@@ -138,7 +166,8 @@ $ICON_PLIST
 </plist>
 PLIST
 
-# Nothing nested to sign inside-out any more: one executable, no dylibs.
+# Nothing nested to sign inside-out: one executable, no dylibs, and the
+# metallib is sealed as a resource.
 #
 # A Developer ID where the machine has one, ad-hoc otherwise. The difference is
 # not cosmetic: an ad-hoc signature is trusted by the machine that made it and

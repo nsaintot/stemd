@@ -46,6 +46,11 @@ wants the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
 `MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` are the two
 halves of saying it, and they have to agree.
 
+The kernels are a separate `mlx.metallib`, looked up beside the executable and
+then at the build tree's absolute path. The bundle ships it in `Resources` with
+a symlink from `MacOS`; without it the app only runs on the machine that built
+it.
+
 **Windows**, x86-64, CUDA or CPU. MSVC, the CUDA toolkit, cuDNN, and LLVM for
 `libclang`. Use `scripts/bundle-windows.ps1` rather than setting the
 environment by hand: it sets `MLX_BUILD_CUDA`, finds cuDNN, and then checks the
