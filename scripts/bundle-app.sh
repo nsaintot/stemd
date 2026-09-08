@@ -28,12 +28,14 @@ if [ "${STEMD_LINK_MODELS:-0}" = "1" ] || [ "${STEMD_EMBED_MODELS:-0}" = "1" ]; 
 fi
 
 # The oldest macOS this bundle claims to run on, and it has to be said out loud
-# in three places that must agree: here for the Rust side's `minos`, in
+# in three places that must agree: here for the executable's `minos`, in
 # mlx-sys's build.rs for the Metal shaders, and in LSMinimumSystemVersion below.
 # Unset, each of them picks up the SDK of whatever machine ran this script, and
 # the result launches on an older Mac and then fails the first time it touches
 # the GPU. See MACOS_DEPLOYMENT_TARGET in vendor/mlx-rs-stemd/mlx-sys/build.rs.
 MACOS_MIN="14.0"
+# Built with an explicit target so the flags below reach only what ships.
+TARGET="aarch64-apple-darwin"
 
 # MLX compiles its Metal kernels at build time, so `metal` has to be reachable
 # or the build stops part way through with a compiler error per kernel.
@@ -70,15 +72,22 @@ NOMETAL
 }
 ensure_metal
 
+# The floor goes to the linker as a flag, not as MACOSX_DEPLOYMENT_TARGET in
+# the environment. The variable reaches every darwin artefact cargo builds,
+# proc-macro dylibs included, and with this toolchain some of those come out
+# with a LINKEDIT string pool dyld refuses to load, which cargo reports as
+# "can't find crate". Under --target, RUSTFLAGS is not applied to host
+# artefacts, so the proc macros build as they always did and only the
+# executable carries the floor.
 echo "building release binary (macOS $MACOS_MIN and up)..."
-MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN" \
-  cargo build --release -p stemd-server --manifest-path "$ROOT/Cargo.toml"
+RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-mmacosx-version-min=$MACOS_MIN" \
+  cargo build --release --target "$TARGET" -p stemd-server --manifest-path "$ROOT/Cargo.toml"
 
 echo "assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$ROOT/target/release/stemd-server" "$APP/Contents/MacOS/stemd"
+cp "$ROOT/target/$TARGET/release/stemd-server" "$APP/Contents/MacOS/stemd"
 
 # The Metal kernels are not in the binary. MLX compiles them to mlx.metallib
 # and loads that at run time, first from the directory holding its own code,

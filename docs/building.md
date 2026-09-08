@@ -44,7 +44,10 @@ does not compile them at runtime, so a floor taken from the build machine ships
 an artefact that launches on an older Mac and then fails the first time it
 wants the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
 `MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` are the two
-halves of saying it, and they have to agree.
+halves of saying it, and they have to agree. The script passes its half
+as a linker flag under `--target`; exported as `MACOSX_DEPLOYMENT_TARGET` it
+would also reach proc-macro dylibs, which this toolchain links in a form dyld
+refuses.
 
 The kernels are a separate `mlx.metallib`, looked up beside the executable and
 then at the build tree's absolute path. The bundle ships it in `Resources` with
