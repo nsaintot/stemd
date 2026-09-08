@@ -114,20 +114,15 @@ pub struct Drops {
     recent: Mutex<Vec<Arc<Dropped>>>,
 }
 
-/// Put a fresh drop at the top of the list, replacing any row already there
-/// for the same source rather than duplicating it.
-///
-/// Dropping a track that is still in the list is a re-run, not a new entry:
-/// the old row is what the user just dragged again, so it moves to the top
-/// with the new run's state instead of sitting alongside a second copy of
-/// itself.
-fn remember(recent: &mut Vec<Arc<Dropped>>, dropped: Arc<Dropped>) {
-    recent.retain(|other| other.source != dropped.source);
-    recent.insert(0, dropped);
-    recent.truncate(REMEMBERED);
-}
-
 impl Drops {
+    /// Insert a drop at the top, replacing any with the same source to avoid duplicates.
+    fn remember(&self, dropped: Arc<Dropped>) {
+        let mut recent = self.recent.lock();
+        recent.retain(|other| other.source != dropped.source);
+        recent.insert(0, dropped);
+        recent.truncate(REMEMBERED);
+    }
+
     /// Take a file and start working on it. Returns the entry the window draws.
     ///
     /// Everything after this happens on its own thread: decoding a five-minute
@@ -140,7 +135,7 @@ impl Drops {
             state: Mutex::new(State::Reading),
         });
 
-        remember(&mut self.recent.lock(), Arc::clone(&dropped));
+        self.remember(Arc::clone(&dropped));
 
         let state = Arc::clone(state);
         let started = Arc::clone(&dropped);
@@ -164,8 +159,7 @@ impl Drops {
     /// Take a drop out of the list, leaving its stems on disk.
     ///
     /// By identity rather than by name: two files with the same title in
-    /// different folders are two drops, and dropping one track twice makes two
-    /// rows that must be dismissable separately.
+    /// different folders are two drops.
     pub fn forget(&self, item: &Arc<Dropped>) {
         self.recent.lock().retain(|other| !Arc::ptr_eq(other, item));
     }
@@ -464,7 +458,7 @@ mod tests {
 
         let drops = Arc::new(Drops::default());
         let item = finished_drop(&stems);
-        drops.recent.lock().push(Arc::clone(&item));
+        drops.remember(Arc::clone(&item));
 
         drops.discard(&item);
         assert!(!stems.exists(), "the stems folder survived");
@@ -482,7 +476,7 @@ mod tests {
 
         let drops = Arc::new(Drops::default());
         let item = finished_drop(&precious);
-        drops.recent.lock().push(Arc::clone(&item));
+        drops.remember(Arc::clone(&item));
 
         drops.discard(&item);
         assert!(
@@ -500,8 +494,8 @@ mod tests {
         let drops = Arc::new(Drops::default());
         let first = finished_drop(Path::new("/a/track-stems"));
         let second = finished_drop(Path::new("/b/track-stems"));
-        drops.recent.lock().push(Arc::clone(&first));
-        drops.recent.lock().push(Arc::clone(&second));
+        drops.remember(Arc::clone(&first));
+        drops.remember(Arc::clone(&second));
 
         drops.forget(&first);
         let left = drops.recent();
@@ -519,16 +513,17 @@ mod tests {
     /// sharing the window's per-row egui id, which is derived from the source.
     #[test]
     fn re_dropping_a_track_replaces_its_row_instead_of_duplicating() {
-        let mut recent = Vec::new();
+        let drops = Drops::default();
         let other = finished_drop(Path::new("/b"));
-        remember(&mut recent, Arc::clone(&other));
+        drops.remember(Arc::clone(&other));
         let first_run = finished_drop(Path::new("/a"));
-        remember(&mut recent, Arc::clone(&first_run));
-        assert_eq!(recent.len(), 2);
+        drops.remember(Arc::clone(&first_run));
+        assert_eq!(drops.recent().len(), 2);
 
         let second_run = finished_drop(Path::new("/a"));
-        remember(&mut recent, Arc::clone(&second_run));
+        drops.remember(Arc::clone(&second_run));
 
+        let recent = drops.recent();
         assert_eq!(
             recent.len(),
             2,
