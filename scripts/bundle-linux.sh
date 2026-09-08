@@ -249,8 +249,19 @@ fi
 
 # --- build ---------------------------------------------------------------
 
+# Source paths go into the binary, in every panic message and in the debug
+# info, as the absolute paths of this machine. Rewritten to names that say
+# what the file is and nothing about whose disk it was on.
+# The source trees rather than the checkout: a prefix covering target/ makes
+# rustc unable to find the proc-macro crates it has just built there.
+remap="--remap-path-prefix=$root/crates=stemd/crates"
+remap="$remap --remap-path-prefix=$root/vendor=stemd/vendor"
+remap="$remap --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=cargo"
+remap="$remap --remap-path-prefix=$(rustc --print sysroot)=rustc"
+
 printf '\nbuilding...\n'
-cargo build --release --manifest-path "$root/Cargo.toml" -p stemd-server -p stemd-cli
+RUSTFLAGS="${RUSTFLAGS:-} $remap" \
+  cargo build --release --manifest-path "$root/Cargo.toml" -p stemd-server -p stemd-cli
 
 exe="$root/target/release/stemd-server"
 

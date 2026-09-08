@@ -72,6 +72,17 @@ NOMETAL
 }
 ensure_metal
 
+# Source paths go into the binary: every panic names its file, and so does
+# the debug info. As built they are the absolute paths of this machine. The
+# prefixes are rewritten to names that say what the file is and nothing
+# about whose disk it was on.
+# The source trees rather than the checkout: a prefix covering target/ makes
+# rustc unable to find the proc-macro crates it has just built there.
+REMAP="--remap-path-prefix=$ROOT/crates=stemd/crates"
+REMAP="$REMAP --remap-path-prefix=$ROOT/vendor=stemd/vendor"
+REMAP="$REMAP --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=cargo"
+REMAP="$REMAP --remap-path-prefix=$(rustc --print sysroot)=rustc"
+
 # The floor goes to the linker as a flag, not as MACOSX_DEPLOYMENT_TARGET in
 # the environment. The variable reaches every darwin artefact cargo builds,
 # proc-macro dylibs included, and with this toolchain some of those come out
@@ -80,7 +91,7 @@ ensure_metal
 # artefacts, so the proc macros build as they always did and only the
 # executable carries the floor.
 echo "building release binary (macOS $MACOS_MIN and up)..."
-RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-mmacosx-version-min=$MACOS_MIN" \
+RUSTFLAGS="${RUSTFLAGS:-} $REMAP -C link-arg=-mmacosx-version-min=$MACOS_MIN" \
   cargo build --release --target "$TARGET" -p stemd-server --manifest-path "$ROOT/Cargo.toml"
 
 echo "assembling $APP"

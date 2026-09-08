@@ -82,6 +82,17 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
+# Source paths go into the binary, in every panic message and in the debug
+# info, as the absolute paths of this machine. Rewritten to names that say
+# what the file is and nothing about whose disk it was on.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+# The source trees rather than the checkout: a prefix covering target\ makes
+# rustc unable to find the proc-macro crates it has just built there.
+$sysroot = (& rustc --print sysroot).Trim()
+$env:RUSTFLAGS = ("$($env:RUSTFLAGS) --remap-path-prefix=$root\crates=stemd\crates " +
+    "--remap-path-prefix=$root\vendor=stemd\vendor --remap-path-prefix=$cargoHome=cargo " +
+    "--remap-path-prefix=$sysroot=rustc").Trim()
+
 Write-Host "building release binaries (CUDA on, sm_$($env:MLX_CUDA_ARCHITECTURES))..."
 Invoke-Native 'cargo build -p stemd-server' {
     cargo build --release --manifest-path (Join-Path $root 'Cargo.toml') -p stemd-server
