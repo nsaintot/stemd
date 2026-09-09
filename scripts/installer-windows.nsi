@@ -62,6 +62,7 @@ SetCompressor /SOLID lzma
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 !include "x64.nsh"
+!include "Sections.nsh"
 
 Name "${NAME} ${VERSION}"
 OutFile "${OUTFILE}"
@@ -83,17 +84,11 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Start stemd"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchStemd
-; The readme slot, repurposed. Unticked, because it is a 1.2 GB download, and
-; offered at all because the alternative is a program that runs on the CPU and
-; a window that says why without saying where to click.
-!define MUI_FINISHPAGE_SHOWREADME ""
-!define MUI_FINISHPAGE_SHOWREADME_TEXT "Fetch the CUDA runtime (about 1.2 GB, NVIDIA cards only)"
-!define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
-!define MUI_FINISHPAGE_SHOWREADME_FUNCTION FetchCuda
 !define MUI_FINISHPAGE_LINK "github.com/nsaintot/stemd"
 !define MUI_FINISHPAGE_LINK_LOCATION "${HOMEPAGE}"
 
 !insertmacro MULTIUSER_PAGE_INSTALLMODE
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -103,35 +98,12 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 
 !insertmacro MUI_LANGUAGE "English"
 
-; makensis produces a 32-bit installer, so every HKLM\Software write is
-; redirected into WOW6432Node unless the view is set. The program is 64-bit and
-; its Add/Remove Programs entry belongs in the 64-bit view with it. Set before
-; MULTIUSER_INIT, which reads the uninstall key itself to find a previous
-; install, so both halves have to agree on where that key lives.
-Function .onInit
-  ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "stemd is built for 64-bit Windows only."
-    Abort
-  ${EndIf}
-  SetRegView 64
-  !insertmacro MULTIUSER_INIT
-FunctionEnd
-
-Function un.onInit
-  SetRegView 64
-  !insertmacro MULTIUSER_UNINIT
-FunctionEnd
-
 ; Through explorer, so the program does not inherit the installer's token. On an
 ; administrator account this whole process is elevated, and a stemd started from
 ; it would run as administrator and write its settings and its cache somewhere
 ; the user's own next run will not look.
 Function LaunchStemd
   Exec '"$WINDIR\explorer.exe" "$INSTDIR\stemd-server.exe"'
-FunctionEnd
-
-Function FetchCuda
-  ExecShell "" "$INSTDIR\install-cuda.cmd"
 FunctionEnd
 
 ; The all-users replacement for the shipped `install-cuda.cmd`: same call, with
@@ -192,6 +164,53 @@ Section "stemd" SecMain
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD SHCTX "${UNINST_KEY}" "EstimatedSize" "$0"
 SectionEnd
+
+; The CUDA runtime and cuDNN, about 1.2 GB from NVIDIA, laid beside the program
+; during the install with the download in the details pane. A component rather
+; than a script beside the executable, because nobody finds the script, and the
+; difference is a separation in seconds instead of minutes. A failed download
+; leaves a working program on the CPU and the script to try again.
+Section "GPU support (CUDA runtime, 1.2 GB download)" SecCuda
+  DetailPrint "Fetching the CUDA runtime beside stemd, about 1.2 GB..."
+  nsExec::ExecToLog '"$INSTDIR\stemd-server.exe" --install-cuda'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "The CUDA runtime could not be fetched (exit $0); stemd runs on the CPU until install-cuda.cmd is run."
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONEXCLAMATION|MB_OK "The CUDA runtime could not be fetched, so stemd will run on the CPU for now.$\r$\n$\r$\nRun install-cuda.cmd in the install folder to try again."
+    ${EndIf}
+  ${EndIf}
+SectionEnd
+
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "stemd, its command-line client and the runtime they need."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecCuda} "Downloads the CUDA runtime and cuDNN from NVIDIA beside stemd, so separations run on the card rather than the CPU. Needs an NVIDIA driver."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+; Below the sections, because .onInit names one of them.
+; makensis produces a 32-bit installer, so every HKLM\Software write is
+; redirected into WOW6432Node unless the view is set. The program is 64-bit and
+; its Add/Remove Programs entry belongs in the 64-bit view with it. Set before
+; MULTIUSER_INIT, which reads the uninstall key itself to find a previous
+; install, so both halves have to agree on where that key lives.
+Function .onInit
+  ${IfNot} ${RunningX64}
+    MessageBox MB_ICONSTOP "stemd is built for 64-bit Windows only."
+    Abort
+  ${EndIf}
+  SetRegView 64
+  !insertmacro MULTIUSER_INIT
+  ; No NVIDIA driver, nothing for the runtime to reach: the GPU component is
+  ; left unticked and greyed out rather than downloading 1.2 GB for nothing.
+  ${IfNot} ${FileExists} "$SYSDIR\nvcuda.dll"
+    SectionSetFlags ${SecCuda} ${SF_RO}
+  ${EndIf}
+FunctionEnd
+
+Function un.onInit
+  SetRegView 64
+  !insertmacro MULTIUSER_UNINIT
+FunctionEnd
 
 Section "Uninstall"
   Delete "$SMPROGRAMS\${NAME}\${NAME}.lnk"
