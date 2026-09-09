@@ -216,7 +216,10 @@ fi
 # Deduplication keys on the package name, so the versioned entry shlibdeps
 # produced wins over the bare name in the lists above, and alternatives such as
 # `libopenblas0 | libblas3` keep their first name as the key.
-depends="$(printf '%s, %s, %s, %s, %s' "$base" "$blas" "$service" "$cuda" "$dlopened" \
+# libcuda1 is named here as well as in the base list: when shlibdeps resolves
+# the rest from a machine whose only libcuda.so.1 is the toolkit's stub, it
+# belongs to no package and drops out, and the base list has been replaced.
+depends="$(printf '%s, libcuda1, %s, %s, %s, %s' "$base" "$blas" "$service" "$cuda" "$dlopened" \
     | tr ',' '\n' \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' \
     | grep -v '^$' \
