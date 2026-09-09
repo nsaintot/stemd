@@ -155,9 +155,13 @@ fn init_logging() -> LogBuffer {
     let filter = |default: &str| {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default.into())
     };
+    // Colour only on a terminal: the installer streams --install-cuda's
+    // progress into its own window, and a redirected log is read by people.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
+                .with_ansi(ansi)
                 .with_filter(filter("stemd_server=info,stemd_core=info,tower_http=warn")),
         )
         .with(LogBufferLayer::new(logs.clone()).with_filter(filter(
