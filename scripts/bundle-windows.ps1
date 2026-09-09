@@ -1,10 +1,12 @@
 # Assemble the Windows build.
 #
-# Twelve files, about 134 MB, and no CUDA in any of them. The executable
-# delay-loads its CUDA imports and decides at startup whether they resolve, so
-# this same directory runs on a machine with no NVIDIA anything and uses a card
-# where there is a usable one. `install-cuda.cmd` beside it fetches the runtime
-# for whoever wants it.
+# About 165 MB and no CUDA library in it. The executable delay-loads its CUDA
+# imports and decides at startup whether they resolve, so this same directory
+# runs on a machine with no NVIDIA anything and uses a card where there is a
+# usable one. `install-cuda.cmd` beside it fetches the runtime for whoever
+# wants it. What does travel is headers: MLX compiles some kernels at run time
+# with NVRTC, and they include CCCL and the CUDA runtime headers, which a
+# machine that never compiles anything still has to have on disk.
 #
 # That replaces staging CUDA's bin\x64 wholesale, which is where the 2.4 GB
 # directory came from: half of it was libraries nothing in the program can call,
@@ -177,6 +179,34 @@ pause
 
 # A CUDA library in here means the delay-load flags stopped working and the
 # directory has quietly become the 2.4 GB one again.
+# The headers NVRTC needs at run time. MLX looks for CCCL at include\cccl
+# beside the executable, and for the runtime headers under CUDA_HOME, which
+# the server points at cuda\ beside itself. Without these, every separation
+# on the GPU fails on its first kernel with "cannot open source file
+# cuda/std/tuple", on a machine that started fine and said device: gpu.
+$toolkit = $env:CUDA_PATH
+if (-not $toolkit) {
+    $toolkit = Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'include\cuda.h') } |
+        Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $toolkit -or -not (Test-Path (Join-Path $toolkit 'include\cccl\cuda\std\tuple'))) {
+    throw "no CCCL headers under the CUDA toolkit ($toolkit). MLX compiles kernels at " +
+          "run time and they include <cuda/std/tuple>; set CUDA_PATH to a toolkit " +
+          "that has include\cccl."
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $Out 'include\cccl'), (Join-Path $Out 'cuda\include') | Out-Null
+# Only the cuda tree is included by the run-time sources; cub and thrust are
+# build-time dependencies and stay out.
+foreach ($tree in 'cuda', 'nv') {
+    $src = Join-Path $toolkit "include\cccl\$tree"
+    if (Test-Path $src) { Copy-Item $src (Join-Path $Out 'include\cccl') -Recurse -Force }
+}
+Get-ChildItem (Join-Path $toolkit 'include') | Where-Object { $_.Name -ne 'cccl' } |
+    Copy-Item -Destination (Join-Path $Out 'cuda\include') -Recurse -Force
+$hdrs = (Get-ChildItem (Join-Path $Out 'include'), (Join-Path $Out 'cuda') -Recurse -File | Measure-Object).Count
+Write-Host "  headers: $hdrs files for the run-time kernel compiler"
+
 $cuda = Get-ChildItem $Out -Filter '*.dll' |
     Where-Object { $_.Name -match '^(cu|nv|npp)' }
 if ($cuda) { throw "CUDA libraries in the base bundle: $($cuda.Name -join ', ')" }
@@ -185,5 +215,5 @@ $size = (Get-ChildItem $Out -Recurse | Measure-Object -Property Length -Sum)
 Write-Host ''
 Write-Host "done: $Out"
 Write-Host ("  {0} files, {1:N1} MB" -f $size.Count, ($size.Sum / 1MB))
-Write-Host '  no CUDA: runs on any machine, uses a card where one is usable'
+Write-Host '  no CUDA libraries: runs on any machine, uses a card where one is usable'
 Write-Host '  install-cuda.cmd adds the runtime on a machine with one'

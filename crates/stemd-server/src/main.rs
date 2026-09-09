@@ -44,6 +44,8 @@ use crate::logbuf::{LogBuffer, LogBufferLayer};
 
 fn main() -> Result<()> {
     adopt_parent_console();
+    #[cfg(windows)]
+    cuda::point_at_bundled_headers();
     let args = cli::Args::from_process();
     let logs = init_logging();
     // After the subscriber exists, or the first panic is reported to nothing.

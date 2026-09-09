@@ -93,6 +93,18 @@ pub const COMPONENTS: &[RemoteFile] = &[
 /// where the delay-load helper falls back to. MLX's own helper also knows a
 /// `../nvidia/<component>/bin` layout, which would work for MLX and not for the
 /// probe.
+/// Point MLX's run-time kernel compiler at the CUDA headers shipped beside
+/// the executable, so a machine without the toolkit can compile them.
+pub fn point_at_bundled_headers() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let cuda = dir.join("cuda");
+    if cuda.join("include").join("cuda_runtime.h").is_file() {
+        // SAFETY: called from main before any other thread exists.
+        unsafe { std::env::set_var("CUDA_HOME", &cuda) };
+    }
+}
+
 pub fn beside_the_executable() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("finding this executable")?;
     Ok(exe
