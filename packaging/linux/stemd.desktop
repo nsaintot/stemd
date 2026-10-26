@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=stemd
+GenericName=Stem separation
+Comment=Separate a track into stems on the GPU
+Exec=stemd-server
+Icon=stemd
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=stems;separation;demucs;audio;
+StartupNotify=true

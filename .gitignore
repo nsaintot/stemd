@@ -42,3 +42,7 @@ __pycache__/
 
 # Agent tooling state, including worktrees that are their own repositories
 .claude/
+
+# CI caches
+/.ccache/
+/.cargo-registry/

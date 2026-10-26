@@ -36,7 +36,7 @@ track bit for bit.
 | --- | --- |
 | macOS | 14 or later, Apple silicon |
 | Windows | NVIDIA card and driver 580 or later, else CPU |
-| Linux | Debian 13 or Ubuntu 24.04, NVIDIA card, driver 580 or later |
+| Linux | x86_64 or aarch64, glibc 2.35 or later, NVIDIA card, driver 580 or later |
 | disk | 168 MB to 942 MB of model weights, downloaded on first run |
 
 ## Install
@@ -57,27 +57,22 @@ On a machine with an NVIDIA card, tick the box at the end of the installer or ru
 once and pinned by digest. No toolkit and no repository. Without it stemd runs on
 the CPU, correctly and far slower.
 
-**Linux.** Take the `amd64.deb` from the
-[latest release](https://github.com/nsaintot/stemd/releases/latest). It wants
-the CUDA 13 runtime and cuDNN 9.5 or later, both from
-[NVIDIA's own repositories](https://developer.download.nvidia.com/compute/cuda/repos/),
-so add those first.
+**Linux.** Take the package for your distribution and architecture
+(`x86_64` or `aarch64`) from the
+[latest release](https://github.com/nsaintot/stemd/releases/latest). Each one
+carries the CUDA runtime and cuDNN, so the NVIDIA driver is the only thing the
+machine needs.
 
-```bash
-sudo apt install ./stemd_*_amd64.deb
-```
+| | |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt install ./stemd-*-linux-x86_64.deb` |
+| Fedora, RHEL 10 | `sudo dnf install ./stemd-*-linux-x86_64.rpm` |
+| anything else | `chmod +x stemd-*.AppImage && ./stemd-*.AppImage` |
 
-Debian 13 takes one more step. NVIDIA publish no cuDNN package for it yet, so
-that dependency cannot resolve from any repository: install cuDNN 9.5 or later by
-hand, point the linker at it, and install without that one dependency. Miss the
-linker line and the window opens, reports `device: gpu`, and fails every
-separation.
-
-```bash
-echo /opt/cudnn13/lib | sudo tee /etc/ld.so.conf.d/cudnn.conf
-sudo ldconfig
-sudo dpkg -i --force-depends ./stemd_*_amd64.deb
-```
+Built on Ubuntu 22.04, so any distribution with glibc 2.35 or later: Ubuntu
+22.04, Debian 12, Fedora 36, RHEL 10 and later. The aarch64 build is for
+NVIDIA's Arm servers and workstations, such as DGX Spark and Grace Hopper;
+on aarch64 without an NVIDIA card it has nothing to run on.
 
 ## Use it
 

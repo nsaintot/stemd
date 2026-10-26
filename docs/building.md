@@ -64,16 +64,21 @@ correctly, and takes 610 seconds over a clip the card does in three.
 Keep those variables identical between builds. cargo re-runs the MLX build
 script when any of them moves, and that is forty minutes rather than four.
 
-**Linux**, x86-64, CUDA. `libavahi-compat-libdnssd-dev` for the mDNS
-advertisement, and the CUDA toolkit plus cuDNN 9.5 or later. Use
-`scripts/bundle-linux.sh`, which checks all of it before compiling anything,
-because the failures are otherwise sixty lines into a CMake trace naming
-something that is not what is missing.
+**Linux**, x86_64 or aarch64, CUDA. Build in the image from
+`packaging/linux/Dockerfile`: CUDA 13.3 with cuDNN on Ubuntu 22.04, libclang
+18, CMake 3.31, and the BLAS and avahi-compat headers. It needs no GPU.
 
-cuDNN must be 9.5 or later: the cudnn-frontend MLX builds against calls
-`cudnnBackendPopulateCudaGraph`, which was added there. An older one compiles
-and then finds no execution plan for any graph at run time. Debian's own
-`nvidia-cudnn` is 9.0.0 and built for CUDA 12, so it does not qualify.
+```bash
+docker build --platform linux/arm64 -t stemd-linux packaging/linux
+docker run --rm -v "$PWD:/work" -e MLX_CUDA_ARCHITECTURES=121 stemd-linux \
+    'cargo build --release -p stemd-server -p stemd-cli'
+```
+
+On a machine of your own instead: `libavahi-compat-libdnssd-dev`,
+`liblapacke-dev`, the CUDA toolkit, cuDNN 9.5 or later in `CUDNN_PATH`, and
+`MLX_BUILD_CUDA=1`. cuDNN must be 9.5 or later: the cudnn-frontend MLX builds
+against calls `cudnnBackendPopulateCudaGraph`, which was added there. An older
+one compiles and then finds no execution plan for any graph at run time.
 
 ## Packaging
 
@@ -82,8 +87,8 @@ and then finds no execution plan for any graph at run time. Debian's own
 ./scripts/bundle.sh              # macOS: a signed, notarized, stapled .dmg
 ./scripts/bundle-windows.ps1     # Windows: dist/stemd-windows
 ./scripts/package-windows.ps1    # Windows: an installer and a zip
-./scripts/package-deb.sh         # Linux: a .deb
-./scripts/bundle-linux.sh        # Linux: a self-contained directory, over 1 GB
+packaging/linux/stage.sh         # Linux: dist/linux, in the image
+packaging/linux/build.sh         # Linux: .deb, .rpm and .AppImage from it
 ```
 
 `MLX_CUDA_ARCHITECTURES` decides which cards the result runs on, and it is the
@@ -91,7 +96,7 @@ single largest thing in the size and the build time. Unset, MLX builds for the
 card in the machine, which is a package that will not start anywhere else. The
 released artefacts are built with `80;86;89;90;120`, Ampere through Blackwell,
 which is five compilations of every kernel: about two and a half hours on
-sixteen cores, and a .deb of 199 MB rather than 55.
+sixteen cores.
 
 The Windows installer offers both modes. Just for me, into
 `%LOCALAPPDATA%\Programs\stemd`, is the default; for all users goes to Program
@@ -110,16 +115,56 @@ highest token available, which on an administrator account means one consent
 prompt even for a per-user install. The installer needs NSIS, which
 `winget install NSIS.NSIS` provides.
 
-Two Linux artefacts on purpose. The `.deb` takes CUDA and cuDNN from the
-distribution, which means one copy of each on the machine rather than two that
-can disagree about which engines to load. The directory carries its own copy of
-everything and exists for a machine with no package manager, such as a live USB.
+### Linux packages
 
-Which distributions can install the `.deb` is decided by the machine that built
-it, not by the packaging. Built on Debian 13 it requires glibc 2.39 and
-libstdc++ 14, which Debian 13 and Ubuntu 24.04 have and Ubuntu 22.04 and Debian
-12 do not. Every other dependency resolves on all four. Build on the oldest
-target you mean to support.
+`.github/workflows/cd.yml` builds them for x86_64 and aarch64 on GitHub's
+runners, installs each on Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Fedora, and
+for a `v<version>` tag uploads them to a draft release.
+
+| | |
+| --- | --- |
+| `stage.sh` | `dist/linux/opt/stemd`: binaries, vendored libraries, the run-time headers |
+| `build.sh` | nfpm writes the `.deb` and `.rpm`, appimagetool the `.AppImage`, from that one tree |
+| `nfpm.yaml.in` | dependencies: the display stack and D-Bus only |
+| `THIRD-PARTY` | notices for the vendored NVIDIA, BLAS and avahi libraries |
+| `jit-headers.sh` | writes `jit-headers.txt`, the toolkit headers MLX's run-time compiler reads; rerun after an MLX or CUDA update |
+
+Every package carries CUDA, cuDNN, BLAS and avahi-compat in `/opt/stemd/lib`,
+about 2 GB unpacked. The driver (`libcuda.so.1`), the display stack and the C++
+runtime come from the machine. NVIDIA's libraries are copied unmodified, as
+their licences require; the executables find them through `DT_RPATH`
+(`$ORIGIN/../lib`), which also covers what cuDNN opens at run time.
+
+`/usr/bin/stemd-server` is a symlink to `/opt/stemd/stemd`, a launcher that sets
+`CUDA_HOME` to the bundled headers and execs `bin/stemd-server` by absolute
+path. MLX locates its CCCL headers from argv[0] without resolving symlinks, so
+the server must never be started through a symlink or by name.
+
+The glibc floor is the image's: 2.35.
+
+### Prebuilt MLX
+
+Compiling MLX's CUDA kernels is most of a Linux build: about two and a half
+hours on sixteen cores for five GPU architectures. The packages link a
+prebuilt copy instead.
+
+| | |
+| --- | --- |
+| `packaging/linux/mlx-prebuilt.env` | release tag, GPU architectures per CPU architecture, SHA-256 per asset |
+| `packaging/linux/prebuilt.sh` | `build OUT` packs one, `fetch DIR` downloads and checks one |
+| `.github/workflows/mlx-prebuilt.yml` | builds both on push of the `mlx-cuda-<n>` tag |
+| `MLX_PREBUILT_OUT` | `mlx-sys` copies `libmlx.a`, `libmlxc.a` and a manifest there after a build |
+| `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
+
+The manifest records the `mlx-sys` version, the MLX tag, the target, the GPU
+architectures and the RMSNorm patch, and `mlx-sys` refuses a prebuilt that does
+not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
+tag, and copy the SHA-256 lines from the run summary into
+`mlx-prebuilt.env`. A runner can stop at its 6 h limit before the kernels are
+done; the compile goes through ccache, so re-running the failed job continues.
+
+GPU architectures: x86_64 `80;86;89;90;120` (Ampere through Blackwell), aarch64
+`90;100;121` (Grace Hopper, Grace Blackwell, DGX Spark).
 
 On the macOS bundle: the icon is built from `resources/` with `sips` and
 `iconutil`, both part of macOS, so a clone needs nothing installed to produce a

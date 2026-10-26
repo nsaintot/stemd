@@ -1,0 +1,162 @@
+# Build the Linux packages (.deb, .rpm, .AppImage) for x86_64 and aarch64,
+# install each on a clean system, and, for a release tag, attach them to the
+# draft release.
+#
+#   push of a v<version> tag    a release: the tag must be on main and match
+#                               Cargo.toml's version; the packages go into a
+#                               draft GitHub release, published by hand
+#   pull request into main      the packages, when it touches the packaging
+#   workflow_dispatch           the packages
+#
+# MLX comes prebuilt (packaging/linux/mlx-prebuilt.env), so a run takes
+# minutes rather than hours. The macOS and Windows artefacts are still built by
+# hand and added to the same draft.
+name: CD
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/scripts/**
+      - .github/workflows/cd.yml
+      - packaging/linux/**
+      - vendor/**
+  workflow_dispatch:
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: |
+          version=$(awk '/^\[workspace.package\]/{f=1} f && /^version *=/{gsub(/"/,"");print $3;exit}' Cargo.toml)
+          release=false
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+              if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+                  echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
+                  exit 1
+              fi
+              if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+                  echo "::error::tag $GITHUB_REF_NAME is not on main"
+                  exit 1
+              fi
+              release=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version $version, release $release" >> "$GITHUB_STEP_SUMMARY"
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, platform: linux/amd64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Free disk space
+        run: .github/scripts/free-disk.sh
+      - name: Build image
+        run: docker build --platform ${{ matrix.platform }} -t stemd-linux packaging/linux
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-registry
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.arch }}-
+      - name: Build, stage and package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p .cargo-registry
+          docker run --rm -v "$PWD:/work" -v "$PWD/.cargo-registry:/root/.cargo/registry" \
+              -e VERSION stemd-linux '
+                  set -e
+                  packaging/linux/prebuilt.sh fetch /tmp/mlx
+                  export MLX_PREBUILT_DIR=/tmp/mlx
+                  export MLX_CUDA_ARCHITECTURES="$(packaging/linux/prebuilt.sh archs)"
+                  cargo build --release --locked -p stemd-server -p stemd-cli
+                  packaging/linux/stage.sh
+                  packaging/linux/build.sh --version "$VERSION"
+                  # The toolkit stub, for the install checks below; not packaged.
+                  mkdir -p dist/stub
+                  cp -L /usr/local/cuda/lib64/stubs/libcuda.so dist/stub/libcuda.so.1'
+          sudo chown -R "$(id -u):$(id -g)" dist target .cargo-registry
+      # Install the deb and the rpm on clean systems, which also checks the
+      # declared dependencies, and start the server from each and from the
+      # AppImage. Starting needs a libcuda.so.1, so the stub stands in for the
+      # driver.
+      - name: Install checks
+        run: |
+          check=/ci/linux-installed-check.sh
+          for image in ubuntu:22.04 debian:12 ubuntu:24.04; do
+              docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/.github/scripts:/ci:ro" "$image" \
+                  bash -ec "apt-get update -qq && apt-get install -y -qq /dist/*.deb >/dev/null && $check"
+          done
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/.github/scripts:/ci:ro" fedora:latest \
+              bash -ec "dnf install -y -q /dist/*.rpm >/dev/null && $check"
+          appimage=$(ls dist/*.AppImage)
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null)
+          LD_LIBRARY_PATH="$PWD/dist/stub" "$RUNNER_TEMP/squashfs-root/AppRun" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+          compression-level: 0
+
+  release:
+    name: Release
+    needs: [plan, linux]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+      # A draft, so nothing is public until published by hand. A rerun
+      # replaces the Linux files; the macOS and Windows ones are left alone.
+      - name: Draft release
+        run: |
+          tag="$GITHUB_REF_NAME"
+          draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ "$draft" == false ]]; then
+              echo "::error::$tag is published; its files are no longer changed"
+              exit 1
+          fi
+          if [[ -z "$draft" ]]; then
+              gh release create "$tag" --draft --verify-tag --title "stemd ${tag#v}" --notes ""
+          fi
+          gh release upload "$tag" --clobber dist/*
+          (cd dist && sha256sum -- *) | tee -a "$GITHUB_STEP_SUMMARY"

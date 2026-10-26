@@ -1,0 +1,5 @@
+#!/bin/sh
+# The AppImage's entry point. The image mounts at a new path on every launch;
+# the launcher finds everything relative to itself.
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/opt/stemd/stemd" "$@"
