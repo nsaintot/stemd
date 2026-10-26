@@ -1,0 +1,89 @@
+# Recipe for the .deb and the .rpm. Both ship the tree stage.sh assembles;
+# only the dependency names differ by family.
+#
+# build.sh runs this through envsubst for VERSION and ARCH (amd64 or arm64),
+# and runs nfpm from inside the staged tree, so `src` paths are relative.
+name: stemd
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+maintainer: nsaintot <neoternon@gmail.com>
+description: |
+  Stem separation service with a drop window.
+  stemd separates a track into stems on an NVIDIA GPU and serves the result
+  over HTTP, announcing itself on the local network with mDNS. It bundles the
+  CUDA runtime and cuDNN; it needs the NVIDIA driver, 580 or later.
+vendor: stemd
+homepage: https://github.com/nsaintot/stemd
+license: MIT OR Apache-2.0
+section: sound
+
+contents:
+  - src: opt/stemd
+    dst: /opt/stemd
+  - src: usr/share/applications/stemd.desktop
+    dst: /usr/share/applications/stemd.desktop
+  - src: usr/share/icons
+    dst: /usr/share/icons
+  - src: /opt/stemd/stemd
+    dst: /usr/bin/stemd-server
+    type: symlink
+  - src: /opt/stemd/bin/stemd-cli
+    dst: /usr/bin/stemd-cli
+    type: symlink
+
+# zstd is supported by dpkg on Ubuntu 22.04 and Debian 12, and by rpm on every
+# current RPM family.
+deb:
+  compression: zstd
+rpm:
+  compression: zstd
+
+# The libraries stage.sh does not vendor: the display stack, which winit and
+# glutin open at run time, and D-Bus, which avahi-client talks through. The
+# driver (libcuda.so.1) is not a dependency: Debian names it libcuda1, Ubuntu
+# libnvidia-compute-<version>, and a .run install provides it outside any
+# package. The launcher warns when it is missing.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libstdc++6 (>= 12)
+      - libgcc-s1
+      - libdbus-1-3
+      - libgl1
+      - libegl1
+      - libx11-6
+      - libx11-xcb1
+      - libxcursor1
+      - libxi6
+      - libxrandr2
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+    recommends:
+      - avahi-daemon
+  rpm:
+    # Sonames rather than package names: RPM provides them automatically and
+    # every RPM family satisfies them under its own package names.
+    depends:
+      - libc.so.6(GLIBC_2.35)(64bit)
+      - libstdc++.so.6(GLIBCXX_3.4.30)(64bit)
+      - libgcc_s.so.1()(64bit)
+      - libdbus-1.so.3()(64bit)
+      - libGL.so.1()(64bit)
+      - libEGL.so.1()(64bit)
+      - libX11.so.6()(64bit)
+      - libX11-xcb.so.1()(64bit)
+      - libXcursor.so.1()(64bit)
+      - libXi.so.6()(64bit)
+      - libXrandr.so.2()(64bit)
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - libwayland-cursor.so.0()(64bit)
+      - libwayland-egl.so.1()(64bit)
+    recommends:
+      - avahi

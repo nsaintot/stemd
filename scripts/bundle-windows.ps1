@@ -119,7 +119,9 @@ if ($WithCli) {
 # to ask whether a card is present, and it is therefore in the CPU-only build
 # too. Picking it would have been a check that passes on exactly the binary it
 # exists to reject.
-$exe = Join-Path $root 'target\release\stemd-server.exe'
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+$release = Join-Path $target 'release'
+$exe = Join-Path $release 'stemd-server.exe'
 $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
 $wanted = 'cublasLt64', 'cufft64', 'nvrtc64'
 $missing = $wanted | Where-Object { $text -notmatch $_ }
@@ -132,7 +134,6 @@ if ($missing) {
 }
 Write-Host "  CUDA imports present ($($wanted -join ', '))"
 
-$release = Join-Path $root 'target\release'
 Remove-Item $Out -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
@@ -140,10 +141,16 @@ Copy-Item (Join-Path $release 'stemd-server.exe') $Out
 if ($WithCli) { Copy-Item (Join-Path $release 'stemd-cli.exe') $Out }
 
 # MLX builds OpenBLAS as a DLL inside mlx-sys's OUT_DIR and nothing installs it.
-$blas = Get-ChildItem (Join-Path $release 'build') -Directory -Filter 'mlx-sys-*' |
-    ForEach-Object { Join-Path $_.FullName 'out\build\libopenblas.dll' } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $blas) { throw 'no libopenblas.dll under target\release\build\mlx-sys-*; build stemd-server first' }
+# A prebuilt MLX carries it in its lib directory.
+$blas = if ($env:MLX_PREBUILT_DIR) {
+    Join-Path $env:MLX_PREBUILT_DIR 'lib\libopenblas.dll'
+} else {
+    Get-ChildItem (Join-Path $release 'build') -Directory -Filter 'mlx-sys-*' |
+        ForEach-Object { Join-Path $_.FullName 'out\build\libopenblas.dll' } |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if ($blas -and -not (Test-Path $blas)) { $blas = $null }
+if (-not $blas) { throw 'no libopenblas.dll in the prebuilt MLX or under target\release\build\mlx-sys-*; build stemd-server first' }
 Copy-Item $blas $Out
 
 # The MSVC runtime, from the redistributable directory the toolchain ships.

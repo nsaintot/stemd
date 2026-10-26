@@ -64,16 +64,26 @@ correctly, and takes 610 seconds over a clip the card does in three.
 Keep those variables identical between builds. cargo re-runs the MLX build
 script when any of them moves, and that is forty minutes rather than four.
 
-**Linux**, x86-64, CUDA. `libavahi-compat-libdnssd-dev` for the mDNS
-advertisement, and the CUDA toolkit plus cuDNN 9.5 or later. Use
-`scripts/bundle-linux.sh`, which checks all of it before compiling anything,
-because the failures are otherwise sixty lines into a CMake trace naming
-something that is not what is missing.
+**Linux**, x86_64 or aarch64, CUDA. Build in the image from
+`packaging/linux/Dockerfile`: CUDA 13.3 with cuDNN on Ubuntu 22.04, libclang
+18, CMake 3.31, and the BLAS and avahi-compat headers. It needs no GPU.
 
-cuDNN must be 9.5 or later: the cudnn-frontend MLX builds against calls
-`cudnnBackendPopulateCudaGraph`, which was added there. An older one compiles
-and then finds no execution plan for any graph at run time. Debian's own
-`nvidia-cudnn` is 9.0.0 and built for CUDA 12, so it does not qualify.
+```bash
+docker build --platform linux/arm64 -t stemd-linux packaging/linux
+docker run --rm -v "$PWD:/work" -e MLX_CUDA_ARCHITECTURES=121 \
+    -e CMAKE_BUILD_PARALLEL_LEVEL=4 -e CARGO_BUILD_JOBS=4 stemd-linux \
+    'cargo build --release -p stemd-server -p stemd-cli'
+```
+
+nvcc wants several GB per kernel, so the job count is capped: unbounded, it
+runs a 32 GB machine out of memory. cmake-rs passes cargo's job count to the
+build, so both are set.
+
+On a machine of your own instead: `libavahi-compat-libdnssd-dev`,
+`liblapacke-dev`, the CUDA toolkit, cuDNN 9.5 or later in `CUDNN_PATH`, and
+`MLX_BUILD_CUDA=1`. cuDNN must be 9.5 or later: the cudnn-frontend MLX builds
+against calls `cudnnBackendPopulateCudaGraph`, which was added there. An older
+one compiles and then finds no execution plan for any graph at run time.
 
 ## Packaging
 
@@ -82,16 +92,15 @@ and then finds no execution plan for any graph at run time. Debian's own
 ./scripts/bundle.sh              # macOS: a signed, notarized, stapled .dmg
 ./scripts/bundle-windows.ps1     # Windows: dist/stemd-windows
 ./scripts/package-windows.ps1    # Windows: an installer and a zip
-./scripts/package-deb.sh         # Linux: a .deb
-./scripts/bundle-linux.sh        # Linux: a self-contained directory, over 1 GB
+packaging/linux/stage.sh         # Linux: dist/linux, in the image
+packaging/linux/build.sh         # Linux: .deb, .rpm and .AppImage from it
 ```
 
 `MLX_CUDA_ARCHITECTURES` decides which cards the result runs on, and it is the
 single largest thing in the size and the build time. Unset, MLX builds for the
 card in the machine, which is a package that will not start anywhere else. The
-released artefacts are built with `80;86;89;90;120`, Ampere through Blackwell,
-which is five compilations of every kernel: about two and a half hours on
-sixteen cores, and a .deb of 199 MB rather than 55.
+released artefacts use the lists in `packaging/mlx-prebuilt.env`; five
+architectures take about two and a half hours on sixteen cores.
 
 The Windows installer offers both modes. Just for me, into
 `%LOCALAPPDATA%\Programs\stemd`, is the default; for all users goes to Program
@@ -110,16 +119,92 @@ highest token available, which on an administrator account means one consent
 prompt even for a per-user install. The installer needs NSIS, which
 `winget install NSIS.NSIS` provides.
 
-Two Linux artefacts on purpose. The `.deb` takes CUDA and cuDNN from the
-distribution, which means one copy of each on the machine rather than two that
-can disagree about which engines to load. The directory carries its own copy of
-everything and exists for a machine with no package manager, such as a live USB.
+### Release builds
 
-Which distributions can install the `.deb` is decided by the machine that built
-it, not by the packaging. Built on Debian 13 it requires glibc 2.39 and
-libstdc++ 14, which Debian 13 and Ubuntu 24.04 have and Ubuntu 22.04 and Debian
-12 do not. Every other dependency resolves on all four. Build on the oldest
-target you mean to support.
+`.github/workflows/cd.yml` builds every artefact on GitHub's runners and checks
+that each installs and starts. A `v<version>` tag on main uploads them all to a
+draft release, which is published by hand.
+
+| | runner | check |
+| --- | --- | --- |
+| Linux `.deb`, `.rpm`, `.AppImage`, x86_64 and aarch64 | `ubuntu-24.04`, `ubuntu-24.04-arm` | installed on Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Fedora |
+| macOS `.dmg`, arm64 | `macos-26` | signed, notarized, `--version` |
+| Windows installer and `.zip`, x86_64 | `windows-2022` | silent install, `--version` without CUDA |
+
+The runners have no GPU, so a separation on a card is still checked by hand
+before publishing.
+
+macOS signing reads these repository secrets:
+
+| secret | |
+| --- | --- |
+| `MACOS_CERT_P12` | base64 of the Developer ID Application certificate and key, as `.p12` |
+| `MACOS_CERT_PASSWORD` | its password |
+| `NOTARY_KEY_P8` | base64 of an App Store Connect API key (`.p8`), Developer role |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | that key's ID, and for a team key its issuer ID (a UUID) |
+
+Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
+release tag fails.
+
+Windows installs CUDA 13.3.1 and cuDNN 9.14 from NVIDIA's redistributable
+archives with `.github/scripts/windows-cuda.ps1`, the versions stemd fetches
+at run time.
+
+### Linux packages
+
+| | |
+| --- | --- |
+| `stage.sh` | `dist/linux/opt/stemd`: binaries, vendored libraries, the run-time headers |
+| `build.sh` | nfpm writes the `.deb` and `.rpm`, appimagetool the `.AppImage`, from that one tree |
+| `nfpm.yaml.in` | dependencies: the display stack and D-Bus only |
+| `THIRD-PARTY` | notices for the vendored NVIDIA, BLAS and avahi libraries |
+| `jit-headers.sh` | writes `jit-headers.txt`, the toolkit headers MLX's run-time compiler reads; rerun after an MLX or CUDA update |
+
+Every package carries CUDA, cuDNN, BLAS and avahi-compat in `/opt/stemd/lib`,
+about 2 GB unpacked. The driver (`libcuda.so.1`), the display stack and the C++
+runtime come from the machine. NVIDIA's libraries are copied unmodified, as
+their licences require; the executables find them through `DT_RPATH`
+(`$ORIGIN/../lib`), which also covers what cuDNN opens at run time.
+
+`/usr/bin/stemd-server` is a symlink to `/opt/stemd/stemd`, a launcher that sets
+`CUDA_HOME` to the bundled headers and execs `bin/stemd-server` by absolute
+path. MLX locates its CCCL headers from argv[0] without resolving symlinks, so
+the server must never be started through a symlink or by name.
+
+The glibc floor is the image's: 2.35.
+
+### Prebuilt MLX
+
+Compiling MLX's CUDA kernels is most of a Linux or Windows build: about two and
+a half hours on sixteen cores for five GPU architectures. The packages link a
+prebuilt copy instead.
+
+| | |
+| --- | --- |
+| `packaging/mlx-prebuilt.env` | release tag, GPU architectures per platform, SHA-256 per asset |
+| `packaging/prebuilt.sh` | `build OUT` packs one, `fetch DIR` downloads and checks one; Linux in the image, Windows in Git Bash |
+| `.github/workflows/mlx-prebuilt.yml` | builds all three on push of the `mlx-cuda-<n>` tag |
+| `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
+| `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
+
+On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
+and `dl.lib`.
+
+The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
+compiler (only `msvc` on Windows, whose toolsets link older ones), nvcc,
+cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a
+prebuilt that does not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
+tag, and copy the SHA-256 lines from the run summary into
+`mlx-prebuilt.env`. A runner can stop at its 6 h limit before the kernels are
+done; the compile goes through ccache, so re-running the failed job continues.
+
+GPU architectures: Linux and Windows x86_64 `80;86;89;90a;120` (Ampere
+through Blackwell), Linux aarch64 `90a;100;121` (Grace Hopper, Grace
+Blackwell, DGX Spark). `90a` rather
+than `90`, because MLX builds its Hopper-only kernels for `90a` alone.
+Windows skips the Hopper quantized matmul kernels
+(`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile; Hopper uses the
+sm80 ones there.
 
 On the macOS bundle: the icon is built from `resources/` with `sips` and
 `iconutil`, both part of macOS, so a clone needs nothing installed to produce a
@@ -148,7 +233,9 @@ xcrun notarytool store-credentials stemd-notary \
     --apple-id <apple id> --team-id <team id>
 ```
 
-`STEMD_NOTARY_PROFILE` names a different one. Without a profile `bundle.sh`
+`STEMD_NOTARY_PROFILE` names a different one. CI uses an App Store Connect API
+key instead: `STEMD_NOTARY_KEY` (the `.p8` file), `STEMD_NOTARY_KEY_ID` and
+`STEMD_NOTARY_ISSUER`. Without a profile `bundle.sh`
 still produces a signed image and stops with what is missing, so an unnotarized
 release takes a deliberate act.
 

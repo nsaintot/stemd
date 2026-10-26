@@ -1,0 +1,38 @@
+Third-party components in this package
+=======================================
+
+stemd itself is under MIT or Apache-2.0, at your option: LICENSE-MIT and
+LICENSE-APACHE beside this file.
+
+NVIDIA CUDA runtime libraries (lib/libcudart*, libcublas*, libcufft*,
+libnvrtc*, libnvJitLink*) and CUDA headers (cuda/include)
+  Copyright NVIDIA Corporation. Redistributed unmodified under the CUDA
+  Toolkit End User License Agreement:
+  https://docs.nvidia.com/cuda/eula/index.html
+
+NVIDIA cuDNN (lib/libcudnn*)
+  Copyright NVIDIA Corporation. Redistributed unmodified under the NVIDIA cuDNN
+  Software License Agreement:
+  https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html
+  For use on systems with NVIDIA GPUs only.
+
+NVIDIA CCCL (include/cccl)
+  Apache License 2.0 with LLVM exceptions:
+  https://github.com/NVIDIA/cccl/blob/main/LICENSE
+
+OpenBLAS, LAPACK and the GNU Fortran runtime (lib/libblas*, liblapack*,
+libopenblas*, libgfortran*, libquadmath*)
+  OpenBLAS: BSD-3-Clause. LAPACK: BSD-3-Clause (modified). libgfortran and
+  libquadmath: GPL-3.0 with the GCC Runtime Library Exception. Taken from
+  Ubuntu 22.04.
+
+Avahi compatibility library (lib/libdns_sd*, libavahi-*)
+  LGPL-2.1-or-later. Taken from Ubuntu 22.04.
+
+LAME 3.100, statically linked into bin/stemd-server
+  LGPL-2.0 (GNU Library General Public License version 2).
+  Source: https://lame.sourceforge.io/
+
+crates/stemd-core/data/mode1_*.bin, compiled into bin/stemd-server
+  Filter coefficients recovered by measurement of third-party hardware rather
+  than authored, so the stemd licence does not purport to cover them.
