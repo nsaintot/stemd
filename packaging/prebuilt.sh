@@ -37,7 +37,7 @@ case "${1:-}" in
         out="${2:?usage: prebuilt.sh build OUT}"
         mkdir -p "$out"
         tree="$(mktemp -d)"
-        MLX_CUDA_ARCHITECTURES="$archs" MLX_PREBUILT_OUT="$(native "$tree")" \
+        MLX_BUILD_CUDA=1 MLX_CUDA_ARCHITECTURES="$archs" MLX_PREBUILT_OUT="$(native "$tree")" \
             cargo build --release --manifest-path "$(native "$root/Cargo.toml")" -p mlx-sys
         rm -f "$out/$asset"
         if [[ "$os" == windows ]]; then
