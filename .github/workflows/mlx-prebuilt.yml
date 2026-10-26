@@ -1,14 +1,14 @@
-# Build the prebuilt MLX that the Linux packages link, for x86_64 and aarch64,
-# and attach it to the release named in packaging/linux/mlx-prebuilt.env.
-# Start it by pushing that tag (mlx-cuda-<n>), or by hand.
+# Build the prebuilt MLX that the Linux and Windows packages link, and attach
+# it to the release named in packaging/mlx-prebuilt.env. Start it by pushing
+# that tag (mlx-cuda-<n>), or by hand.
 #
 # Compiling the CUDA kernels can outlast a runner's 6 h job limit. The compile
 # goes through ccache, and the cache is saved even when the build is stopped,
-# so re-running the failed jobs continues where they stopped. Two caches of
-# 4 GB stay inside the repository's 10 GB cache quota.
+# so re-running the failed jobs continues where they stopped. Three caches of
+# 3 GB stay inside the repository's 10 GB cache quota.
 #
 # Afterwards, copy the SHA-256 lines from the run summary into
-# mlx-prebuilt.env.
+# packaging/mlx-prebuilt.env.
 name: MLX prebuilt
 
 on:
@@ -20,8 +20,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: MLX (${{ matrix.arch }})
+  linux:
+    name: MLX (linux ${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -40,8 +40,8 @@ jobs:
         run: docker build --platform ${{ matrix.platform }} -t stemd-linux packaging/linux
       - id: key
         run: |
-          . packaging/linux/mlx-prebuilt.env
-          echo "key=ccache-${{ matrix.arch }}-$MLX_PREBUILT_TAG-$(sha256sum packaging/linux/Dockerfile packaging/linux/mlx-prebuilt.env vendor/mlx-rs-stemd/mlx-sys/build.rs | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          . packaging/mlx-prebuilt.env
+          echo "key=ccache-linux-${{ matrix.arch }}-$MLX_PREBUILT_TAG-$(sha256sum packaging/linux/Dockerfile packaging/mlx-prebuilt.env vendor/mlx-rs-stemd/mlx-sys/build.rs | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
         with:
           path: .ccache
@@ -54,10 +54,10 @@ jobs:
         run: |
           mkdir -p .ccache dist
           timeout --signal=TERM -k 2m 300m docker run --rm --init --name mlx -v "$PWD:/work" \
-              -e CCACHE_DIR=/work/.ccache -e CCACHE_MAXSIZE=4G \
+              -e CCACHE_DIR=/work/.ccache -e CCACHE_MAXSIZE=3G \
               -e CMAKE_CUDA_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -e CMAKE_BUILD_PARALLEL_LEVEL=3 -e CARGO_BUILD_JOBS=3 \
-              stemd-linux "packaging/linux/prebuilt.sh build /work/dist"
+              stemd-linux "packaging/prebuilt.sh build /work/dist && ccache -s"
       - name: Own the cache
         if: always()
         run: |
@@ -75,13 +75,73 @@ jobs:
           exit 1
       - uses: actions/upload-artifact@v4
         with:
-          name: mlx-${{ matrix.arch }}
+          name: mlx-linux-${{ matrix.arch }}
           path: dist/mlx-cuda-linux-*.tar.zst
+          compression-level: 0
+
+  windows:
+    name: MLX (windows x86_64)
+    runs-on: windows-2022
+    timeout-minutes: 355
+    env:
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
+      CCACHE_MAXSIZE: 3G
+      # Short, because MLX's dependencies nest deep under OUT_DIR.
+      CARGO_TARGET_DIR: C:\t
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      # No developer prompt: cmake-rs finds MSVC itself, and Git Bash's own
+      # link.exe would shadow MSVC's on PATH.
+      - name: Install CUDA
+        run: .github/scripts/windows-cuda.ps1
+      - name: Install Ninja and ccache
+        run: .github/scripts/windows-tools.ps1
+      - id: key
+        shell: bash
+        run: |
+          . packaging/mlx-prebuilt.env
+          echo "key=ccache-windows-x86_64-$MLX_PREBUILT_TAG-$(sha256sum .github/scripts/windows-cuda.ps1 packaging/mlx-prebuilt.env vendor/mlx-rs-stemd/mlx-sys/build.rs | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.key.outputs.key }}-
+      # Stopped by the step timeout with time left to save the cache.
+      - name: Build MLX
+        id: build
+        continue-on-error: true
+        timeout-minutes: 300
+        shell: bash
+        env:
+          CMAKE_CUDA_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CMAKE_BUILD_PARALLEL_LEVEL: 3
+          CARGO_BUILD_JOBS: 3
+        run: packaging/prebuilt.sh build dist
+      - name: Cache statistics
+        if: always()
+        run: ccache -s
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .ccache
+          key: ${{ steps.key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Stop if unfinished
+        if: steps.build.outcome != 'success'
+        run: |
+          echo "::error::The build stopped before it finished. Re-run the failed jobs to continue from the cache."
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-windows-x86_64
+          path: dist/mlx-cuda-windows-*.zip
           compression-level: 0
 
   publish:
     name: Attach to the release
-    needs: build
+    needs: [linux, windows]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -89,7 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          sparse-checkout: packaging/linux/mlx-prebuilt.env
+          sparse-checkout: packaging/mlx-prebuilt.env
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
@@ -97,7 +157,7 @@ jobs:
           path: dist
           merge-multiple: true
       - run: |
-          . packaging/linux/mlx-prebuilt.env
+          . packaging/mlx-prebuilt.env
           if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$MLX_PREBUILT_TAG" ]]; then
               echo "::error::tag $GITHUB_REF_NAME does not match MLX_PREBUILT_TAG=$MLX_PREBUILT_TAG"
               exit 1
@@ -105,14 +165,14 @@ jobs:
           if ! gh release view "$MLX_PREBUILT_TAG" >/dev/null 2>&1; then
               gh release create "$MLX_PREBUILT_TAG" --prerelease --target "$GITHUB_SHA" \
                   --title "Prebuilt MLX ($MLX_PREBUILT_TAG)" \
-                  --notes "MLX built with CUDA for the Linux packages. Not for end users. See packaging/linux/mlx-prebuilt.env."
+                  --notes "MLX built with CUDA for the Linux and Windows packages. Not for end users. See packaging/mlx-prebuilt.env."
           fi
-          gh release upload "$MLX_PREBUILT_TAG" --clobber dist/*.tar.zst
+          gh release upload "$MLX_PREBUILT_TAG" --clobber dist/mlx-cuda-*
           {
               echo '```'
-              for f in dist/mlx-cuda-linux-*.tar.zst; do
-                  arch="${f##*linux-}"; arch="${arch%.tar.zst}"
-                  echo "SHA256_$arch=$(sha256sum "$f" | cut -d' ' -f1)"
+              for f in dist/mlx-cuda-*; do
+                  platform="${f#dist/mlx-cuda-}"; platform="${platform%%.*}"
+                  echo "SHA256_${platform//-/_}=$(sha256sum "$f" | cut -d' ' -f1)"
               done
               echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

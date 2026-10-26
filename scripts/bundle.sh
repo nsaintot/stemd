@@ -4,6 +4,8 @@
 # Needs a keychain profile, made once:
 #   xcrun notarytool store-credentials stemd-notary \
 #       --apple-id <apple id> --team-id <team id>
+# or an App Store Connect API key in STEMD_NOTARY_KEY (the .p8 file),
+# STEMD_NOTARY_KEY_ID and STEMD_NOTARY_ISSUER, which CI uses.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,6 +32,11 @@ APP_Y=173
 APPS_X=491
 APPS_Y=173
 PROFILE="${STEMD_NOTARY_PROFILE:-stemd-notary}"
+if [ -n "${STEMD_NOTARY_KEY:-}" ]; then
+  NOTARY=(--key "$STEMD_NOTARY_KEY" --key-id "$STEMD_NOTARY_KEY_ID" --issuer "$STEMD_NOTARY_ISSUER")
+else
+  NOTARY=(--keychain-profile "$PROFILE")
+fi
 
 say() { printf '  %s\n' "$*"; }
 
@@ -59,8 +66,12 @@ esac
 
 # `history` hits the network as well as the keychain, so only the error naming
 # the keychain item means the profile is absent.
-if ! NOTARY_CHECK="$(xcrun notarytool history --keychain-profile "$PROFILE" 2>&1)"; then
-  if printf '%s' "$NOTARY_CHECK" | grep -q "No Keychain password item"; then
+if ! NOTARY_CHECK="$(xcrun notarytool history "${NOTARY[@]}" 2>&1)"; then
+  if [ -n "${STEMD_NOTARY_KEY:-}" ]; then
+    echo "notarytool could not use the API key in STEMD_NOTARY_KEY. It said:" >&2
+    echo >&2
+    printf '%s\n' "$NOTARY_CHECK" | sed 's/^/  /' >&2
+  elif printf '%s' "$NOTARY_CHECK" | grep -q "No Keychain password item"; then
     echo "no notarytool profile named '$PROFILE'. Make one with" >&2
     echo >&2
     echo "  xcrun notarytool store-credentials $PROFILE \\" >&2
@@ -80,7 +91,7 @@ echo "notarizing the app, which takes a few minutes"
 APPZIP="$DIST/stemd-app-for-notarization.zip"
 rm -f "$APPZIP"
 ditto -c -k --keepParent "$APP" "$APPZIP"
-xcrun notarytool submit "$APPZIP" --keychain-profile "$PROFILE" --wait
+xcrun notarytool submit "$APPZIP" "${NOTARY[@]}" --wait
 rm -f "$APPZIP"
 xcrun stapler staple "$APP"
 say "app stapled"
@@ -175,7 +186,7 @@ codesign --force --sign "$IDENTITY" --timestamp "$DMG"
 say "signed: $IDENTITY"
 
 echo "notarizing the image"
-xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
+xcrun notarytool submit "$DMG" "${NOTARY[@]}" --wait
 
 xcrun stapler staple "$DMG"
 say "image stapled"

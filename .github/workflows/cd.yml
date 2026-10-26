@@ -1,17 +1,25 @@
-# Build the Linux packages (.deb, .rpm, .AppImage) for x86_64 and aarch64,
-# install each on a clean system, and, for a release tag, attach them to the
-# draft release.
+# Build every release artefact, check that each installs and starts, and, for
+# a release tag, attach them all to a draft release.
+#
+#   Linux     .deb, .rpm, .AppImage   x86_64 and aarch64
+#   macOS     .dmg                    arm64, signed and notarized
+#   Windows   installer and .zip      x86_64
 #
 #   push of a v<version> tag    a release: the tag must be on main and match
-#                               Cargo.toml's version; the packages go into a
+#                               Cargo.toml's version; the artefacts go into a
 #                               draft GitHub release, published by hand
-#   pull request into main      the packages, when it touches the packaging
-#   workflow_dispatch           the packages
+#   pull request into main      the artefacts, when it touches the packaging
+#   workflow_dispatch           the artefacts
 #
-# MLX comes prebuilt (packaging/linux/mlx-prebuilt.env), so a run takes
-# minutes rather than hours. Until that file pins a SHA-256 per architecture
-# the Linux jobs are skipped, and a release tag fails. The macOS and Windows artefacts are still built by
-# hand and added to the same draft.
+# Linux and Windows link a prebuilt MLX (packaging/mlx-prebuilt.env), so a run
+# takes minutes rather than hours. Until that file pins a SHA-256 per platform
+# those jobs are skipped, and a release tag fails.
+#
+# macOS signing and notarization use the secrets MACOS_CERT_P12 (base64 of the
+# Developer ID Application certificate), MACOS_CERT_PASSWORD, and
+# NOTARY_KEY_P8 (base64 of an App Store Connect API key), NOTARY_KEY_ID,
+# NOTARY_ISSUER. Without them the app is signed ad hoc and no .dmg is made; a
+# release tag fails.
 name: CD
 
 on:
@@ -22,7 +30,8 @@ on:
     paths:
       - .github/scripts/**
       - .github/workflows/cd.yml
-      - packaging/linux/**
+      - packaging/**
+      - scripts/**
       - vendor/**
   workflow_dispatch:
 
@@ -60,15 +69,15 @@ jobs:
               fi
               release=true
           fi
-          . packaging/linux/mlx-prebuilt.env
+          . packaging/mlx-prebuilt.env
           prebuilt=false
-          if [[ -n "$SHA256_x86_64" && -n "$SHA256_aarch64" ]]; then
+          if [[ -n "$SHA256_linux_x86_64" && -n "$SHA256_linux_aarch64" && -n "$SHA256_windows_x86_64" ]]; then
               prebuilt=true
           elif [[ "$release" == true ]]; then
-              echo "::error::packaging/linux/mlx-prebuilt.env pins no prebuilt MLX; build $MLX_PREBUILT_TAG first"
+              echo "::error::packaging/mlx-prebuilt.env pins no prebuilt MLX; build $MLX_PREBUILT_TAG first"
               exit 1
           else
-              echo "::warning::packaging/linux/mlx-prebuilt.env pins no prebuilt MLX yet, so the Linux packages are not built"
+              echo "::warning::packaging/mlx-prebuilt.env pins no prebuilt MLX yet, so the Linux and Windows artefacts are not built"
           fi
           {
               echo "version=$version"
@@ -100,8 +109,8 @@ jobs:
         with:
           path: |
             .cargo-registry
-          key: cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.arch }}-
+          key: cargo-linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-linux-${{ matrix.arch }}-
       - name: Build, stage and package
         env:
           VERSION: ${{ needs.plan.outputs.version }}
@@ -110,9 +119,9 @@ jobs:
           docker run --rm -v "$PWD:/work" -v "$PWD/.cargo-registry:/root/.cargo/registry" \
               -e VERSION stemd-linux '
                   set -e
-                  packaging/linux/prebuilt.sh fetch /tmp/mlx
+                  packaging/prebuilt.sh fetch /tmp/mlx
                   export MLX_PREBUILT_DIR=/tmp/mlx
-                  export MLX_CUDA_ARCHITECTURES="$(packaging/linux/prebuilt.sh archs)"
+                  export MLX_CUDA_ARCHITECTURES="$(packaging/prebuilt.sh archs)"
                   cargo build --release --locked -p stemd-server -p stemd-cli
                   packaging/linux/stage.sh
                   packaging/linux/build.sh --version "$VERSION"
@@ -145,9 +154,127 @@ jobs:
             dist/*.AppImage
           compression-level: 0
 
+  macos:
+    name: macOS (arm64)
+    needs: plan
+    runs-on: macos-26
+    env:
+      SIGNED: ${{ secrets.MACOS_CERT_P12 != '' && secrets.NOTARY_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Check signing
+        if: needs.plan.outputs.release == 'true' && env.SIGNED != 'true'
+        run: |
+          echo "::error::a release needs the MACOS_CERT_P12 and NOTARY_KEY_P8 secrets"
+          exit 1
+      - name: Metal compiler
+        run: xcrun --find metal || xcodebuild -downloadComponent MetalToolchain
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-macos-
+      # A keychain of its own, first in the search list, so bundle-app.sh
+      # finds the Developer ID identity there.
+      - name: Signing keychain
+        if: env.SIGNED == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          base64 -D <<<"$MACOS_CERT_P12" > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" \
+              -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          base64 -D <<<"$NOTARY_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+      - name: Build, sign and notarize
+        if: env.SIGNED == 'true'
+        env:
+          STEMD_NOTARY_KEY: ${{ runner.temp }}/notary.p8
+          STEMD_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          STEMD_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: scripts/bundle.sh
+      - name: Build
+        if: env.SIGNED != 'true'
+        run: scripts/bundle-app.sh
+      - name: Start check
+        run: dist/stemd.app/Contents/MacOS/stemd --version
+      - name: Remove credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+      - uses: actions/upload-artifact@v4
+        if: env.SIGNED == 'true'
+        with:
+          name: macos-arm64
+          path: dist/*.dmg
+          compression-level: 0
+
+  windows:
+    name: Windows (x86_64)
+    needs: plan
+    if: needs.plan.outputs.prebuilt == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install CUDA
+        run: .github/scripts/windows-cuda.ps1
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-windows-
+      - name: Fetch the prebuilt MLX
+        shell: bash
+        run: |
+          dir="$(cygpath -u "$RUNNER_TEMP")/mlx"
+          packaging/prebuilt.sh fetch "$dir"
+          {
+              echo "MLX_PREBUILT_DIR=$(cygpath -w "$dir")"
+              echo "MLX_CUDA_ARCHITECTURES=$(packaging/prebuilt.sh archs)"
+          } >> "$GITHUB_ENV"
+      - name: Build and package
+        run: scripts/package-windows.ps1 -Out dist
+      # The runner has no NVIDIA driver, so this also checks that the server
+      # starts without CUDA, and that the installer leaves the GPU component
+      # out.
+      - name: Install check
+        run: |
+          & dist\stemd-windows\stemd-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'the staged server does not start' }
+          $setup = Get-Item dist\stemd-*-setup.exe
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
+          & (Join-Path $installed 'stemd-server.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'the installed server does not start' }
+          & (Join-Path $installed 'stemd-cli.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'the installed client does not start' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            dist/*-setup.exe
+            dist/*-windows-x64.zip
+          compression-level: 0
+
   release:
     name: Release
-    needs: [plan, linux]
+    needs: [plan, linux, macos, windows]
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -158,11 +285,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: linux-*
           path: dist
           merge-multiple: true
       # A draft, so nothing is public until published by hand. A rerun
-      # replaces the Linux files; the macOS and Windows ones are left alone.
+      # replaces the files.
       - name: Draft release
         run: |
           tag="$GITHUB_REF_NAME"

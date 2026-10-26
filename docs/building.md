@@ -99,9 +99,8 @@ packaging/linux/build.sh         # Linux: .deb, .rpm and .AppImage from it
 `MLX_CUDA_ARCHITECTURES` decides which cards the result runs on, and it is the
 single largest thing in the size and the build time. Unset, MLX builds for the
 card in the machine, which is a package that will not start anywhere else. The
-released artefacts are built with `80;86;89;90;120`, Ampere through Blackwell,
-which is five compilations of every kernel: about two and a half hours on
-sixteen cores.
+released artefacts use the lists in `packaging/mlx-prebuilt.env`; five
+architectures take about two and a half hours on sixteen cores.
 
 The Windows installer offers both modes. Just for me, into
 `%LOCALAPPDATA%\Programs\stemd`, is the default; for all users goes to Program
@@ -120,11 +119,38 @@ highest token available, which on an administrator account means one consent
 prompt even for a per-user install. The installer needs NSIS, which
 `winget install NSIS.NSIS` provides.
 
-### Linux packages
+### Release builds
 
-`.github/workflows/cd.yml` builds them for x86_64 and aarch64 on GitHub's
-runners, installs each on Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Fedora, and
-for a `v<version>` tag uploads them to a draft release.
+`.github/workflows/cd.yml` builds every artefact on GitHub's runners and checks
+that each installs and starts. A `v<version>` tag on main uploads them all to a
+draft release, which is published by hand.
+
+| | runner | check |
+| --- | --- | --- |
+| Linux `.deb`, `.rpm`, `.AppImage`, x86_64 and aarch64 | `ubuntu-24.04`, `ubuntu-24.04-arm` | installed on Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Fedora |
+| macOS `.dmg`, arm64 | `macos-26` | signed, notarized, `--version` |
+| Windows installer and `.zip`, x86_64 | `windows-2022` | silent install, `--version` without CUDA |
+
+The runners have no GPU, so a separation on a card is still checked by hand
+before publishing.
+
+macOS signing reads these repository secrets:
+
+| secret | |
+| --- | --- |
+| `MACOS_CERT_P12` | base64 of the Developer ID Application certificate and key, as `.p12` |
+| `MACOS_CERT_PASSWORD` | its password |
+| `NOTARY_KEY_P8` | base64 of an App Store Connect API key (`.p8`), Developer role |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | that key's ID and issuer ID |
+
+Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
+release tag fails.
+
+Windows installs CUDA 13.3.1 and cuDNN 9.14 from NVIDIA's redistributable
+archives with `.github/scripts/windows-cuda.ps1`, the versions stemd fetches
+at run time.
+
+### Linux packages
 
 | | |
 | --- | --- |
@@ -149,27 +175,32 @@ The glibc floor is the image's: 2.35.
 
 ### Prebuilt MLX
 
-Compiling MLX's CUDA kernels is most of a Linux build: about two and a half
-hours on sixteen cores for five GPU architectures. The packages link a
+Compiling MLX's CUDA kernels is most of a Linux or Windows build: about two and
+a half hours on sixteen cores for five GPU architectures. The packages link a
 prebuilt copy instead.
 
 | | |
 | --- | --- |
-| `packaging/linux/mlx-prebuilt.env` | release tag, GPU architectures per CPU architecture, SHA-256 per asset |
-| `packaging/linux/prebuilt.sh` | `build OUT` packs one, `fetch DIR` downloads and checks one |
-| `.github/workflows/mlx-prebuilt.yml` | builds both on push of the `mlx-cuda-<n>` tag |
-| `MLX_PREBUILT_OUT` | `mlx-sys` copies `libmlx.a`, `libmlxc.a` and a manifest there after a build |
+| `packaging/mlx-prebuilt.env` | release tag, GPU architectures per platform, SHA-256 per asset |
+| `packaging/prebuilt.sh` | `build OUT` packs one, `fetch DIR` downloads and checks one; Linux in the image, Windows in Git Bash |
+| `.github/workflows/mlx-prebuilt.yml` | builds all three on push of the `mlx-cuda-<n>` tag |
+| `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
+On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`),
+`dl.lib` and the compiled delay-load helper, `mlx_delayload.lib`.
+
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
-compiler, nvcc, cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a prebuilt that does
-not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
+compiler (only `msvc` on Windows, whose toolsets link older ones), nvcc,
+cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a
+prebuilt that does not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
 tag, and copy the SHA-256 lines from the run summary into
 `mlx-prebuilt.env`. A runner can stop at its 6 h limit before the kernels are
 done; the compile goes through ccache, so re-running the failed job continues.
 
-GPU architectures: x86_64 `80;86;89;90a;120` (Ampere through Blackwell),
-aarch64 `90a;100;121` (Grace Hopper, Grace Blackwell, DGX Spark). `90a` rather
+GPU architectures: Linux and Windows x86_64 `80;86;89;90a;120` (Ampere
+through Blackwell), Linux aarch64 `90a;100;121` (Grace Hopper, Grace
+Blackwell, DGX Spark). `90a` rather
 than `90`, because MLX builds its Hopper-only kernels for `90a` alone.
 
 On the macOS bundle: the icon is built from `resources/` with `sips` and
@@ -199,7 +230,9 @@ xcrun notarytool store-credentials stemd-notary \
     --apple-id <apple id> --team-id <team id>
 ```
 
-`STEMD_NOTARY_PROFILE` names a different one. Without a profile `bundle.sh`
+`STEMD_NOTARY_PROFILE` names a different one. CI uses an App Store Connect API
+key instead: `STEMD_NOTARY_KEY` (the `.p8` file), `STEMD_NOTARY_KEY_ID` and
+`STEMD_NOTARY_ISSUER`. Without a profile `bundle.sh`
 still produces a signed image and stops with what is missing, so an unnotarized
 release takes a deliberate act.
 
