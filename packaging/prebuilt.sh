@@ -36,6 +36,7 @@ case "${1:-}" in
     build)
         out="${2:?usage: prebuilt.sh build OUT}"
         mkdir -p "$out"
+        out="$(cd "$out" && pwd)"
         tree="$(mktemp -d)"
         MLX_BUILD_CUDA=1 MLX_CUDA_ARCHITECTURES="$archs" MLX_PREBUILT_OUT="$(native "$tree")" \
             cargo build --release --manifest-path "$(native "$root/Cargo.toml")" -p mlx-sys
