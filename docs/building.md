@@ -202,6 +202,9 @@ GPU architectures: Linux and Windows x86_64 `80;86;89;90a;120` (Ampere
 through Blackwell), Linux aarch64 `90a;100;121` (Grace Hopper, Grace
 Blackwell, DGX Spark). `90a` rather
 than `90`, because MLX builds its Hopper-only kernels for `90a` alone.
+Windows skips the Hopper quantized matmul kernels
+(`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile; Hopper uses the
+sm80 ones there.
 
 On the macOS bundle: the icon is built from `resources/` with `sips` and
 `iconutil`, both part of macOS, so a clone needs nothing installed to produce a

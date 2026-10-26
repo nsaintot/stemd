@@ -88,6 +88,9 @@ jobs:
       CCACHE_MAXSIZE: 3G
       # Short, because MLX's dependencies nest deep under OUT_DIR.
       CARGO_TARGET_DIR: C:\t
+      # MSVC rejects the Hopper quantized matmul kernels (error C2719 on an
+      # over-aligned parameter). Hopper GPUs use the sm80 kernels instead.
+      MLX_DISABLE_SM90A_KERNELS: 1
     steps:
       - uses: actions/checkout@v5
         with:
