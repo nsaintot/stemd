@@ -256,7 +256,12 @@ jobs:
       - name: Install check
         run: |
           & dist\stemd-windows\stemd-server.exe --version
-          if ($LASTEXITCODE -ne 0) { throw 'the staged server does not start' }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host ('exit code 0x{0:X8}' -f $LASTEXITCODE)
+              Get-ChildItem dist\stemd-windows -Filter *.dll | ForEach-Object Name
+              dumpbin /nologo /dependents dist\stemd-windows\stemd-server.exe dist\stemd-windows\libopenblas.dll
+              throw 'the staged server does not start'
+          }
           $setup = Get-Item dist\stemd-*-setup.exe
           Start-Process $setup.FullName -ArgumentList '/S' -Wait
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
