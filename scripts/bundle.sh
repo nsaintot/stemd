@@ -5,7 +5,7 @@
 #   xcrun notarytool store-credentials stemd-notary \
 #       --apple-id <apple id> --team-id <team id>
 # or an App Store Connect API key in STEMD_NOTARY_KEY (the .p8 file),
-# STEMD_NOTARY_KEY_ID and STEMD_NOTARY_ISSUER, which CI uses.
+# STEMD_NOTARY_KEY_ID and, for a team key, STEMD_NOTARY_ISSUER, which CI uses.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,7 +33,9 @@ APPS_X=491
 APPS_Y=173
 PROFILE="${STEMD_NOTARY_PROFILE:-stemd-notary}"
 if [ -n "${STEMD_NOTARY_KEY:-}" ]; then
-  NOTARY=(--key "$STEMD_NOTARY_KEY" --key-id "$STEMD_NOTARY_KEY_ID" --issuer "$STEMD_NOTARY_ISSUER")
+  NOTARY=(--key "$STEMD_NOTARY_KEY" --key-id "$STEMD_NOTARY_KEY_ID")
+  # Team keys have an issuer; individual keys have none.
+  if [ -n "${STEMD_NOTARY_ISSUER:-}" ]; then NOTARY+=(--issuer "$STEMD_NOTARY_ISSUER"); fi
 else
   NOTARY=(--keychain-profile "$PROFILE")
 fi

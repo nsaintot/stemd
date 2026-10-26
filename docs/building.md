@@ -141,7 +141,7 @@ macOS signing reads these repository secrets:
 | `MACOS_CERT_P12` | base64 of the Developer ID Application certificate and key, as `.p12` |
 | `MACOS_CERT_PASSWORD` | its password |
 | `NOTARY_KEY_P8` | base64 of an App Store Connect API key (`.p8`), Developer role |
-| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | that key's ID and issuer ID |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | that key's ID, and for a team key its issuer ID (a UUID) |
 
 Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
 release tag fails.

@@ -17,8 +17,8 @@
 #
 # macOS signing and notarization use the secrets MACOS_CERT_P12 (base64 of the
 # Developer ID Application certificate), MACOS_CERT_PASSWORD, and
-# NOTARY_KEY_P8 (base64 of an App Store Connect API key), NOTARY_KEY_ID,
-# NOTARY_ISSUER. Without them the app is signed ad hoc and no .dmg is made; a
+# NOTARY_KEY_P8 (base64 of an App Store Connect API key), NOTARY_KEY_ID, and
+# NOTARY_ISSUER for a team key. Without them the app is signed ad hoc and no .dmg is made; a
 # release tag fails.
 name: CD
 
