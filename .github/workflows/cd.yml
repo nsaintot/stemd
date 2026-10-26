@@ -255,20 +255,19 @@ jobs:
       # out.
       - name: Install check
         run: |
-          & dist\stemd-windows\stemd-server.exe --version
-          if ($LASTEXITCODE -ne 0) {
-              Write-Host ('exit code 0x{0:X8}' -f $LASTEXITCODE)
-              Get-ChildItem dist\stemd-windows -Filter *.dll | ForEach-Object Name
-              dumpbin /nologo /dependents dist\stemd-windows\stemd-server.exe dist\stemd-windows\libopenblas.dll
-              throw 'the staged server does not start'
+          # The server is a GUI-subsystem executable, which `&` does not wait for.
+          function Test-Version([string]$exe) {
+              $out = Join-Path $env:RUNNER_TEMP 'version.txt'
+              $p = Start-Process $exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+              Get-Content $out
+              if ($p.ExitCode -ne 0) { throw ('{0} --version exited with 0x{1:X8}' -f $exe, $p.ExitCode) }
           }
+          Test-Version dist\stemd-windows\stemd-server.exe
           $setup = Get-Item dist\stemd-*-setup.exe
           Start-Process $setup.FullName -ArgumentList '/S' -Wait
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
-          & (Join-Path $installed 'stemd-server.exe') --version
-          if ($LASTEXITCODE -ne 0) { throw 'the installed server does not start' }
-          & (Join-Path $installed 'stemd-cli.exe') --version
-          if ($LASTEXITCODE -ne 0) { throw 'the installed client does not start' }
+          Test-Version (Join-Path $installed 'stemd-server.exe')
+          Test-Version (Join-Path $installed 'stemd-cli.exe')
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
