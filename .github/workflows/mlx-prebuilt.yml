@@ -4,7 +4,8 @@
 #
 # Compiling the CUDA kernels can outlast a runner's 6 h job limit. The compile
 # goes through ccache, and the cache is saved even when the build is stopped,
-# so re-running the failed jobs continues where they stopped.
+# so re-running the failed jobs continues where they stopped. Two caches of
+# 4 GB stay inside the repository's 10 GB cache quota.
 #
 # Afterwards, copy the SHA-256 lines from the run summary into
 # mlx-prebuilt.env.
@@ -52,8 +53,8 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p .ccache dist
-          timeout --signal=TERM 300m docker run --rm --name mlx -v "$PWD:/work" \
-              -e CCACHE_DIR=/work/.ccache -e CCACHE_MAXSIZE=6G \
+          timeout --signal=TERM -k 2m 300m docker run --rm --init --name mlx -v "$PWD:/work" \
+              -e CCACHE_DIR=/work/.ccache -e CCACHE_MAXSIZE=4G \
               -e CMAKE_CUDA_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -e CMAKE_BUILD_PARALLEL_LEVEL=3 -e CARGO_BUILD_JOBS=3 \
               stemd-linux "packaging/linux/prebuilt.sh build /work/dist"

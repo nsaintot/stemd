@@ -56,7 +56,9 @@ if want appimage; then
     appdir="$out/stemd.AppDir"
     rm -rf "$appdir"
     mkdir -p "$appdir"
-    cp -a "$stage/opt" "$stage/usr" "$appdir/"
+    # Hard links: the tree is about 2 GB and appimagetool only reads it.
+    cp -al "$stage/opt" "$stage/usr" "$appdir/" 2>/dev/null ||
+        cp -a "$stage/opt" "$stage/usr" "$appdir/"
     install -m 0755 "$root/packaging/linux/AppRun" "$appdir/AppRun"
     install -m 0644 "$root/packaging/linux/stemd.desktop" "$appdir/stemd.desktop"
     cp "$appdir/usr/share/icons/hicolor/256x256/apps/stemd.png" "$appdir/stemd.png"

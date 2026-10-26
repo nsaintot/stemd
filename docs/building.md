@@ -70,9 +70,14 @@ script when any of them moves, and that is forty minutes rather than four.
 
 ```bash
 docker build --platform linux/arm64 -t stemd-linux packaging/linux
-docker run --rm -v "$PWD:/work" -e MLX_CUDA_ARCHITECTURES=121 stemd-linux \
+docker run --rm -v "$PWD:/work" -e MLX_CUDA_ARCHITECTURES=121 \
+    -e CMAKE_BUILD_PARALLEL_LEVEL=4 -e CARGO_BUILD_JOBS=4 stemd-linux \
     'cargo build --release -p stemd-server -p stemd-cli'
 ```
+
+nvcc wants several GB per kernel, so the job count is capped: unbounded, it
+runs a 32 GB machine out of memory. cmake-rs passes cargo's job count to the
+build, so both are set.
 
 On a machine of your own instead: `libavahi-compat-libdnssd-dev`,
 `liblapacke-dev`, the CUDA toolkit, cuDNN 9.5 or later in `CUDNN_PATH`, and
@@ -156,15 +161,16 @@ prebuilt copy instead.
 | `MLX_PREBUILT_OUT` | `mlx-sys` copies `libmlx.a`, `libmlxc.a` and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
-The manifest records the `mlx-sys` version, the MLX tag, the target, the GPU
-architectures and the RMSNorm patch, and `mlx-sys` refuses a prebuilt that does
+The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
+compiler, nvcc, cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a prebuilt that does
 not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
 tag, and copy the SHA-256 lines from the run summary into
 `mlx-prebuilt.env`. A runner can stop at its 6 h limit before the kernels are
 done; the compile goes through ccache, so re-running the failed job continues.
 
-GPU architectures: x86_64 `80;86;89;90;120` (Ampere through Blackwell), aarch64
-`90;100;121` (Grace Hopper, Grace Blackwell, DGX Spark).
+GPU architectures: x86_64 `80;86;89;90a;120` (Ampere through Blackwell),
+aarch64 `90a;100;121` (Grace Hopper, Grace Blackwell, DGX Spark). `90a` rather
+than `90`, because MLX builds its Hopper-only kernels for `90a` alone.
 
 On the macOS bundle: the icon is built from `resources/` with `sips` and
 `iconutil`, both part of macOS, so a clone needs nothing installed to produce a

@@ -6,12 +6,12 @@
 #   jit-headers.sh
 #
 # Runs in the image from packaging/linux/Dockerfile. Compiles every header MLX
-# embeds for NVRTC, for every GPU architecture in mlx-prebuilt.env, and records
-# the files NVRTC opens. Run it again after an MLX or CUDA update.
+# embeds for NVRTC, with the options MLX passes, for every compute capability
+# CUDA 13 supports, and records the files NVRTC opens. Fails if one is a CCCL
+# file outside the cuda/ and nv/ trees stage.sh ships. Run it again after an
+# MLX or CUDA update.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-# shellcheck source=mlx-prebuilt.env
-. "$root/packaging/linux/mlx-prebuilt.env"
 mlx_tag="$(sed -n 's/^const MLX_TAG: &str = "\(.*\)";/\1/p' "$root/vendor/mlx-rs-stemd/mlx-sys/build.rs")"
 cuda="${CUDA_PATH:-/usr/local/cuda}"
 case "$(uname -m)" in
@@ -46,19 +46,26 @@ gcc "$work/nvrtc.c" -I"$cuda/include" -L"$cuda/lib64" -lnvrtc -o "$work/nvrtc"
 
 # One translation unit per header, as MLX's kernels include them. A header
 # compiled on its own can fail; only the files opened matter.
+# MLX compiles for the device it finds, as sm_<cc> with an `a` suffix from
+# compute capability 9.0 on, and passes no other option but include paths.
 dev="$work/mlx/mlx/backend/cuda/device"
-# shellcheck disable=SC2154
-archs="$CUDA_ARCHS_x86_64;$CUDA_ARCHS_aarch64"
 for h in "$dev"/*.cuh "$dev"/*.h; do
     printf '#include "mlx/backend/cuda/device/%s"\n#include <cooperative_groups.h>\n' \
         "$(basename "$h")" > "$work/tu.cu"
-    for a in ${archs//;/ }; do
-        LD_LIBRARY_PATH="$cuda/lib64" strace -f -e trace=openat -o "$work/trace.$a.$(basename "$h")" \
-            "$work/nvrtc" "$work/tu.cu" --include-path="$work/mlx" --include-path="$inc/cccl" \
-            --include-path="$inc" -std=c++20 -default-device "-arch=sm_$a" >/dev/null 2>&1
+    for cc in 75 80 86 87 89 90a 100a 103a 110a 120a 121a; do
+        LD_LIBRARY_PATH="$cuda/lib64" strace -f -e trace=openat -o "$work/trace.$cc.$(basename "$h")" \
+            "$work/nvrtc" "$work/tu.cu" "--gpu-architecture=sm_$cc" --include-path="$work/mlx" \
+            --include-path="$inc/cccl" --include-path="$inc" >/dev/null 2>&1
     done
 done
 
-cat "$work"/trace.* | grep -v ENOENT | grep -oE "\"$inc/[^\"]+\"" | tr -d '"' \
-    | sed "s#^$inc/##" | grep -v '^cccl/' | sort -u > "$root/packaging/linux/jit-headers.txt"
+opened="$(cat "$work"/trace.* | grep -v ENOENT | grep -oE "\"$inc/[^\"]+\"" | tr -d '"' \
+    | sed "s#^$inc/##" | sort -u)"
+outside="$(grep '^cccl/' <<<"$opened" | grep -vE '^cccl/(cuda|nv)/' || true)"
+if [[ -n "$outside" ]]; then
+    echo "ERROR: NVRTC opens CCCL files outside cuda/ and nv/; ship them in stage.sh:" >&2
+    echo "$outside" >&2
+    exit 1
+fi
+grep -v '^cccl/' <<<"$opened" > "$root/packaging/linux/jit-headers.txt"
 wc -l < "$root/packaging/linux/jit-headers.txt"

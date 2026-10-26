@@ -9,7 +9,8 @@
 #   workflow_dispatch           the packages
 #
 # MLX comes prebuilt (packaging/linux/mlx-prebuilt.env), so a run takes
-# minutes rather than hours. The macOS and Windows artefacts are still built by
+# minutes rather than hours. Until that file pins a SHA-256 per architecture
+# the Linux jobs are skipped, and a release tag fails. The macOS and Windows artefacts are still built by
 # hand and added to the same draft.
 name: CD
 
@@ -39,6 +40,7 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       release: ${{ steps.plan.outputs.release }}
+      prebuilt: ${{ steps.plan.outputs.prebuilt }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,13 +60,27 @@ jobs:
               fi
               release=true
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release=$release" >> "$GITHUB_OUTPUT"
-          echo "version $version, release $release" >> "$GITHUB_STEP_SUMMARY"
+          . packaging/linux/mlx-prebuilt.env
+          prebuilt=false
+          if [[ -n "$SHA256_x86_64" && -n "$SHA256_aarch64" ]]; then
+              prebuilt=true
+          elif [[ "$release" == true ]]; then
+              echo "::error::packaging/linux/mlx-prebuilt.env pins no prebuilt MLX; build $MLX_PREBUILT_TAG first"
+              exit 1
+          else
+              echo "::warning::packaging/linux/mlx-prebuilt.env pins no prebuilt MLX yet, so the Linux packages are not built"
+          fi
+          {
+              echo "version=$version"
+              echo "release=$release"
+              echo "prebuilt=$prebuilt"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, release $release, prebuilt MLX $prebuilt" >> "$GITHUB_STEP_SUMMARY"
 
   linux:
     name: Linux (${{ matrix.arch }})
     needs: plan
+    if: needs.plan.outputs.prebuilt == 'true'
     strategy:
       fail-fast: false
       matrix:

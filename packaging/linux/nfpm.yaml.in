@@ -69,6 +69,9 @@ overrides:
     # Sonames rather than package names: RPM provides them automatically and
     # every RPM family satisfies them under its own package names.
     depends:
+      - libc.so.6(GLIBC_2.35)(64bit)
+      - libstdc++.so.6(GLIBCXX_3.4.30)(64bit)
+      - libgcc_s.so.1()(64bit)
       - libdbus-1.so.3()(64bit)
       - libGL.so.1()(64bit)
       - libEGL.so.1()(64bit)
