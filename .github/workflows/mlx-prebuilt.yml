@@ -46,7 +46,10 @@ jobs:
         with:
           path: .ccache
           key: ${{ steps.key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ steps.key.outputs.key }}-
+          # ccache checks every hit itself, so any cache for this arch is safe.
+          restore-keys: |
+            ${{ steps.key.outputs.key }}-
+            ccache-linux-${{ matrix.arch }}-
       # Stopped by `timeout` with time left to save the cache.
       - name: Build MLX
         id: build
@@ -110,7 +113,9 @@ jobs:
         with:
           path: .ccache
           key: ${{ steps.key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ steps.key.outputs.key }}-
+          restore-keys: |
+            ${{ steps.key.outputs.key }}-
+            ccache-windows-x86_64-
       # Stopped by the step timeout with time left to save the cache.
       - name: Build MLX
         id: build

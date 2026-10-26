@@ -187,8 +187,8 @@ prebuilt copy instead.
 | `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
-On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`),
-`dl.lib` and the compiled delay-load helper, `mlx_delayload.lib`.
+On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
+and `dl.lib`.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
 compiler (only `msvc` on Windows, whose toolsets link older ones), nvcc,
