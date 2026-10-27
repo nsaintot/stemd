@@ -50,11 +50,17 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr) -> Result<Server>
     // loaded at CPU speed. A card whose runtime is missing looks exactly like
     // no card in every later line, and only one of the two has a fix.
     if stemd_core::Accelerator::gpu_refused() {
-        tracing::warn!(
-            "a GPU is installed but its runtime is not usable from here, so this \
-             runs on the CPU. Run with --install-cuda to fetch it (about 1.2 GB, \
-             once), or put the libraries beside the executable yourself."
-        );
+        if cfg!(windows) {
+            tracing::warn!(
+                "a GPU is installed but its runtime is not usable from here, so this \
+                 runs on the CPU. Run with --install-cuda to fetch it (about 1.2 GB, \
+                 once), or put the libraries beside the executable yourself."
+            );
+        } else {
+            tracing::warn!(
+                "a GPU is installed but failed a test computation, so this runs on the CPU."
+            );
+        }
     }
     let settings = Arc::new(open_settings(args)?);
     let (stems, cache_summary) = open_stem_cache(args)?;
