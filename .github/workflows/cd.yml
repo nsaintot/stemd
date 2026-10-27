@@ -145,6 +145,12 @@ jobs:
           appimage=$(ls dist/*.AppImage)
           (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null)
           LD_LIBRARY_PATH="$PWD/dist/stub" "$RUNNER_TEMP/squashfs-root/AppRun" --version
+      # The runner has no GPU, and the stub libcuda finds no device.
+      - name: CPU separation
+        timeout-minutes: 30
+        run: |
+          root="$RUNNER_TEMP/squashfs-root"
+          LD_LIBRARY_PATH="$PWD/dist/stub" .github/scripts/cpu-separation.sh "$root/AppRun" "$root/opt/stemd/bin/stemd-cli"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
@@ -268,6 +274,12 @@ jobs:
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
           Test-Version (Join-Path $installed 'stemd-server.exe')
           Test-Version (Join-Path $installed 'stemd-cli.exe')
+      # The runner has no NVIDIA driver.
+      - name: CPU separation
+        timeout-minutes: 30
+        run: |
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
+          .github/scripts/cpu-separation.ps1 -Server (Join-Path $installed 'stemd-server.exe') -Cli (Join-Path $installed 'stemd-cli.exe')
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64

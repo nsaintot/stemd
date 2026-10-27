@@ -190,6 +190,10 @@ prebuilt copy instead.
 On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
 and `dl.lib`.
 
+`mlx-sys` patches MLX's CUDA allocator so a CUDA build also runs on the CPU of a
+machine without a CUDA device. CD checks this with a CPU separation on the Linux
+and Windows runners, which have no GPU.
+
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
 compiler (only `msvc` on Windows, whose toolsets link older ones), nvcc,
 cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a
