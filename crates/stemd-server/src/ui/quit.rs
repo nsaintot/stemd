@@ -86,8 +86,7 @@ pub fn dialog(ui: &mut egui::Ui, palette: &Palette, track: &str) -> Option<Choic
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(format!(
-            "{track} is not finished. Quitting now throws away the work done \
-             so far — nothing is written until a separation completes."
+            "{track} is not finished. Quitting now will cancel the current separation."
         ))
         .color(palette.muted),
     );

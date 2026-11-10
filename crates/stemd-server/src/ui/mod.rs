@@ -19,6 +19,7 @@ mod probe;
 mod quit;
 mod recents;
 mod section;
+mod starting;
 mod status;
 mod theme;
 
@@ -29,6 +30,7 @@ use eframe::egui;
 
 use crate::api::AppState;
 use crate::drops::{AUDIO_EXTENSIONS, Dropped, looks_like_audio};
+use crate::launch::Launch;
 
 use theme::{Palette, Sheen};
 
@@ -56,7 +58,7 @@ const WINDOW_ICON: &[u8] = include_bytes!("../../../../resources/stemd-icon-mac-
 #[cfg(not(target_os = "macos"))]
 const WINDOW_ICON: &[u8] = include_bytes!("../../../../resources/stemd-icon-win-256.png");
 
-pub fn run(state: Arc<AppState>, bind: SocketAddr) -> Result<(), eframe::Error> {
+pub fn run(launch: Arc<Launch>, bind: SocketAddr) -> Result<(), eframe::Error> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(MIN_WINDOW_SIZE)
@@ -93,9 +95,43 @@ pub fn run(state: Arc<AppState>, bind: SocketAddr) -> Result<(), eframe::Error> 
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
-            Ok(Box::new(Window::new(state, bind, &cc.egui_ctx)))
+            Ok(Box::new(App {
+                launch,
+                bind,
+                window: None,
+            }))
         }),
     )
+}
+
+/// The startup view until the server is ready, then [`Window`].
+struct App {
+    launch: Arc<Launch>,
+    bind: SocketAddr,
+    window: Option<Window>,
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.window.is_none()
+            && let Some(state) = self.launch.ready()
+        {
+            self.window = Some(Window::new(Arc::clone(state), self.bind, ui.ctx()));
+        }
+        match &mut self.window {
+            Some(window) => window.ui(ui),
+            None => starting::show(ui, &self.launch),
+        }
+    }
+
+    /// The only shutdown the window ever gets.
+    ///
+    /// Cmd-Q goes `[NSApp terminate:]` to `applicationWillTerminate:` to winit's
+    /// `LoopExiting` to here, and AppKit calls `exit()` as soon as that returns. It is
+    /// the last point at which the worker can be taken out of the model.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::shutdown::quit(&self.launch, "window closed")
+    }
 }
 
 struct Window {
@@ -133,8 +169,8 @@ impl Window {
     }
 }
 
-impl eframe::App for Window {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl Window {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(REPAINT_INTERVAL);
         // The appearance can change under a running window, and the style was
@@ -190,10 +226,6 @@ impl eframe::App for Window {
         });
 
         header::switch_dialog(&ctx, &self.state, &palette);
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.shutdown()
     }
 }
 
@@ -310,15 +342,6 @@ impl Window {
                 drops.accept(&state, path);
             })
             .expect("spawning the file picker");
-    }
-
-    /// The only shutdown the window ever gets.
-    ///
-    /// Cmd-Q goes `[NSApp terminate:]` to `applicationWillTerminate:` to winit's
-    /// `LoopExiting` to here, and AppKit calls `exit()` as soon as that returns. It is
-    /// the last point at which the worker can be taken out of the model.
-    fn shutdown(&self) -> ! {
-        crate::shutdown::now(&self.state, "window closed")
     }
 }
 

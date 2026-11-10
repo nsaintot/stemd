@@ -10,12 +10,14 @@ use anyhow::{Context, Result};
 use axum::extract::DefaultBodyLimit;
 
 use crate::api::{self, AppState};
-use crate::startup::Server;
+use crate::cli::Args;
+use crate::launch::{Launch, Stage};
+use crate::logbuf::LogBuffer;
 
 /// Take the port, before anything else is done.
 ///
 /// Called ahead of [`crate::startup::prepare`], which is the point of it being
-/// separate from [`run`]. Two things follow.
+/// separate from [`headless`] and [`windowed`]. Two things follow.
 ///
 /// A second launch fails here, in milliseconds, instead of after the model is
 /// loaded, which was four seconds on a warm CUDA machine and over a minute on a
@@ -35,36 +37,88 @@ pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
     Ok(listener)
 }
 
-/// Serve until the window closes or a signal arrives.
-pub fn run(server: Server, listener: std::net::TcpListener, headless: bool) -> Result<()> {
+/// Prepare the server, then serve until a signal arrives.
+pub fn headless(args: &Args, logs: LogBuffer, listener: std::net::TcpListener) -> Result<()> {
+    let addr = listener.local_addr().context("reading the bound address")?;
+    let launch = Arc::new(Launch::default());
+    let server = crate::startup::prepare(args, logs, addr, &launch)?;
+    let runtime = runtime()?;
+    launch.finish(Arc::clone(&server.state));
+    watch_for_signals(&runtime, &launch);
+    runtime
+        .block_on(listen(
+            server.state,
+            listener,
+            server.max_upload,
+            server.cache_summary,
+        ))
+        .context("serving")
+}
+
+/// Open the window at once and prepare the server behind it.
+///
+/// With no model on disk the window asks which one to download, then shows the
+/// download and the load. Serving starts when the model is loaded. A failed
+/// startup is shown in the window until it is closed.
+pub fn windowed(args: Args, logs: LogBuffer, listener: std::net::TcpListener) -> Result<()> {
     // The address the socket actually got, which is the one to show and to
     // advertise. It answers `--bind :0`, where the requested address names no
     // port anyone could connect to.
     let bind = listener.local_addr().context("reading the bound address")?;
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building the tokio runtime")?;
-
-    let serving = runtime.spawn(listen(
-        Arc::clone(&server.state),
-        listener,
-        server.max_upload,
-        server.cache_summary,
-    ));
+    let runtime = runtime()?;
+    let launch = Arc::new(Launch::windowed());
 
     // Both ways out, not just the headless one: a windowed server started from a
     // terminal is still Ctrl-C'd from that terminal, and without this it would
     // die on the default action with the worker still in the model and the mDNS
     // advertisement still standing.
-    watch_for_signals(&runtime, &server.state);
+    watch_for_signals(&runtime, &launch);
 
-    if headless {
-        runtime.block_on(serving).context("server task panicked")?
-    } else {
-        window(&server.state, bind)
-    }
+    let handle = runtime.handle().clone();
+    let behind = Arc::clone(&launch);
+    std::thread::Builder::new()
+        .name("stemd-startup".into())
+        .spawn(move || {
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::startup::prepare(&args, logs, bind, &behind)
+            }));
+            match prepared {
+                Ok(Ok(server)) => {
+                    let state = Arc::clone(&server.state);
+                    handle.spawn(async move {
+                        if let Err(err) = listen(
+                            server.state,
+                            listener,
+                            server.max_upload,
+                            server.cache_summary,
+                        )
+                        .await
+                        {
+                            tracing::error!("{err:#}");
+                        }
+                    });
+                    behind.finish(state);
+                }
+                Ok(Err(err)) => {
+                    tracing::error!("startup failed: {err:#}");
+                    behind.set(Stage::Failed(format!("{err:#}")));
+                }
+                // The panic hook has already logged where.
+                Err(_) => behind.set(Stage::Failed(
+                    "startup panicked; the log has the details".into(),
+                )),
+            }
+        })
+        .context("spawning the startup thread")?;
+
+    window(&launch, bind)
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")
 }
 
 /// Serve on a listener that is already bound.
@@ -99,11 +153,11 @@ async fn listen(
 /// A signal does not unwind the stack, so no `Drop` runs: without this the
 /// worker would still be in the model when the process tore itself down, and
 /// clients would chase a dead server until its TTL expired.
-fn watch_for_signals(runtime: &tokio::runtime::Runtime, state: &Arc<AppState>) {
-    let state = Arc::clone(state);
+fn watch_for_signals(runtime: &tokio::runtime::Runtime, launch: &Arc<Launch>) {
+    let launch = Arc::clone(launch);
     runtime.spawn(async move {
         if asked_to_stop().await {
-            crate::shutdown::now(&state, "signal received");
+            crate::shutdown::quit(&launch, "signal received");
         }
     });
 }
@@ -161,7 +215,7 @@ async fn asked_to_stop() -> bool {
 /// `exit()` the moment its delegate returns, so the only path reaching the line
 /// below is `run_native` failing before the window is up. Windows and Linux return
 /// normally when the event loop ends.
-fn window(state: &Arc<AppState>, bind: SocketAddr) -> Result<()> {
-    crate::ui::run(Arc::clone(state), bind).map_err(|e| anyhow::anyhow!("{e}"))?;
-    crate::shutdown::now(state, "window closed")
+fn window(launch: &Arc<Launch>, bind: SocketAddr) -> Result<()> {
+    crate::ui::run(Arc::clone(launch), bind).map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::shutdown::quit(launch, "window closed")
 }

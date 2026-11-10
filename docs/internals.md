@@ -131,32 +131,19 @@ interfaces: en0=192.0.2.11 en7=198.51.100.4 bridge100=203.0.113.1
 `--no-mdns` disables it; `--instance` sets the name. Advertisement failure is
 logged and ignored: a client with the address configured out of band still works.
 
-## Window
+## Drops
 
-The window is the default because this ships as an `.app`, where stdout goes
-nowhere and there would otherwise be no way to use it at all. It is a drop target
-first: a track dropped on it becomes a job, and the stems land in
-`<track>-stems/` beside the source file. Under that are the model and output
-controls, the list of what has been separated and where it went, and the log.
-Closing it stops the server.
+A file dropped on the window is the same job a `POST /v1/jobs` makes: same hash
+ingredients, same store, same worker. A drop and a client asking for the same
+track join one separation, and the same file twice is a cache hit. `drops.rs`
+differs at two points: the audio comes from a file, and it always asks for the
+derived part, because a folder of stems has no mix to rebuild it from.
 
-A drop is **the same job** a `POST /v1/jobs` makes: same hash ingredients, same
-store, same worker, so a drop and a deck asking for the same track join one
-separation, and the same file twice is a cache hit. `drops.rs` is an adapter,
-differing at two points: the audio comes from a file rather than a socket, and it
-always asks for the derived part, because a folder of stems carries no mix to
-rebuild it from.
+The GUI owns the main thread on macOS, so the HTTP runtime is built explicitly in
+both modes instead of through `#[tokio::main]`.
 
-The log view is a second *view* over the ring buffer `GET /v1/logs` serves, never
-a second logging path. Because the GUI owns the main thread on macOS, the HTTP
-runtime is driven explicitly in both modes rather than through `#[tokio::main]`.
-
-Window bugs are testable without a window. `ui/probe.rs` runs egui headless:
-`Context::run_ui` takes synthetic pointer input and returns the shapes that would
-have been drawn: enough to ask whether hovering something grows a scroll bar, or
-whether a full log fills its box. Both were real bugs, both "fixed" by eye first.
-Each such test ships with one that reproduces the bug, because a sweep that finds
-nothing is not a passing test.
+`ui/probe.rs` runs egui headless (`Context::run_ui` with synthetic input) to test
+layout without a window.
 
 ## Logging
 
@@ -166,10 +153,8 @@ mechanics: timings, bookkeeping, paths that did no work. A whole separation
 costs two `info` lines.
 
 The two sinks are filtered apart: the console takes `info` and up, which is what
-a headless run should print, while the buffer behind the window and `/v1/logs`
-keeps `debug` too, so the level dropdown has something to reveal and the detail
-that explains a bug is already recorded rather than one restart away. `RUST_LOG`
-overrides both at once.
+a headless run should print, while the buffer behind `/v1/logs` keeps `debug`
+too. `RUST_LOG` overrides both at once.
 
 ## Settings
 
@@ -179,16 +164,14 @@ stored as the string the matching flag would take, so the file stays
 hand-editable and one unreadable field costs that field rather than the file.
 
 A flag is for one run, so the store keeps two copies: what the file says and
-what this run is using. Disabling the pinned control is not enough on its own: a
-write serialises the whole document, so changing the *rate* in the window would
-otherwise carry a `--output-format` flag into the file beside it.
+what this run is using. A write serializes the whole document, so without the
+second copy a change to the rate would also save a `--output-format` flag.
 
 Format and rate are a pair, and a pair that cannot exist is reconciled rather
 than attempted: `mp3` has no 96 kHz mode, and LAME does not refuse one it lacks:
 it turns on its own resampler and spends eighteen seconds a stem producing a
-48 kHz file nobody asked for. The pair can be made invalid four ways (two flags,
-two menus, a hand-edited file, a file from a version that allowed it), which is
-why the invariant lives here rather than at each control.
+48 kHz file nobody asked for. Flags, the settings UI, a hand-edited file and an
+older file can all produce an invalid pair, so the store enforces it.
 
 ## Shutdown
 
@@ -203,17 +186,7 @@ gone and MLX has not been seen to do this, but it is the same shape of hazard: a
 statically linked C++ runtime holding a Metal device and an allocator in globals,
 and skipping `atexit` costs a dying process nothing.
 
-**Closing the window mid-separation asks first.** The exit above is correct but
-silent, and a quality separation is four minutes: closing one minute in threw
-that minute away with no way back. The close request is vetoed, a modal names
-the running track, and only `Quit anyway` lets it through. An idle window closes
-on the first click, there is nothing to lose, so there is nothing to ask.
-
-`Cmd-Q` is not covered and cannot be. It is `[NSApp terminate:]`, which reaches
-`applicationWillTerminate:` and then calls `exit()` as soon as the delegate
-returns; there is no point in that path where a window can say "wait". `Cmd-Q`
-mid-separation is still safe, it goes through `shutdown::now` like everything
-else, cancels the job and does not crash. It just does not ask.
+Cmd-Q goes through `shutdown::now` too and cancels the running job.
 
 ## Writing the stems
 

@@ -52,7 +52,7 @@ pub fn list(
     if items.is_empty() {
         ui.add_space(2.0);
         ui.label(
-            egui::RichText::new("Nothing yet. Dropped tracks show up here.")
+            egui::RichText::new("No separated tracks")
                 .size(11.5)
                 .color(palette.muted),
         );

@@ -111,7 +111,7 @@ fn cache_controls(ui: &mut egui::Ui, state: &AppState, palette: &Palette) {
             stats.tracks > 0,
             egui::Button::new(egui::RichText::new("Empty cache").size(TEXT)),
         )
-        .on_hover_text("Delete every separated stem. Tracks separate again on the next request.")
+        .on_hover_text("Delete all separated tracks")
         .clicked()
     {
         let (tracks, freed) = state.cache.clear();

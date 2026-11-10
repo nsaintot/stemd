@@ -98,7 +98,7 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, view: &mut View, lines: &[LogL
                     !lines.is_empty(),
                     egui::Button::new(egui::RichText::new("Clear").size(CONTROL_TEXT)),
                 )
-                .on_hover_text("Empty the buffer. GET /v1/logs reads the same one.")
+                .on_hover_text("Clears the logs")
                 .clicked();
             ui.checkbox(
                 &mut view.follow,
