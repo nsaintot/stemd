@@ -91,6 +91,7 @@ POST /v1/jobs?sample_rate=44100&channels=2&format=f32le
 | `output_format` | `default_output_format` | `flac`, `wav`, `mp3`, `pcm16`, `pcm32` |
 | `output_sample_rate` | `default_output_sample_rate` | `24000`, `44100`, `48000` or `96000` |
 | `include_derived` | `false` | ship the derived part too, rather than leaving the client to rebuild it |
+| `parts` | `harmonics,vocals` | comma-separated parts to ship; see below |
 | `dsp_mode` | `0` | filter the output conversion runs through; see below |
 
 The two defaults are set in the server's window and persist across its launches,
@@ -108,6 +109,32 @@ duration gate sees it.
 curl -X POST --data-binary @track.pcm \
   "http://host:8420/v1/jobs?sample_rate=44100&channels=2&format=s16le"
 ```
+
+#### `parts`
+
+Every model separates four sources: `drums`, `bass`, `other` and `vocals`.
+`harmonics` is `bass` and `other` together. A job lists the parts it wants:
+
+| `parts` | ships | the client rebuilds |
+|---|---|---|
+| `harmonics,vocals` (default) | `harmonics`, `vocals` | `drums` |
+| `bass,other,vocals` | `vocals`, `bass`, `other` | `drums` |
+| `drums,vocals` | `vocals`, `drums` | `harmonics` |
+| `drums,bass,other,vocals` | all four | nothing |
+
+- Parts may not overlap: `harmonics,bass` is refused.
+- They must leave out one part or none. The part left out is the one the client
+  rebuilds as `mix` minus the stems, and the one `include_derived` adds. The
+  result names it in `derived_stem`, which is `null` when nothing is left out.
+- `parts` in `/v1/health` lists what the loaded model offers. Every preset offers
+  all five.
+- Stems ship in the order `harmonics`, `vocals`, `drums`, `bass`, `other`.
+- `Balanced` runs a third model, `htdemucs_ft`'s bass specialist, when a job asks
+  for `bass` or `other`: about 1.5x the time. `Fast` and `Quality` get every part
+  from one pass.
+- With nothing left out, `Fast` ships its model's four sources as they are, and
+  they miss the mix by the model's residual (around −30 dB). `Balanced` and
+  `Quality` build `other` as the remainder, so the four sum exactly.
 
 #### `dsp_mode`
 
@@ -168,7 +195,7 @@ then.
     {"name": "harmonics", "path": "~/Library/Caches/stemd/<key>/harmonics.flac",
      "url": "/v1/jobs/{id}/stems/harmonics", "bytes": 2216440, "gain": 1.0}
   ],
-  "model_residual_db": -35.2,
+  "model_residual_db": -35.2, "derived_stem": "drums",
   "separation_secs": 1.39, "realtime_factor": 21.6,
   "cached": false
 }
@@ -296,11 +323,10 @@ compatibility without a round trip:
 model=htdemucs  path=/v1  v=1  version=0.1.0
 ```
 
-**`v=1` is the whole contract.** It means two stems (`harmonics` and `vocals`)
-and a third the client rebuilds from the mix itself. That pair has never varied
-and cannot: it is what protocol 1 *is*. If it ever changes, that is `v=2`, and a
-client checking the version rejects the server before it has to wonder what it
-was sent.
+**`v=1` is the whole contract.** It means a job that names no `parts` gets two
+stems (`harmonics` and `vocals`) and a third the client rebuilds from the mix
+itself. `parts` changes that only for a client that asks. Changing the default
+is protocol 2, `v=2`, which a client checking the version rejects.
 
 There used to be a `stems=harmonics,vocals` entry saying the same thing a second
 time. It was dropped because a field that cannot vary invites a branch that can

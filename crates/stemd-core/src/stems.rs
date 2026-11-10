@@ -53,6 +53,194 @@ pub const STEM_SOURCES: [(&str, &[&str]); 2] =
 /// third part.
 pub const PARTS: [&str; 3] = ["drums", "harmonics", "vocals"];
 
+/// Every part a job can ask for, in the order they ship. `harmonics` is `bass` and
+/// `other` together.
+pub const PART_NAMES: [&str; 5] = ["harmonics", "vocals", "drums", "bass", "other"];
+
+/// `a - b`, sample by sample.
+pub fn minus(a: &Audio, b: &Audio) -> Audio {
+    let data = a
+        .data
+        .iter()
+        .zip(&b.data)
+        .map(|(x, y)| x.iter().zip(y).map(|(p, q)| p - q).collect())
+        .collect();
+    Audio::new(data, a.sample_rate)
+}
+
+/// `mix` minus every part in `parts`.
+pub fn remainder<'a>(mix: &Audio, parts: impl IntoIterator<Item = &'a Audio>) -> Audio {
+    let mut out = mix.clone();
+    for part in parts {
+        for (c, ch) in out.data.iter_mut().enumerate() {
+            for (i, sample) in ch.iter_mut().enumerate() {
+                *sample -= at(part, c, i);
+            }
+        }
+    }
+    out
+}
+
+/// Every part name, for a separator that can produce all of them.
+pub fn all_parts() -> Vec<String> {
+    PART_NAMES.iter().map(|p| (*p).to_owned()).collect()
+}
+
+/// The model sources a part is made of.
+pub fn sources_of(part: &str) -> Option<&'static [&'static str]> {
+    Some(match part {
+        "harmonics" => &["bass", "other"],
+        "vocals" => &["vocals"],
+        "drums" => &["drums"],
+        "bass" => &["bass"],
+        "other" => &["other"],
+        _ => return None,
+    })
+}
+
+/// Any set of [`PART_NAMES`], unchecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PartSet(u8);
+
+impl PartSet {
+    fn bit(part: &str) -> Option<u8> {
+        PART_NAMES.iter().position(|p| *p == part).map(|i| 1 << i)
+    }
+
+    /// Parse a comma-separated list, refusing unknown names.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let mut set = Self::default();
+        for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            set.0 |= Self::bit(name)
+                .ok_or_else(|| format!("unknown part {name:?}; expected some of {PART_NAMES:?}"))?;
+        }
+        Ok(set)
+    }
+
+    pub fn has(self, part: &str) -> bool {
+        Self::bit(part).is_some_and(|b| self.0 & b != 0)
+    }
+
+    #[must_use]
+    pub fn with(self, part: &str) -> Self {
+        Self(self.0 | Self::bit(part).unwrap_or(0))
+    }
+
+    #[must_use]
+    pub fn without(self, part: &str) -> Self {
+        Self(self.0 & !Self::bit(part).unwrap_or(0))
+    }
+
+    /// The parts, in [`PART_NAMES`] order.
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        PART_NAMES.into_iter().filter(move |p| self.has(p))
+    }
+
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::Display for PartSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.names().collect::<Vec<_>>().join(","))
+    }
+}
+
+/// The parts a job ships.
+///
+/// The sources they cover must not overlap, and what they leave out must be one
+/// part or nothing: that part is the one a player rebuilds as `mix` minus the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Parts(PartSet);
+
+impl Parts {
+    /// `harmonics` and `vocals`, with `drums` rebuilt: protocol 1.
+    pub const DEFAULT: Self = Self(PartSet(0b00011));
+
+    /// [`Self::DEFAULT`] and its derived part.
+    pub const DEFAULT_WITH_DERIVED: PartSet = PartSet(0b00111);
+
+    /// Parse a comma-separated list such as `bass,other,vocals`.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        Self::try_from(PartSet::parse(list)?)
+    }
+
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        self.0.names()
+    }
+
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(self, part: &str) -> bool {
+        self.0.has(part)
+    }
+
+    /// Model sources none of the parts cover.
+    pub fn left_out(self) -> Vec<&'static str> {
+        FOUR_STEM_SOURCES
+            .into_iter()
+            .filter(|source| {
+                !self
+                    .names()
+                    .any(|part| sources_of(part).is_some_and(|s| s.contains(source)))
+            })
+            .collect()
+    }
+
+    /// The part a player rebuilds: whatever is left out, or nothing if all is shipped.
+    pub fn derived(self) -> Option<&'static str> {
+        let left = self.left_out();
+        PART_NAMES.into_iter().find(|part| {
+            sources_of(part)
+                .is_some_and(|s| s.len() == left.len() && s.iter().all(|x| left.contains(x)))
+        })
+    }
+}
+
+impl TryFrom<PartSet> for Parts {
+    type Error = String;
+
+    fn try_from(set: PartSet) -> Result<Self, String> {
+        if set.is_empty() {
+            return Err("ask for at least one part".into());
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for part in set.names() {
+            for source in sources_of(part).expect("a known part") {
+                if seen.contains(source) {
+                    return Err(format!("{source} is asked for twice"));
+                }
+                seen.push(source);
+            }
+        }
+        let parts = Self(set);
+        if !parts.left_out().is_empty() && parts.derived().is_none() {
+            return Err(format!(
+                "{set} leaves {:?} out, which is not one part; ask for all but one",
+                parts.left_out()
+            ));
+        }
+        Ok(parts)
+    }
+}
+
+impl std::fmt::Display for Parts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The part a player reconstructs rather than receiving. Player-side only, and
 /// fixed. See the module docs for why it is `drums`.
 pub const DERIVED: &str = "drums";
@@ -108,12 +296,15 @@ pub struct Stems {
     /// miss. An arrangement that builds one part by subtraction has no such redundancy
     /// and collapses to float noise.
     pub model_residual_db: f64,
+    /// Parts beyond [`SHIPPED`] that this separation estimated.
+    pub more: Vec<(&'static str, Audio)>,
 }
 
 impl Stems {
     pub fn stem(&self, name: &str) -> Option<&Audio> {
         self.shipped
             .iter()
+            .chain(&self.more)
             .find(|(n, _)| *n == name)
             .map(|(_, audio)| audio)
     }
@@ -122,15 +313,7 @@ impl Stems {
     ///
     /// This is the model's own version plus the residual.
     pub fn derived_part(&self, mix: &Audio) -> Audio {
-        let mut out = mix.clone();
-        for (_, stem) in &self.shipped {
-            for (c, ch) in out.data.iter_mut().enumerate() {
-                for (i, sample) in ch.iter_mut().enumerate() {
-                    *sample -= at(stem, c, i);
-                }
-            }
-        }
-        out
+        remainder(mix, self.shipped.iter().map(|(_, stem)| stem))
     }
 
     /// Apply the three faders.
@@ -181,12 +364,13 @@ fn at(audio: &Audio, c: usize, i: usize) -> f32 {
 }
 
 /// Level of `mix - sum(sources)` relative to `mix`, in dB.
-pub fn unexplained_db(mix: &Audio, sources: &[Audio]) -> f64 {
+pub fn unexplained_db<'a>(mix: &Audio, sources: impl IntoIterator<Item = &'a Audio>) -> f64 {
+    let sources: Vec<&Audio> = sources.into_iter().collect();
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (c, mix_ch) in mix.data.iter().enumerate() {
         for (i, m) in mix_ch.iter().enumerate() {
             let mut sum = 0.0f32;
-            for src in sources {
+            for src in &sources {
                 sum += at(src, c, i);
             }
             num += f64::from(m - sum).powi(2);
@@ -223,8 +407,27 @@ mod tests {
         let stems = Stems {
             model_residual_db: unexplained_db(&mix, &flat),
             shipped,
+            more: Vec::new(),
         };
         (mix, stems)
+    }
+
+    #[test]
+    fn the_default_parts_are_protocol_1() {
+        assert_eq!(Parts::DEFAULT.names().collect::<Vec<_>>(), SHIPPED);
+        assert_eq!(Parts::DEFAULT.derived(), Some(DERIVED));
+        assert_eq!(Parts::parse("vocals,harmonics"), Ok(Parts::DEFAULT));
+    }
+
+    #[test]
+    fn a_request_names_what_is_rebuilt() {
+        let derived = |list: &str| Parts::parse(list).map(Parts::derived);
+        assert_eq!(derived("bass,other,vocals"), Ok(Some("drums")));
+        assert_eq!(derived("drums,vocals"), Ok(Some("harmonics")));
+        assert_eq!(derived("drums,bass,other,vocals"), Ok(None));
+        assert!(derived("harmonics,bass").is_err(), "bass twice");
+        assert!(derived("vocals").is_err(), "three sources left out");
+        assert!(derived("piano").is_err());
     }
 
     #[test]

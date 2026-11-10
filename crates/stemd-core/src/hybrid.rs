@@ -49,7 +49,7 @@ use crate::backend::{BackendInfo, Separate};
 use crate::mixture::Normalisation;
 use crate::pcm::Audio;
 use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
-use crate::stems::{PARTS, Stems};
+use crate::stems::{Parts, Stems, minus};
 
 /// Progress is reported in thousandths rather than in chunks, because the two
 /// halves are nowhere near the same size.
@@ -75,14 +75,9 @@ fn within(base: u32, span: u32, done: usize, total: usize) -> Progress {
 
 pub struct HybridConfig {
     pub overlap: f32,
-    /// What the vocals half runs at, and what the drums half runs at.
-    ///
-    /// Two fields rather than one because the halves do not want the same answer. In
-    /// `Preset::Quality` the vocals half is a BS-RoFormer and the drums half is a
-    /// demucs, and on CUDA those want opposite precisions. The caller chooses,
-    /// through [`Precision::preferred`](crate::Precision::preferred).
+    /// Precision of the vocals half. See [`Precision::preferred`](crate::Precision::preferred).
     pub vocals_precision: Precision,
-    /// See [`Self::vocals_precision`].
+    /// Precision of the drums half.
     pub drums_precision: Precision,
     /// Hand the drums half the instrumental rather than the mixture.
     ///
@@ -104,7 +99,7 @@ impl Default for HybridConfig {
     }
 }
 
-fn open(dir: &Path, name: &str, precision: Precision) -> Result<Weights> {
+pub(crate) fn open(dir: &Path, name: &str, precision: Precision) -> Result<Weights> {
     let path = dir.join(format!("{name}.safetensors"));
     Weights::load(&path)?.cast(precision)
 }
@@ -155,6 +150,8 @@ impl Half {
 pub struct HybridSeparator {
     vocals: Half,
     drums: Half,
+    /// A bass specialist, run only for a job that asks for `bass` or `other`.
+    bass: Option<Half>,
     model: String,
     sample_rate: u32,
     channels: usize,
@@ -163,6 +160,7 @@ pub struct HybridSeparator {
 
 /// Index of a source in demucs's `drums, bass, other, vocals` order.
 const DRUMS: i32 = 0;
+const BASS: i32 = 1;
 const VOCALS: i32 = 3;
 
 impl HybridSeparator {
@@ -192,14 +190,19 @@ impl HybridSeparator {
         // if it somehow did not.
         let precision = config.vocals_precision;
         let weights = open(dir, artefact, precision)?;
-        Ok(Self::assemble(
+        let mut separator = Self::assemble(
             Half::demucs(&weights, VOCALS, precision)
                 .with_context(|| format!("loading {artefact}'s vocals specialist"))?,
             Half::demucs(&weights, DRUMS, precision)
                 .with_context(|| format!("loading {artefact}'s drums specialist"))?,
             artefact.to_owned(),
             config,
-        ))
+        );
+        separator.bass = Some(
+            Half::demucs(&weights, BASS, precision)
+                .with_context(|| format!("loading {artefact}'s bass specialist"))?,
+        );
+        Ok(separator)
     }
 
     fn assemble(vocals: Half, drums: Half, model: String, config: HybridConfig) -> Self {
@@ -207,67 +210,104 @@ impl HybridSeparator {
         Self {
             vocals,
             drums,
+            bass: None,
             model,
             sample_rate: architecture.sample_rate.unsigned_abs(),
             channels: architecture.audio_channels.unsigned_abs() as usize,
             config,
         }
     }
+}
 
-    fn check_geometry(&self, mix: &Audio) -> Result<()> {
-        if mix.channels() != self.channels {
-            bail!(
-                "these models expect {} channels, got {}",
-                self.channels,
-                mix.channels()
-            );
-        }
-        if mix.sample_rate != self.sample_rate {
-            bail!(
-                "these models expect {} Hz, got {} Hz",
-                self.sample_rate,
-                mix.sample_rate
-            );
-        }
-        Ok(())
+pub(crate) fn check_geometry(mix: &Audio, channels: usize, sample_rate: u32) -> Result<()> {
+    if mix.channels() != channels {
+        bail!(
+            "these models expect {channels} channels, got {}",
+            mix.channels()
+        );
     }
+    if mix.sample_rate != sample_rate {
+        bail!(
+            "these models expect {sample_rate} Hz, got {} Hz",
+            mix.sample_rate
+        );
+    }
+    Ok(())
+}
 
-    /// `[C, T]` planes as one `[1, C, T]` array, optionally normalised.
-    fn to_array(&self, mix: &Audio, norm: Option<&Normalisation>) -> Result<Array> {
-        let frames = mix.frames();
-        let mut flat = Vec::with_capacity(self.channels * frames);
-        for channel in &mix.data {
+/// `[C, T]` planes as one `[1, C, T]` array, optionally normalised.
+pub(crate) fn to_array(mix: &Audio, norm: Option<&Normalisation>) -> Result<Array> {
+    let frames = mix.frames();
+    let mut flat = Vec::with_capacity(mix.channels() * frames);
+    for channel in &mix.data {
+        match norm {
+            Some(n) => flat.extend(channel.iter().map(|&v| n.apply(v))),
+            None => flat.extend(channel.iter().copied()),
+        }
+    }
+    let shape = [1, i32::try_from(mix.channels())?, i32::try_from(frames)?];
+    Ok(Array::from_slice(&flat, &shape))
+}
+
+/// One `[C, T]` slice back to planes, optionally denormalised.
+pub(crate) fn to_planes(
+    out: &Array,
+    channels: usize,
+    norm: Option<&Normalisation>,
+    frames: usize,
+) -> Result<Vec<Vec<f32>>> {
+    mlx_rs::transforms::eval([out])?;
+    let full = out.as_dtype(mlx_rs::Dtype::Float32)?;
+    mlx_rs::transforms::eval([&full])?;
+    let flat = full
+        .try_as_slice::<f32>()
+        .map_err(|e| anyhow::anyhow!("the separated stem is not contiguous f32: {e:?}"))?;
+    Ok((0..channels)
+        .map(|c| {
+            let plane = &flat[c * frames..(c + 1) * frames];
             match norm {
-                Some(n) => flat.extend(channel.iter().map(|&v| n.apply(v))),
-                None => flat.extend(channel.iter().copied()),
+                Some(n) => plane.iter().map(|&v| n.restore(v)).collect(),
+                None => plane.to_vec(),
             }
-        }
-        let shape = [1, i32::try_from(self.channels)?, i32::try_from(frames)?];
-        Ok(Array::from_slice(&flat, &shape))
-    }
+        })
+        .collect())
+}
 
-    /// One `[1, 1, C, T]` slice back to planes, optionally denormalised.
-    fn to_planes(
-        &self,
-        out: &Array,
-        norm: Option<&Normalisation>,
-        frames: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        mlx_rs::transforms::eval([out])?;
-        let full = out.as_dtype(mlx_rs::Dtype::Float32)?;
-        mlx_rs::transforms::eval([&full])?;
-        let flat = full
-            .try_as_slice::<f32>()
-            .map_err(|e| anyhow::anyhow!("the separated stem is not contiguous f32: {e:?}"))?;
-        Ok((0..self.channels)
-            .map(|c| {
-                let plane = &flat[c * frames..(c + 1) * frames];
-                match norm {
-                    Some(n) => plane.iter().map(|&v| n.restore(v)).collect(),
-                    None => plane.to_vec(),
-                }
-            })
-            .collect())
+/// The stems from drums and vocals estimates, with harmonics the remainder.
+pub(crate) fn remainder_stems(
+    mix: &Audio,
+    drums: Vec<Vec<f32>>,
+    vocals: Vec<Vec<f32>>,
+    bass: Option<Vec<Vec<f32>>>,
+) -> Stems {
+    let rate = mix.sample_rate;
+    let harmonics: Vec<Vec<f32>> = (0..mix.channels())
+        .map(|c| {
+            (0..mix.frames())
+                .map(|i| mix.data[c][i] - vocals[c][i] - drums[c][i])
+                .collect()
+        })
+        .collect();
+    let (drums, harmonics, vocals) = (
+        Audio::new(drums, rate),
+        Audio::new(harmonics, rate),
+        Audio::new(vocals, rate),
+    );
+    // Constructed to sum, so this is float noise rather than a measurement.
+    let model_residual_db = crate::stems::unexplained_db(mix, [&drums, &harmonics, &vocals]);
+
+    let mut more = Vec::new();
+    if let Some(bass) = bass {
+        let bass = Audio::new(bass, rate);
+        // `other` is the remainder less the bass, so the four sum to the mix.
+        more.push(("other", minus(&harmonics, &bass)));
+        more.push(("bass", bass));
+    }
+    more.push(("drums", drums));
+    Stems {
+        model_residual_db,
+        shipped: vec![("harmonics", harmonics), ("vocals", vocals)],
+        more,
     }
 }
 
@@ -279,8 +319,8 @@ impl HybridSeparator {
 }
 
 impl Separate for HybridSeparator {
-    fn separate(&mut self, mix: &Audio, sink: &dyn ProgressSink) -> Result<Stems> {
-        self.check_geometry(mix)?;
+    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
+        check_geometry(mix, self.channels, self.sample_rate)?;
         sink.update(Progress::new(Stage::Analysing));
 
         let frames = mix.frames();
@@ -303,7 +343,7 @@ impl Separate for HybridSeparator {
         // whose mono statistics are not the mixture's.
         let run = |half: &Half, source: &Audio, base: u32, span: u32| -> Result<Vec<Vec<f32>>> {
             let norm = Normalisation::of(source);
-            let input = self.to_array(source, half.normalised.then_some(&norm))?;
+            let input = to_array(source, half.normalised.then_some(&norm))?;
             let out = over_track(
                 half.model.as_ref(),
                 &input,
@@ -321,8 +361,9 @@ impl Separate for HybridSeparator {
                     Ok(())
                 },
             )?;
-            self.to_planes(
+            to_planes(
                 &out.index((0, half.source)),
+                self.channels,
                 half.normalised.then_some(&norm),
                 frames,
             )
@@ -347,44 +388,27 @@ impl Separate for HybridSeparator {
             mix
         };
 
-        let drums = run(&self.drums, for_drums, vocals_units, UNITS - vocals_units)?;
+        // The bass specialist, when asked for, shares the drums half's span of the
+        // bar: both are one demucs model over the track.
+        let bass_half = self
+            .bass
+            .as_ref()
+            .filter(|_| parts.contains("bass") || parts.contains("other"));
+        let drums_units = match bass_half {
+            Some(_) => (UNITS - vocals_units) / 2,
+            None => UNITS - vocals_units,
+        };
+        let drums = run(&self.drums, for_drums, vocals_units, drums_units)?;
+        let bass = bass_half
+            .map(|half| {
+                let base = vocals_units + drums_units;
+                run(half, mix, base, UNITS - base)
+            })
+            .transpose()?;
         sink.update(within(UNITS, 0, 0, 1));
 
         sink.update(Progress::new(Stage::Reconstructing));
-        let harmonics: Vec<Vec<f32>> = (0..self.channels)
-            .map(|c| {
-                (0..frames)
-                    .map(|i| mix.data[c][i] - vocals[c][i] - drums[c][i])
-                    .collect()
-            })
-            .collect();
-
-        let parts = [
-            ("drums", drums),
-            ("harmonics", harmonics),
-            ("vocals", vocals),
-        ];
-        let audio = |name: &str| {
-            parts
-                .iter()
-                .find(|(part, _)| *part == name)
-                .map(|(_, data)| Audio::new(data.clone(), self.sample_rate))
-                .expect("every part was just built")
-        };
-        debug_assert!(PARTS.iter().all(|p| parts.iter().any(|(n, _)| n == p)));
-
-        Ok(Stems {
-            // Constructed to sum, so this is float noise rather than a
-            // measurement -- see the field's documentation.
-            model_residual_db: crate::stems::unexplained_db(
-                mix,
-                &[audio("drums"), audio("harmonics"), audio("vocals")],
-            ),
-            shipped: crate::stems::SHIPPED
-                .iter()
-                .map(|stem| (*stem, audio(stem)))
-                .collect(),
-        })
+        Ok(remainder_stems(mix, drums, vocals, bass))
     }
 
     fn info(&self) -> BackendInfo {
@@ -400,6 +424,11 @@ impl Separate for HybridSeparator {
             stems: crate::stems::SHIPPED.iter().map(|s| (*s).into()).collect(),
             // Asked, for the same reason as the single-model path.
             device: stemd_mlx::Accelerator::detect().as_str().into(),
+            parts: if self.bass.is_some() {
+                crate::stems::all_parts()
+            } else {
+                ["harmonics", "vocals", "drums"].map(String::from).to_vec()
+            },
         }
     }
 }
@@ -418,6 +447,7 @@ mod tests {
     #[test]
     fn the_specialists_are_the_sources_they_are_named_for() {
         assert_eq!(FOUR_STEM_SOURCES[DRUMS.unsigned_abs() as usize], "drums");
+        assert_eq!(FOUR_STEM_SOURCES[BASS.unsigned_abs() as usize], "bass");
         assert_eq!(FOUR_STEM_SOURCES[VOCALS.unsigned_abs() as usize], "vocals");
     }
 

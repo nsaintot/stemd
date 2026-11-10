@@ -231,8 +231,8 @@ fn where_roformer_spends_its_time() {
     let transform = best("transformer", &|| {
         model.transform(&embedded).expect("transform")
     });
-    let masked = model.mask(&transformed).expect("mask");
-    let mask = best("mask", &|| model.mask(&transformed).expect("mask"));
+    let masked = model.mask(0, &transformed).expect("mask");
+    let mask = best("mask", &|| model.mask(0, &transformed).expect("mask"));
 
     // Measured, not subtracted. This is the whole reason `apply` is a method:
     // the tail used to be `whole - embed - transform - mask`, which reported

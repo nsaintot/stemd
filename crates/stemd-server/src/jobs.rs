@@ -45,6 +45,9 @@ pub struct JobResult {
     /// Level of `mix - sum(model sources)`, in dB relative to the mix.
     /// Diagnostic: what the model failed to explain about the track.
     pub model_residual_db: f64,
+    /// The part a client rebuilds as `mix` minus `stems`; `None` when the stems
+    /// cover the mix.
+    pub derived_stem: Option<&'static str>,
     /// What the separation cost when it ran, which for a cache hit was some
     /// earlier job.
     pub separation_secs: f64,
@@ -76,6 +79,7 @@ impl JobResult {
                 })
                 .collect(),
             model_residual_db: entry.model_residual_db,
+            derived_stem: entry.derived,
             separation_secs: entry.separation_secs,
             realtime_factor: entry.realtime_factor(),
             cached,
@@ -605,6 +609,7 @@ mod tests {
             out_format: StemFormat::Pcm32,
             out_rate: stemd_core::OutputRate::default(),
             include_derived: false,
+            parts: stemd_core::Parts::DEFAULT,
             dsp: stemd_core::DspMode::default(),
             model: "digest",
         };

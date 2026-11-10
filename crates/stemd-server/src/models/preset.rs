@@ -29,8 +29,8 @@ use stemd_core::Family;
 /// Named for the trade rather than the checkpoint. See docs/evaluation.md for the
 /// measurements.
 ///
-/// Both are demucs v4. The v3 preset was retired because a bidirectional LSTM is
-/// the one demucs architecture MLX runs badly.
+/// Fast and Balanced are demucs v4. The v3 preset was retired because a
+/// bidirectional LSTM is the one demucs architecture MLX runs badly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     /// `htdemucs` (demucs v4). The cheap end, and the model that won a listening
@@ -43,16 +43,8 @@ pub enum Preset {
     /// as harmonics put all of that error on the part the player rebuilds. Running the
     /// drums and vocals specialists and shipping harmonics as the remainder removes it.
     Balanced,
-    /// BS PolarFormer for the vocals, `htdemucs_ft`'s drums specialist for the rest,
-    /// chained. Two artefacts and two models, and the only preset that is not one
-    /// architecture.
-    ///
-    /// It beats both others on every one of the three parts a player drives, and it
-    /// is slow. See docs/evaluation.md.
-    ///
-    /// The vocals half was `bs_roformer_viperx` until PolarFormer replaced it. The
-    /// two score the same on MUSDB, and PolarFormer leaves far less voice in the
-    /// harmonics on electronic material, which no benchmark here caught.
+    /// stemd's own 4-stem BS-RoFormer; ships drums and vocals, harmonics is the
+    /// remainder. See docs/evaluation.md.
     Quality,
 }
 
@@ -72,43 +64,19 @@ impl Preset {
         match self {
             Self::Fast => "htdemucs v4 — ~22 s per track",
             Self::Balanced => "htdemucs ft — ~48 s per track",
-            Self::Quality => "PolarFormer + htdemucs ft — ~256 s per track",
+            Self::Quality => "stemd RoFormer — ~110 s per track",
         }
-    }
-
-    /// True when this preset cannot meet the 50 s target the player expects.
-    ///
-    /// For a preset that cannot meet the budget by design, not one that can be pushed
-    /// past it by load. `Balanced` was marked until it stopped running two of its four
-    /// models and came in under the target.
-    pub const fn over_budget(self) -> bool {
-        matches!(self, Self::Quality)
     }
 
     /// Artefact name, i.e. what `--demucs-model` takes, what identifies the
     /// preset in the settings file, and what the weights file is called
     /// without its extension.
     ///
-    /// [`Self::Quality`] needs two artefacts and this is the one that names it;
-    /// see [`Self::artefacts`].
     pub const fn artefact(self) -> &'static str {
         match self {
             Self::Fast => "htdemucs",
             Self::Balanced => "htdemucs_ft",
-            Self::Quality => "bs_polarformer",
-        }
-    }
-
-    /// Every artefact the preset needs loaded, the naming one first.
-    ///
-    /// Only [`Self::Quality`] has more than one, and its second is the same
-    /// `htdemucs_ft` [`Self::Balanced`] uses, so a machine with Balanced
-    /// installed only downloads the difference.
-    pub const fn artefacts(self) -> &'static [&'static str] {
-        match self {
-            Self::Fast => &["htdemucs"],
-            Self::Balanced => &["htdemucs_ft"],
-            Self::Quality => &["bs_polarformer", "htdemucs_ft"],
+            Self::Quality => "stemd_roformer",
         }
     }
 
@@ -136,7 +104,7 @@ impl Preset {
     /// hand-named artefact, which is always a single demucs.
     pub const fn families(preset: Option<Self>) -> &'static [Family] {
         match preset {
-            Some(Self::Quality) => &[Family::Roformer, Family::HtDemucs],
+            Some(Self::Quality) => &[Family::Roformer],
             Some(Self::Balanced) => &[Family::HtDemucs, Family::HtDemucs],
             Some(Self::Fast) | None => &[Family::HtDemucs],
         }
@@ -147,10 +115,9 @@ impl Preset {
             Self::Fast => 1,
             // 1 was all four models with harmonics as `bass + other`.
             Self::Balanced => 2,
-            // 1 ran both halves over the mixture. 2 chains them: the drums
-            // half is handed `mix - vocals`. Same weights, same two forward
-            // passes, different audio out.
-            Self::Quality => 2,
+            // 1 and 2 were BS PolarFormer + htdemucs_ft, unchained then chained.
+            // 3 is one 4-stem model.
+            Self::Quality => 3,
         }
     }
 
@@ -168,9 +135,18 @@ impl Preset {
     }
 
     /// Match an artefact name back to a preset, so `--demucs-model` and the
-    /// window cannot disagree about what is loaded.
+    /// window cannot disagree about what is loaded. A preset's former name
+    /// matches it too, so a settings file saved before a swap keeps its choice.
     pub fn from_artefact(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.artefact() == name)
+        Self::ALL
+            .into_iter()
+            .find(|p| p.artefact() == name)
+            .or_else(|| {
+                FORMER
+                    .iter()
+                    .find(|(former, _)| *former == name)
+                    .map(|(_, preset)| *preset)
+            })
     }
 
     pub fn total_bytes(self) -> u64 {
@@ -184,6 +160,9 @@ pub const DEFAULT_PRESET: Preset = Preset::Fast;
 /// What a weights file is called. One place, because both the catalogue and the
 /// loader have to agree on it.
 pub const WEIGHTS_EXTENSION: &str = ".safetensors";
+
+/// Artefacts a preset used to name, and the preset that replaced them.
+const FORMER: [(&str, Preset); 1] = [("bs_polarformer", Preset::Quality)];
 
 /// Retired artefacts, still named so a settings file that mentions one can say
 /// what happened rather than falling back in silence.
@@ -222,22 +201,17 @@ const BALANCED_WEIGHTS: RemoteFile = RemoteFile {
     bytes: 672_024_519,
 };
 
-/// BS PolarFormer, plus the same `htdemucs_ft` Balanced uses.
+/// stemd's own 4-stem BS-RoFormer, float16.
 ///
-/// Uploaded and verified from the public URL: the bytes the network serves hash to
-/// the digest below, which is the one thing a pin cannot check about itself.
-/// Converted by `tools/export/convert_roformer.py` from ZFTurbo's
-/// `model_bs_polarformer_float16.ckpt`, the only form its weights are published in.
+/// Converted by `tools/export/convert_stemd_roformer.py` and then
+/// `tools/export/convert_roformer.py`.
 pub const QUALITY_SOURCE: ModelSource = ModelSource {
-    files: &[
-        RemoteFile {
-            name: "bs_polarformer.safetensors",
-            url: "https://github.com/nsaintot/stemd/releases/download/models-v2/bs_polarformer.safetensors",
-            sha256: "9e08a5e075204e893a4eb393ae64d47177c76f11a306686db1343d7cc7c468f6",
-            bytes: 102_201_832,
-        },
-        BALANCED_WEIGHTS,
-    ],
+    files: &[RemoteFile {
+        name: "stemd_roformer.safetensors",
+        url: "https://github.com/nsaintot/stemd/releases/download/models-v3/stemd_roformer.safetensors",
+        sha256: "ce3802b634d04d955626cffe038ec5ac8f26ef1c90f3d4cfe5ac542ad6da4b37",
+        bytes: 250_585_752,
+    }],
 };
 
 #[cfg(test)]
@@ -248,21 +222,22 @@ mod tests {
     fn presets_and_artefacts_round_trip() {
         for preset in Preset::ALL {
             assert_eq!(Preset::from_artefact(preset.artefact()), Some(preset));
-            // Every file of a preset must belong to one of its artefacts,
-            // which is what keeps the download and the loader in step.
+            // Every file of a preset must belong to its artefact, which is what
+            // keeps the download and the loader in step.
             assert!(
-                preset.source().files.iter().all(|f| preset
-                    .artefacts()
+                preset
+                    .source()
+                    .files
                     .iter()
-                    .any(|name| f.name.starts_with(name))),
-                "{preset:?} has files matching none of {:?}",
-                preset.artefacts()
+                    .all(|f| f.name.starts_with(preset.artefact())),
+                "{preset:?} has files not named for {}",
+                preset.artefact()
             );
         }
         assert_eq!(Preset::from_artefact("nonsense"), None);
     }
 
-    /// One weights file per artefact the preset names, in the same order.
+    /// One weights file per preset, named for its artefact.
     ///
     /// This is what lets the loader look for `<artefact>.safetensors` without
     /// consulting the catalogue, and what makes the digest unambiguous.
@@ -270,43 +245,26 @@ mod tests {
     fn every_artefact_has_its_weights_file() {
         for preset in Preset::ALL {
             let files = preset.source().files;
-            let names = preset.artefacts();
-            assert_eq!(files.len(), names.len(), "{preset:?} is inconsistent");
-            for (file, name) in files.iter().zip(names) {
-                assert_eq!(file.name, format!("{name}{WEIGHTS_EXTENSION}"));
-            }
-            assert_eq!(preset.artefact(), names[0], "{preset:?} names its first");
+            assert_eq!(files.len(), 1, "{preset:?} is inconsistent");
+            assert_eq!(
+                files[0].name,
+                format!("{}{WEIGHTS_EXTENSION}", preset.artefact())
+            );
             assert_eq!(preset.digest(), files[0].sha256);
         }
     }
 
-    /// An artefact used by more than one preset must be pinned identically by
-    /// all of them, or one would fetch a file the next rejects as mismatched.
-    ///
-    /// Three presets share `htdemucs_ft` now. Written over every file every
-    /// preset names rather than over a pair, so a fifth preset is covered by
-    /// existing code instead of needing a line added here.
+    /// A settings file saved before Quality changed models still opens on Quality,
+    /// and the former name is not also listed as retired.
     #[test]
-    fn a_shared_artefact_is_pinned_once() {
-        let mut seen: std::collections::HashMap<&str, (&str, &str, u64)> =
-            std::collections::HashMap::new();
-        for preset in Preset::ALL {
-            for file in preset.source().files {
-                let pin = (file.sha256, file.url, file.bytes);
-                if let Some(first) = seen.insert(file.name, pin) {
-                    assert_eq!(
-                        first, pin,
-                        "{} is pinned differently by {preset:?} than by an \
-                         earlier preset",
-                        file.name
-                    );
-                }
-            }
+    fn a_former_artefact_still_names_its_preset() {
+        for (name, preset) in FORMER {
+            assert_eq!(Preset::from_artefact(name), Some(preset));
+            assert!(
+                !RETIRED.contains(&name),
+                "{name} is both former and retired"
+            );
         }
-        assert!(
-            seen.len() < Preset::ALL.iter().map(|p| p.source().files.len()).sum(),
-            "no artefact is shared, so this test checked nothing"
-        );
     }
 
     /// A retired artefact must not quietly match a preset again, or a settings
@@ -331,14 +289,13 @@ mod tests {
     #[test]
     fn every_demucs_artefact_is_v4() {
         for preset in Preset::ALL {
-            for artefact in preset.artefacts() {
-                // v3 is `hdemucs_*`, v4 is `htdemucs*`. Anything else is not a
-                // demucs at all and this test has no opinion on it.
-                assert!(
-                    !artefact.starts_with("hdemucs"),
-                    "{preset:?} names {artefact}, which is demucs v3"
-                );
-            }
+            // v3 is `hdemucs_*`, v4 is `htdemucs*`. Anything else is not a
+            // demucs at all and this test has no opinion on it.
+            assert!(
+                !preset.artefact().starts_with("hdemucs"),
+                "{preset:?} names {}, which is demucs v3",
+                preset.artefact()
+            );
         }
         // And the guard is not vacuous: the name it exists to reject would be.
         assert!(RETIRED.iter().any(|name| name.starts_with("hdemucs")));

@@ -14,6 +14,7 @@ pub mod mlx;
 pub mod pcm;
 pub mod progress;
 pub mod resample;
+pub mod roformer;
 pub mod stemfmt;
 pub mod stems;
 
@@ -23,9 +24,10 @@ pub use mlx::{MlxConfig, MlxSeparator};
 pub use pcm::{Audio, PcmFormat};
 pub use progress::{Cancelled, Progress, ProgressSink, Silent, Stage};
 pub use resample::{DspMode, OutputRate};
+pub use roformer::RoformerSeparator;
 /// Re-exported so a caller can name a precision without depending on
 /// `stemd-mlx`. stemd-server does exactly that: it has to put the precision in
 /// its cache key and never links the model crate.
 pub use stemd_mlx::{Accelerator, Family, Precision, memory};
 pub use stemfmt::{StemFormat, encode as encode_stem};
-pub use stems::{DERIVED, PARTS, PartGains, SHIPPED, Stems};
+pub use stems::{DERIVED, PART_NAMES, PARTS, PartGains, PartSet, Parts, SHIPPED, Stems};

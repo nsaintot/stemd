@@ -57,6 +57,10 @@ const fn unity() -> f32 {
     1.0
 }
 
+fn default_derived_stem() -> Option<String> {
+    Some("drums".into())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct JobResult {
     /// Rate the stems are at, which is the requested output rate rather than
@@ -65,6 +69,10 @@ pub struct JobResult {
     pub format: String,
     pub stems: Vec<StemRef>,
     pub model_residual_db: f64,
+    /// The part to rebuild as `mix` minus `stems`; absent from older servers,
+    /// which always mean `drums`.
+    #[serde(default = "default_derived_stem")]
+    pub derived_stem: Option<String>,
     pub separation_secs: f64,
     pub realtime_factor: f64,
 }
@@ -96,7 +104,7 @@ struct Created {
 
 /// How the samples are encoded in each direction.
 #[derive(Debug, Clone, Copy)]
-pub struct Formats {
+pub struct Formats<'a> {
     /// Encoding of the uploaded PCM.
     pub upload: &'static str,
     /// Container the stems come back in.
@@ -105,11 +113,13 @@ pub struct Formats {
     pub rate: Option<u32>,
     /// Ask the server for the derived part rather than rebuilding it.
     pub derived: bool,
+    /// Comma-separated parts to ship, when not the server's default.
+    pub parts: Option<&'a str>,
     /// Filter the server converts the stems with, when not its default.
     pub dsp: Option<u8>,
 }
 
-impl Formats {
+impl<'a> Formats<'a> {
     /// Stems come back as FLAC by default: the same 16-bit samples, half the
     /// wire. `--f32` swaps both directions to float for an exact null.
     pub const fn new(f32_everywhere: bool) -> Self {
@@ -119,6 +129,7 @@ impl Formats {
                 download: "f32le",
                 rate: None,
                 derived: false,
+                parts: None,
                 dsp: None,
             }
         } else {
@@ -127,6 +138,7 @@ impl Formats {
                 download: "flac",
                 rate: None,
                 derived: false,
+                parts: None,
                 dsp: None,
             }
         }
@@ -141,6 +153,12 @@ impl Formats {
     #[must_use]
     pub const fn with_derived(mut self, derived: bool) -> Self {
         self.derived = derived;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_parts(mut self, parts: Option<&'a str>) -> Self {
+        self.parts = parts;
         self
     }
 
@@ -176,13 +194,16 @@ impl Server {
     }
 
     /// Upload the mix and return the new job's id.
-    pub fn submit(&self, body: &[u8], sample_rate: u32, formats: Formats) -> Result<String> {
+    pub fn submit(&self, body: &[u8], sample_rate: u32, formats: Formats<'_>) -> Result<String> {
         let mut url = format!(
             "{}/v1/jobs?sample_rate={sample_rate}&channels=2&format={}&output_format={}",
             self.base, formats.upload, formats.download,
         );
         if let Some(rate) = formats.rate {
             url.push_str(&format!("&output_sample_rate={rate}"));
+        }
+        if let Some(parts) = formats.parts {
+            url.push_str(&format!("&parts={parts}"));
         }
         if formats.derived {
             url.push_str("&include_derived=true");

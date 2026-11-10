@@ -15,11 +15,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use stemd_core::{Audio, DspMode, PcmFormat, Progress, Stage};
+use stemd_core::{Audio, DspMode, PART_NAMES, PcmFormat, Progress, Stage};
 
 use crate::api::AppState;
 use crate::cache::{Entry, Ingredients, Output};
 use crate::queue::QueuedWork;
+use crate::settings::DropParts;
+
+/// Where a drop records the scale of parts written below unity.
+const GAINS_FILE: &str = "stems.json";
 
 /// Recent drops kept for the window's list. Older ones fall off the end.
 pub const REMEMBERED: usize = 12;
@@ -209,10 +213,11 @@ fn run(state: &Arc<AppState>, item: &Arc<Dropped>) -> Result<()> {
         derived: true,
         // A drop writes files, it does not feed a client's subtraction.
         dsp: DspMode::General,
+        parts: settings.drop_parts.request(),
     };
 
     let (entry, cached) = separate(state, item, &mix, output)?;
-    let finished = write_out(&item.source, &entry, cached)?;
+    let finished = write_out(&item.source, &entry, cached, settings.drop_parts)?;
     tracing::info!(
         "{}: {} parts written to {}",
         item.title,
@@ -279,6 +284,7 @@ fn separate(
         out_format: output.format,
         out_rate: output.rate,
         include_derived: output.derived,
+        parts: output.parts,
         dsp: output.dsp,
         model: &state.switcher.identity(),
     });
@@ -338,13 +344,19 @@ fn separate(
 ///
 /// Copied rather than moved: the entry stays in the cache, so a deck asking for
 /// the same track over the network still gets it without separating again.
-fn write_out(source: &Path, entry: &Entry, cached: bool) -> Result<Finished> {
+fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> Result<Finished> {
     let dir = output_dir(source);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    clear_parts(&dir)?;
 
     let mut parts = Vec::new();
     let mut scaled = Vec::new();
     for stem in &entry.stems {
+        // Not ticked: count it as fetched so the reaper treats the entry as consumed.
+        if !wanted.has(&stem.name) {
+            entry.mark_fetched(&stem.name);
+            continue;
+        }
         let name = stem
             .path
             .file_name()
@@ -372,6 +384,22 @@ fn write_out(source: &Path, entry: &Entry, cached: bool) -> Result<Finished> {
     })
 }
 
+/// Remove the part files and gains note an earlier drop of this track wrote.
+fn clear_parts(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let ours = PART_NAMES.contains(&stem) || path.file_name() == Some(GAINS_FILE.as_ref());
+        if ours && path.is_file() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// `<track>-stems/` beside the file that was dropped, matching what the
 /// command-line client writes by default.
 fn output_dir(source: &Path) -> PathBuf {
@@ -396,11 +424,11 @@ fn write_gains(dir: &Path, scaled: &[(String, f32)]) -> Result<()> {
                  sum back to the mix.",
         "gains": gains,
     });
-    let path = dir.join("stems.json");
+    let path = dir.join(GAINS_FILE);
     std::fs::write(&path, serde_json::to_string_pretty(&note)?)
         .with_context(|| format!("writing {}", path.display()))?;
     tracing::info!(
-        "{} parts were scaled to fit; noted in stems.json",
+        "{} parts were scaled to fit; noted in {GAINS_FILE}",
         scaled.len()
     );
     Ok(())

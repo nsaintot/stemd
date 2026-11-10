@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use stemd_core::{Audio, DERIVED, DspMode, OutputRate, PcmFormat, StemFormat, Stems, resample};
+use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, StemFormat, Stems, resample};
 
 /// Invalidates every stored entry when bumped by hand. Covers a change to which
 /// stems ship, or to how one is encoded or scaled on the way out. The model is in
@@ -41,12 +41,19 @@ pub struct Output {
     pub derived: bool,
     /// Filter the conversion to `rate` runs through.
     pub dsp: DspMode,
+    /// Parts to ship. The derived part is the one they leave out.
+    pub parts: Parts,
 }
 
 impl Output {
     /// How many parts this asks for, for a log line.
-    pub const fn parts(self) -> usize {
-        stemd_core::SHIPPED.len() + if self.derived { 1 } else { 0 }
+    pub fn parts(self) -> usize {
+        self.parts.len() + usize::from(self.ships_derived())
+    }
+
+    /// Whether the derived part ships: asked for, and something is left out.
+    pub fn ships_derived(self) -> bool {
+        self.derived && self.parts.derived().is_some()
     }
 }
 
@@ -69,6 +76,9 @@ pub struct Ingredients<'a> {
     /// Whether the derived part ships. In the key for the same reason: it
     /// changes which files an entry holds.
     pub include_derived: bool,
+    /// Parts the job ships. In the key because it changes which files an entry
+    /// holds.
+    pub parts: Parts,
     /// Filter the conversion to `out_rate` ran through. In the key because two
     /// modes at one rate are two different files.
     pub dsp: DspMode,
@@ -91,7 +101,9 @@ pub fn key(ingredients: &Ingredients<'_>) -> String {
         ingredients.in_format.to_string(),
         ingredients.out_format.to_string(),
         ingredients.out_rate.to_string(),
-        ingredients.include_derived.to_string(),
+        // Asking for the derived part when the parts leave nothing out changes nothing.
+        (ingredients.include_derived && ingredients.parts.derived().is_some()).to_string(),
+        ingredients.parts.to_string(),
         ingredients.dsp.to_string(),
         ingredients.model.to_owned(),
     ] {
@@ -146,6 +158,9 @@ pub struct Entry {
     pub frames: usize,
     pub format: StemFormat,
     pub model_residual_db: f64,
+    /// The part a client rebuilds as `mix` minus the stems: whatever the request
+    /// left out. Listed in `stems` too when it was asked for.
+    pub derived: Option<&'static str>,
     /// What the separation cost when it actually ran. Preserved across hits, so
     /// a client can tell a cheap answer from an expensive one.
     pub separation_secs: f64,
@@ -387,6 +402,7 @@ impl Cache {
             frames: shipped.first().map_or(0, |(_, audio)| audio.frames()),
             format: output.format,
             model_residual_db: stems.model_residual_db,
+            derived: output.parts.derived(),
             separation_secs,
             evicted: AtomicBool::new(false),
             state: Mutex::new(State {
@@ -529,11 +545,10 @@ fn clear_contents(dir: &Path) -> std::io::Result<()> {
 
 /// The parts an entry stores, converted to the requested output rate.
 ///
-/// [`stemd_core::SHIPPED`] always; the derived part only when asked for. It is
-/// computed here at the native rate, where `mix - harmonics - vocals` is exact and
-/// carries the model's residual, then put through the same filter as the others.
-/// Resampling is linear, so the set still sums to the resampled mix. The model's
-/// own `drums` source is missing the residual and would not sum.
+/// The parts `output.parts` names, then the derived part when asked for. That one
+/// is computed here at the native rate as `mix` minus the shipped parts, which is
+/// exact and carries the model's residual, then put through the same filter as the
+/// others. Resampling is linear, so the set still sums to the resampled mix.
 ///
 /// Separation runs at the model's rate and this is the only place the output rate
 /// is applied, so the cached bytes and the rate an entry reports cannot disagree.
@@ -542,12 +557,26 @@ fn to_output_rate(
     stems: &Stems,
     output: Output,
 ) -> Result<Vec<(&'static str, Audio)>> {
-    let derived = output.derived.then(|| stems.derived_part(mix));
-    let parts: Vec<(&'static str, &Audio)> = stems
-        .shipped
-        .iter()
-        .map(|(name, audio)| (*name, audio))
-        .chain(derived.iter().map(|audio| (DERIVED, audio)))
+    let mut parts: Vec<(&'static str, &Audio)> = Vec::new();
+    for name in output.parts.names() {
+        let audio = stems
+            .stem(name)
+            .with_context(|| format!("this separation has no {name}"))?;
+        parts.push((name, audio));
+    }
+    let derived = if output.derived {
+        output.parts.derived().map(|name| {
+            (
+                name,
+                stemd_core::stems::remainder(mix, parts.iter().map(|(_, audio)| *audio)),
+            )
+        })
+    } else {
+        None
+    };
+    let parts: Vec<(&'static str, &Audio)> = parts
+        .into_iter()
+        .chain(derived.iter().map(|(name, audio)| (*name, audio)))
         .collect();
 
     //  Concurrent for every rate rather than by case: the 48 kHz path does not
@@ -772,6 +801,7 @@ mod tests {
                     rate: OutputRate::default(),
                     derived: false,
                     dsp: DspMode::default(),
+                    parts: Parts::DEFAULT,
                 },
                 1.0,
             )
@@ -938,6 +968,7 @@ mod tests {
             rate,
             derived,
             dsp: DspMode::default(),
+            parts: Parts::DEFAULT,
         }
     }
 
@@ -958,11 +989,57 @@ mod tests {
                 stemd_core::SHIPPED.len() + 1,
                 "{rate}: {names:?}"
             );
-            assert_eq!(names.last(), Some(&DERIVED), "{rate}: {names:?}");
+            assert_eq!(
+                names.last(),
+                Some(&stemd_core::DERIVED),
+                "{rate}: {names:?}"
+            );
             for (name, audio) in &parts {
                 assert_eq!(audio.sample_rate, rate.hz(), "{name} at the wrong rate");
             }
         }
+    }
+
+    /// A job's own parts ship in [`stemd_core::PART_NAMES`] order, the derived
+    /// part is what they leave out, and the set still sums to the mix.
+    #[test]
+    fn a_parts_list_ships_those_parts_and_rebuilds_the_rest() {
+        let (mix, mut stems) = crate::testkit::stems(4410);
+        let harmonics = stems.stem("harmonics").unwrap().clone();
+        let bass = Audio::new(
+            harmonics
+                .data
+                .iter()
+                .map(|c| c.iter().map(|v| v * 0.25).collect())
+                .collect(),
+            harmonics.sample_rate,
+        );
+        let other = stemd_core::stems::minus(&harmonics, &bass);
+        stems.more = vec![("bass", bass), ("other", other)];
+
+        let output = Output {
+            parts: Parts::parse("vocals,other,bass").unwrap(),
+            ..output(OutputRate::Hz44100, true)
+        };
+        let parts = to_output_rate(&mix, &stems, output).unwrap();
+        let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["vocals", "bass", "other", "drums"]);
+
+        let sum = parts.iter().fold(mix.clone(), |rest, (_, audio)| {
+            stemd_core::stems::minus(&rest, audio)
+        });
+        let peak = sum.data.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 1e-5, "the parts miss the mix by {peak}");
+
+        let missing = Output {
+            parts: Parts::parse("drums,vocals").unwrap(),
+            ..output
+        };
+        let (_, plain) = crate::testkit::stems(4410);
+        assert!(
+            to_output_rate(&mix, &plain, missing).is_err(),
+            "no drums estimate to ship"
+        );
     }
 
     /// Asking for the derived part must not be answerable from an entry that
@@ -977,6 +1054,7 @@ mod tests {
             out_format: StemFormat::Pcm16,
             out_rate: OutputRate::Hz44100,
             include_derived: false,
+            parts: Parts::DEFAULT,
             dsp: DspMode::General,
             model: "digest",
         };
@@ -984,6 +1062,13 @@ mod tests {
             key(&base),
             key(&Ingredients {
                 include_derived: true,
+                ..base
+            })
+        );
+        assert_ne!(
+            key(&base),
+            key(&Ingredients {
+                parts: Parts::parse("bass,other,vocals").unwrap(),
                 ..base
             })
         );
@@ -1032,6 +1117,7 @@ mod tests {
             out_format: StemFormat::Pcm16,
             out_rate: OutputRate::Hz44100,
             include_derived: false,
+            parts: Parts::DEFAULT,
             dsp: DspMode::General,
             model: "digest",
         };

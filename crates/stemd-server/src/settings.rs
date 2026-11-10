@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use stemd_core::{OutputRate, StemFormat};
+use stemd_core::{OutputRate, PartSet, Parts, StemFormat};
 
 use crate::models::{self, DEFAULT_PRESET, Preset, RETIRED};
 
@@ -31,6 +31,65 @@ pub struct Settings {
     pub format: StemFormat,
     /// Output rate for a request that does not name one.
     pub rate: OutputRate,
+    /// Parts a dropped track writes beside it. Jobs over HTTP name their own.
+    pub drop_parts: DropParts,
+}
+
+/// Which parts a drop writes.
+///
+/// `harmonics` and `bass` or `other` cannot be on together: ticking one side
+/// clears the other. At least one part stays ticked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropParts(PartSet);
+
+impl DropParts {
+    /// `harmonics`, `vocals` and `drums`.
+    pub const DEFAULT: Self = Self(Parts::DEFAULT_WITH_DERIVED);
+
+    pub fn has(self, part: &str) -> bool {
+        self.0.has(part)
+    }
+
+    /// Tick or untick `part`, keeping the set valid.
+    #[must_use]
+    pub fn toggle(self, part: &str) -> Self {
+        let set = if self.0.has(part) {
+            self.0.without(part)
+        } else if part == "harmonics" {
+            self.0.without("bass").without("other").with(part)
+        } else if part == "bass" || part == "other" {
+            self.0.without("harmonics").with(part)
+        } else {
+            self.0.with(part)
+        };
+        if set.is_empty() { self } else { Self(set) }
+    }
+
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        self.0.names()
+    }
+
+    /// What to ask the separator for so every ticked part exists: `bass` and
+    /// `other` split out when either is ticked, `drums` always as the derived part.
+    pub fn request(self) -> Parts {
+        if self.has("bass") || self.has("other") {
+            Parts::parse("bass,other,vocals").expect("a valid list")
+        } else {
+            Parts::DEFAULT
+        }
+    }
+
+    fn parse(list: &str) -> Option<Self> {
+        let set = PartSet::parse(list).ok()?;
+        let clash = set.has("harmonics") && (set.has("bass") || set.has("other"));
+        (!set.is_empty() && !clash).then_some(Self(set))
+    }
+}
+
+impl std::fmt::Display for DropParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl Settings {
@@ -67,6 +126,7 @@ impl Default for Settings {
             preset: DEFAULT_PRESET,
             format: StemFormat::Flac,
             rate: OutputRate::default(),
+            drop_parts: DropParts::DEFAULT,
         }
     }
 }
@@ -86,6 +146,8 @@ struct Stored {
     model: Option<String>,
     output_format: Option<String>,
     output_sample_rate: Option<u32>,
+    /// Comma-separated, as [`DropParts`] prints it.
+    drop_parts: Option<String>,
 }
 
 impl Stored {
@@ -94,6 +156,7 @@ impl Stored {
             model: Some(settings.preset.artefact().to_owned()),
             output_format: Some(settings.format.to_string()),
             output_sample_rate: Some(settings.rate.hz()),
+            drop_parts: Some(settings.drop_parts.to_string()),
         }
     }
 
@@ -131,6 +194,12 @@ impl Stored {
                     &hz.to_string(),
                     &settings.rate.hz().to_string(),
                 ),
+            }
+        }
+        if let Some(list) = self.drop_parts {
+            match DropParts::parse(&list) {
+                Some(parts) => settings.drop_parts = parts,
+                None => warn_ignored("drop_parts", &list, &settings.drop_parts.to_string()),
             }
         }
         settings.reconcile();
@@ -238,6 +307,10 @@ impl SettingsStore {
         }
     }
 
+    pub fn set_drop_parts(&self, parts: DropParts) {
+        self.write(|s| s.drop_parts = parts);
+    }
+
     pub fn set_rate(&self, rate: OutputRate) {
         if !self.pinned.rate {
             self.write(|s| s.rate = rate);
@@ -309,6 +382,37 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn harmonics_and_its_halves_clear_each_other() {
+        let split = DropParts::DEFAULT.toggle("bass");
+        assert_eq!(split.to_string(), "vocals,drums,bass");
+        assert_eq!(split.request().to_string(), "vocals,bass,other");
+        assert_eq!(
+            split.toggle("harmonics").to_string(),
+            "harmonics,vocals,drums"
+        );
+        assert_eq!(DropParts::DEFAULT.request(), Parts::DEFAULT);
+    }
+
+    #[test]
+    fn the_last_tick_stays() {
+        let one = DropParts::parse("vocals").unwrap();
+        assert_eq!(one.toggle("vocals"), one);
+    }
+
+    #[test]
+    fn drop_parts_survive_a_relaunch_and_a_bad_list_is_ignored() {
+        let path = scratch();
+        let store = SettingsStore::open(path.clone());
+        store.set_drop_parts(DropParts::parse("bass,other,vocals,drums").unwrap());
+        assert_eq!(
+            SettingsStore::open(path).get().drop_parts.to_string(),
+            "vocals,drums,bass,other"
+        );
+        assert!(DropParts::parse("harmonics,bass").is_none());
+        assert!(DropParts::parse("piano").is_none());
     }
 
     #[test]

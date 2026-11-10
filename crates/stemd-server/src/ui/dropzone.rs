@@ -33,6 +33,16 @@ pub(super) const PERCENT_WIDTH: f32 = 34.0;
 /// decides it: the bar itself is five points.
 const BAR_ROW_HEIGHT: f32 = 16.0;
 
+/// The hint under the arrow, listing the ticked parts.
+fn hint(parts: crate::settings::DropParts) -> String {
+    let names: Vec<&str> = parts.names().collect();
+    let list = match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    };
+    format!("{list}, beside the file")
+}
+
 pub struct Zone<'a> {
     pub palette: &'a Palette,
     pub sheen: &'a mut Sheen,
@@ -40,6 +50,8 @@ pub struct Zone<'a> {
     pub armed: bool,
     /// The most recent drop, if it is still being worked on.
     pub current: Option<&'a Dropped>,
+    /// What a drop writes, for the hint under the arrow.
+    pub parts: crate::settings::DropParts,
 }
 
 impl Zone<'_> {
@@ -135,7 +147,7 @@ impl Zone<'_> {
         painter.text(
             egui::pos2(mid, y),
             egui::Align2::CENTER_TOP,
-            "harmonics, vocals and drums, beside the file",
+            hint(self.parts),
             hint_font,
             self.palette.muted,
         );

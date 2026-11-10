@@ -2,7 +2,7 @@
 
 This is what the hosting repository's README said before the source moved into
 it. It describes the `models-v1` tag, which is superseded: the shipping
-artefacts are safetensors under `models-v2`, and their digests are pinned in
+artefacts are safetensors under `models-v2` and `models-v3`, and their digests are pinned in
 `crates/stemd-server/src/models/preset.rs`.
 
 It is kept because the provenance and licence position below apply to every
@@ -40,3 +40,53 @@ separately from that repository and carry no explicit licence: the question was
 asked in [demucs#327](https://github.com/facebookresearch/demucs/issues/327) in
 2022, went unanswered, and the repository is now archived. These artefacts are
 derived works of those weights and are published on that understanding.
+
+---
+
+## `stemd_roformer` (`models-v3`)
+
+stemd's own separation model, which the `Quality` preset runs.
+
+| | |
+|---|---|
+| File | `stemd_roformer.safetensors`, 250,585,752 bytes |
+| SHA-256 | `ce3802b634d04d955626cffe038ec5ac8f26ef1c90f3d4cfe5ac542ad6da4b37` |
+| Architecture | BS-RoFormer: dim 256, depth 12, 62 bands, rotary position, 125.2M parameters, float16 |
+| Output | bass, drums, other, vocals; stemd ships drums and vocals and builds harmonics as the remainder |
+| Release | [models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) |
+
+### Terms
+
+Copyright 2026 Nicolas Saintot.
+
+The weights in `stemd_roformer.safetensors` are licensed under the
+[Creative Commons Attribution-NonCommercial 4.0 International
+licence](https://creativecommons.org/licenses/by-nc/4.0/legalcode) (CC BY-NC
+4.0). In short:
+
+- You may copy, redistribute, convert and fine-tune the weights.
+- Credit stemd, link to this licence, and say if you changed them.
+- You may not use the weights, or a model derived from them, for commercial
+  purposes. Selling them, bundling them in a paid product, or offering a paid
+  service built on them needs written permission.
+
+These terms cover the model only. They place no restriction on the audio
+produced with it: stems separated by stemd, or by any other software running
+these weights, belong to whoever holds the rights in the source recording, and
+may be used however those rights allow.
+
+The licence applies to these weights alone. stemd's code is MIT or Apache-2.0,
+at your choice; the other models stemd downloads carry their own terms, listed
+above.
+
+Training data includes MUSDB18-HQ (train split), MoisesDB, Slakh2100 and CC0
+recordings. Some of these datasets allow non-commercial research use only,
+which is why the weights are non-commercial. No MUSDB18-HQ test track was used
+for training.
+
+The weights are provided as is, without warranty of any kind, and the licensor
+is not liable for any damages arising from their use, as set out in sections 5
+and 6 of the licence.
+
+To ask about commercial use, open an issue on
+[nsaintot/stemd](https://github.com/nsaintot/stemd/issues).

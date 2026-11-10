@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
-use stemd_core::{Audio, DspMode, OutputRate, PcmFormat, Stage, resample};
+use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, Stage, resample};
 use tokio_util::io::ReaderStream;
 
 use crate::cache::{Cache, Ingredients, Output};
@@ -129,6 +129,11 @@ struct Health {
     /// The part `include_derived=true` adds. Not shipped by default: a client
     /// holding the mix rebuilds it as `mix` minus the stems above.
     derived_stem: &'static str,
+    /// Parts a job can list in `parts`. Which one the player rebuilds follows from
+    /// the request: whatever it leaves out.
+    parts: Vec<String>,
+    /// What a job that names no `parts` gets.
+    default_parts: Vec<&'static str>,
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
@@ -164,6 +169,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
         default_output_format: defaults.format.to_string(),
         default_output_sample_rate: defaults.rate.hz(),
         derived_stem: stemd_core::DERIVED,
+        parts: info.parts,
+        default_parts: Parts::DEFAULT.names().collect(),
     })
 }
 
@@ -189,6 +196,11 @@ struct CreateParams {
     /// stems.
     #[serde(default)]
     include_derived: Option<bool>,
+    /// Comma-separated parts to ship, such as `bass,other,vocals`. Defaults to
+    /// `default_parts` from `/v1/health`. They must not overlap, and must leave out
+    /// one part or none: that part is the one `include_derived` adds.
+    #[serde(default)]
+    parts: Option<String>,
     /// Filter the conversion to `output_sample_rate` runs through. `0`, the
     /// default, converts any pair. See `dsp_modes` in `/v1/health`.
     #[serde(default)]
@@ -275,7 +287,18 @@ impl Submission {
             None => DspMode::default(),
         };
 
-        let model_rate = state.queue.info().sample_rate;
+        let info = state.queue.info();
+        let model_rate = info.sample_rate;
+        let parts = match params.parts.as_deref() {
+            Some(list) => Parts::parse(list).map_err(ApiError::bad_request)?,
+            None => Parts::DEFAULT,
+        };
+        if let Some(missing) = parts.names().find(|p| !info.parts.iter().any(|q| q == p)) {
+            return Err(ApiError::bad_request(format!(
+                "{} cannot produce {missing}; it offers {:?}",
+                info.model, info.parts
+            )));
+        }
         check_dsp_mode(dsp, model_rate, out_rate).map_err(ApiError::bad_request)?;
 
         // Said out loud, because the way this goes wrong is inaudible from here
@@ -342,6 +365,7 @@ impl Submission {
                 rate: out_rate,
                 derived: params.include_derived.unwrap_or(false),
                 dsp,
+                parts,
             },
             channels: params.channels,
             sample_rate: params.sample_rate,
@@ -358,6 +382,7 @@ impl Submission {
             out_format: self.output.format,
             out_rate: self.output.rate,
             include_derived: self.output.derived,
+            parts: self.output.parts,
             dsp: self.output.dsp,
             model,
         }
@@ -659,6 +684,7 @@ mod tests {
             output_format: None,
             output_sample_rate: None,
             include_derived: None,
+            parts: None,
             dsp_mode: None,
         }
     }

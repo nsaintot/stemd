@@ -14,7 +14,8 @@
 //!   -> multiply the spectrogram, inverse stft
 //! ```
 //!
-//! It emits one stem, vocals; the instrumental is the mixture minus it. See
+//! It emits one stem per mask estimator: vocals alone for the published
+//! checkpoints, bass, drums, other and vocals for stemd's own. See
 //! docs/evaluation.md for what that means for a server shipping `harmonics`.
 
 use std::f32::consts::PI;
@@ -55,6 +56,8 @@ pub struct Config {
     pub precision: Precision,
     /// How position enters attention.
     pub positional: Positional,
+    /// Zero the DC bin before the inverse transform, as the reference does by default.
+    pub zero_dc: bool,
 }
 
 /// Which positional scheme the artefact was trained with.
@@ -101,6 +104,7 @@ impl Default for Config {
             sample_rate: 44100,
             precision: Precision::default(),
             positional: Positional::Rope,
+            zero_dc: true,
         }
     }
 }
@@ -122,18 +126,40 @@ impl Config {
         }
     }
 
+    /// stemd's own 4-stem model: PolarFormer's shape with rotary position, and
+    /// trained without the DC bin zeroed.
+    pub fn stemd() -> Self {
+        Self {
+            positional: Positional::Rope,
+            zero_dc: false,
+            ..Self::polarformer()
+        }
+    }
+
     /// Which variant an artefact is, asked of its tensors.
     ///
-    /// The two differ in four values and no code, and nothing in either file names
-    /// itself, but a polar artefact carries `pope_embed` tensors and a rotary one
-    /// carries `rotary_embed.freqs`, and neither can be renamed without the load
-    /// failing.
+    /// `pope_embed` means PolarFormer; a rotary artefact of width 256 with more than
+    /// one mask estimator is `stemd_roformer`; anything else is viperx.
     pub fn of(weights: &Weights) -> Self {
+        let width = weights
+            .at("final_norm")
+            .get("gamma")
+            .map(|gamma| gamma.shape()[0])
+            .ok();
+        let stems = (0..)
+            .take_while(|s| {
+                weights
+                    .at(&format!("mask_estimators.{s}.to_freqs.0.0.0"))
+                    .has("weight")
+            })
+            .count();
         if weights
             .at("layers.0.0.layers.0.0")
             .has("pope_embed.inv_freqs")
         {
             Self::polarformer()
+        } else if width == Some(256) && stems > 1 {
+            Self::stemd()
         } else {
             Self::default()
         }
@@ -571,16 +597,12 @@ impl crate::apply::Chunked for BsRoformer {
         self.config.chunk
     }
 
-    /// One: vocals. The instrumental is the mixture minus it, which is not
-    /// this model's business.
     fn sources(&self) -> i32 {
-        1
+        self.stems()
     }
 
     fn separate_chunk(&self, chunk: &Array) -> Result<Array> {
-        let out = self.forward(chunk)?;
-        let s = out.shape().to_vec();
-        Ok(out.reshape(&[s[0], 1, s[1], s[2]])?)
+        self.forward(chunk)
     }
 }
 
@@ -590,7 +612,8 @@ pub struct BsRoformer {
     band_split: BandSplit,
     blocks: Vec<Block>,
     final_norm: RmsNorm,
-    mask: MaskEstimator,
+    /// One per stem, in the order the artefact numbers them.
+    masks: Vec<MaskEstimator>,
     config: Config,
 }
 
@@ -605,12 +628,23 @@ impl BsRoformer {
                 freq: Transformer::load(&scope.child("1"), &config, 1)?,
             });
         }
+        let mut masks = Vec::new();
+        while weights
+            .at(&format!("mask_estimators.{}.to_freqs.0.0.0", masks.len()))
+            .has("weight")
+        {
+            let scope = weights.at(&format!("mask_estimators.{}.to_freqs", masks.len()));
+            masks.push(MaskEstimator::load(&scope, &config)?);
+        }
+        if masks.is_empty() {
+            bail!("the artefact has no mask estimators");
+        }
         Ok(Self {
             stft: Stft::new(config.n_fft, config.hop),
             band_split: BandSplit::load(&weights.at("band_split.to_features"), &config)?,
             blocks,
             final_norm: RmsNorm::load(&weights.at("final_norm"), config.dim)?,
-            mask: MaskEstimator::load(&weights.at("mask_estimators.0.to_freqs"), &config)?,
+            masks,
             config,
         })
     }
@@ -621,6 +655,11 @@ impl BsRoformer {
 
     pub const fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// How many stems one forward pass produces.
+    pub fn stems(&self) -> i32 {
+        self.masks.len() as i32
     }
 
     /// `[B, C, T]` audio to `[B, C, F, N]` complex, as two real arrays.
@@ -680,13 +719,13 @@ impl BsRoformer {
         self.final_norm.forward(&x)
     }
 
-    /// The mask, in the same interleaved layout the spectrogram was flattened
-    /// into: `[B, N, bands, dim] -> [B, N, F * C * 2]`.
-    pub fn mask(&self, x: &Array) -> Result<Array> {
-        self.mask.forward(x)
+    /// One stem's mask, in the same interleaved layout the spectrogram was
+    /// flattened into: `[B, N, bands, dim] -> [B, N, F * C * 2]`.
+    pub fn mask(&self, stem: usize, x: &Array) -> Result<Array> {
+        self.masks[stem].forward(x)
     }
 
-    /// Separate one chunk. `[B, C, T]` in, `[B, C, T]` of vocals out.
+    /// Separate one chunk. `[B, C, T]` in, `[B, stems, C, T]` out.
     pub fn forward(&self, audio: &Array) -> Result<Array> {
         let shape = audio.shape().to_vec();
         let (channels, samples) = (shape[1], shape[2]);
@@ -705,16 +744,19 @@ impl BsRoformer {
         let flat = self
             .interleave(&real, &imag)?
             .as_dtype(self.config.precision.dtype())?;
-        let mask = self.mask(&self.transform(&self.band_split.forward(&flat)?)?)?;
-
-        self.apply(&mask, &real, &imag, samples)
+        let features = self.transform(&self.band_split.forward(&flat)?)?;
+        let stems = (0..self.masks.len())
+            .map(|stem| self.apply(&self.mask(stem, &features)?, &real, &imag, samples))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ops::stack_axis(&stems, 1)?)
     }
 
     /// Apply a mask to the spectrogram it was estimated from, and invert.
     ///
-    /// Everything in [`Self::forward`] after the mask estimator: the complex multiply,
-    /// dropping DC, and the inverse transform. `[B, N, F * C * 2]` of mask and
-    /// `[B, C, F, N]` of spectrogram in, `[B, C, samples]` out.
+    /// Everything in [`Self::forward`] after one mask estimator: the complex
+    /// multiply, DC zeroing when `zero_dc` is set, and the inverse transform.
+    /// `[B, N, F * C * 2]` of mask and `[B, C, F, N]` of spectrogram in,
+    /// `[B, C, samples]` out.
     ///
     /// Split out so it can be measured directly; the stages do not sum to the forward.
     pub fn apply(&self, mask: &Array, real: &Array, imag: &Array, samples: i32) -> Result<Array> {
@@ -757,22 +799,22 @@ impl BsRoformer {
         };
         let (out_real, out_imag) = (split(&out_real)?, split(&out_imag)?);
 
-        // The reference zeroes the DC bin before inverting. Left in, it is an
-        // offset on the output rather than anything audible, but it is one the
-        // reference does not have.
-        let keep = Array::from_iter(1..bins, &[bins - 1]);
-        let out_real = ops::pad(
-            &out_real.take_axis(&keep, 2)?,
-            &[(0, 0), (0, 0), (1, 0), (0, 0)][..],
-            Array::from_f32(0.0),
-            None,
-        )?;
-        let out_imag = ops::pad(
-            &out_imag.take_axis(&keep, 2)?,
-            &[(0, 0), (0, 0), (1, 0), (0, 0)][..],
-            Array::from_f32(0.0),
-            None,
-        )?;
+        // The published checkpoints were trained with the DC bin zeroed before
+        // inverting; `stemd_roformer` was not.
+        let (out_real, out_imag) = if self.config.zero_dc {
+            let keep = Array::from_iter(1..bins, &[bins - 1]);
+            let zero_dc = |a: &Array| -> Result<Array> {
+                Ok(ops::pad(
+                    &a.take_axis(&keep, 2)?,
+                    &[(0, 0), (0, 0), (1, 0), (0, 0)][..],
+                    Array::from_f32(0.0),
+                    None,
+                )?)
+            };
+            (zero_dc(&out_real)?, zero_dc(&out_imag)?)
+        } else {
+            (out_real, out_imag)
+        };
 
         let spectrum = ops::add(
             &out_real.as_dtype(Dtype::Complex64)?,

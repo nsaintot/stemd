@@ -1,8 +1,8 @@
 //! BS-RoFormer, as far as it has been ported.
 //!
-//! The model is 159.8M parameters against htdemucs's 42M and separates one
-//! stem, vocals, with the instrumental being the remainder. See
-//! docs/evaluation.md for why it is worth having and how it has to be paired.
+//! Runs against whichever artefact `STEMD_MLX_ROFORMER` names: viperx or
+//! PolarFormer (vocals only) or stemd's own 4-stem model. See
+//! docs/evaluation.md.
 //!
 //! Ignored: needs `STEMD_MLX_ROFORMER` pointing at a converted artefact.
 
@@ -57,12 +57,18 @@ fn the_converted_artefact_is_what_the_checkpoint_said() {
     let _gpu = one_at_a_time();
     let Some(w) = roformer_weights() else { return };
 
-    // 699 for a rotary artefact. A polar one carries one shared `freqs` buffer
-    // per attention less and a pair of `pope_embed` tensors more, so
-    // 699 - 24 + 48 = 723: arithmetic rather than a second magic number, so a
-    // truncated conversion still fails here instead of matching by accident.
+    // 699 for a rotary artefact with one stem. A polar one carries one shared
+    // `freqs` buffer per attention less and a pair of `pope_embed` tensors
+    // more, so 699 - 24 + 48 = 723. Each further stem adds a mask estimator of
+    // 62 bands x 4 tensors, so the 4-stem `stemd_roformer` holds 699 + 3 * 248 = 1443.
     let polar = w.at("layers.0.0.layers.0.0").has("pope_embed.inv_freqs");
-    let expected = if polar { 699 - 24 + 48 } else { 699 };
+    let stems = (0..)
+        .take_while(|s| {
+            w.at(&format!("mask_estimators.{s}.to_freqs.0.0.0"))
+                .has("weight")
+        })
+        .count();
+    let expected = if polar { 699 - 24 + 48 } else { 699 } + (stems - 1) * 248;
     assert_eq!(w.len(), expected, "the checkpoint holds {expected} tensors");
 
     // Twelve blocks, each a time transformer then a frequency transformer.
@@ -308,7 +314,7 @@ fn the_mask_matches_the_reference() {
     };
 
     let model = model_of(&w);
-    let got = model.mask(&features).expect("mask");
+    let got = model.mask(0, &features).expect("mask");
 
     assert_eq!(got.shape(), want.shape(), "shape differs");
     let null = null_db(&got, &want);
@@ -330,7 +336,7 @@ fn the_mask_matches_the_reference() {
     assert!(null < -90.0, "the mask nulls at only {null:.1} dB");
 }
 
-/// The whole model: audio in, vocals out.
+/// The whole model: audio in, every stem out.
 ///
 /// Everything above this passes on its own, so what is left for this to catch
 /// is the wiring between them: the complex multiply, the order the frequency
@@ -354,8 +360,10 @@ fn the_whole_model_matches_the_reference() {
     let audio = input.reshape(&[1, s[0], s[1]]).expect("add a batch axis");
     let got = model.forward(&audio).expect("separating");
 
-    // The reference keeps a stem axis it only ever has one of.
-    let want = want.reshape(&[1, s[0], s[1]]).expect("drop the stem axis");
+    // `[1, stems, C, T]` on both sides.
+    let want = want
+        .reshape(&[1, model.stems(), s[0], s[1]])
+        .expect("add the stem axis");
     assert_eq!(got.shape(), want.shape(), "shape differs");
     let null = null_db(&got, &want);
     println!("whole model: {null:.1} dB");
@@ -397,11 +405,10 @@ fn a_short_track_survives_the_crossfade() {
     let want = model
         .forward(&centred)
         .expect("forward")
-        .index((.., .., left..left + length));
+        .index((.., .., .., left..left + length));
 
-    let got = stemd_mlx::apply::over_track(&model, &audio, 0.25, &mut |_, _| Ok(()))
-        .expect("over_track")
-        .index((.., 0, .., ..));
+    let got =
+        stemd_mlx::apply::over_track(&model, &audio, 0.25, &mut |_, _| Ok(())).expect("over_track");
 
     assert_eq!(got.shape(), want.shape(), "shape differs");
     let null = null_db(&got, &want);
