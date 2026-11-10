@@ -1,13 +1,19 @@
 //! Job queue and the single separation worker.
 //!
-//! Separation is serialised: one track at a time, FIFO, with a position to report,
-//! backpressure when saturated, and cancellation that covers the running job as
-//! well as the waiting ones. The separator polls between segments, so cancelling
-//! costs one segment.
+//! Separation is serialised: one segment at a time on one worker. Whole-track jobs
+//! run FIFO, with a position to report, backpressure when saturated, and
+//! cancellation that covers the running job as well as the waiting ones.
+//!
+//! Between segments the worker takes session work, in this order:
+//!
+//! 1. a staged model, when no job is mid-track;
+//! 2. a critical session segment, also between two segments of a running job;
+//! 3. the next waiting job;
+//! 4. a bonus session segment.
 //!
 //! The worker builds every separator it runs. See [`BuildSeparator`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,12 +22,16 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
 use parking_lot::{Condvar, Mutex};
-use stemd_core::{Audio, BackendInfo, Cancelled, Progress, Separate, Stage, Stems};
+use stemd_core::{
+    Audio, BackendInfo, Cancelled, Pass, Progress, Segmenting, Separate, Stage, Stems, whole_track,
+};
 
 use crate::cache::Output;
 
 use crate::cache::Cache;
 use crate::jobs::Job;
+use crate::pieces::{Pieces, type_dir};
+use crate::sessions::{Priority, Sessions, Track, excerpt, gain, output_index, track_id};
 
 /// How a separator reaches the worker: as a recipe, never as a finished model.
 ///
@@ -36,6 +46,8 @@ pub struct QueuedWork {
     pub mix: Audio,
     /// Format, rate and part set the client asked for.
     pub output: Output,
+    /// The `model_id` the job was submitted under, for the pieces it writes.
+    pub model_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +91,11 @@ struct Inner {
     /// `None` only between spawning the worker and its first build; [`Queue::start`]
     /// does not return until it is `Some`.
     info: Mutex<Option<BackendInfo>>,
+    /// How the loaded separator cuts a track, written with `info`.
+    segmenting: Mutex<Option<Segmenting>>,
+    /// Whether the loaded separator needs the whole mix's normalisation.
+    normalises: AtomicBool,
+    sessions: Arc<Sessions>,
 }
 
 pub struct Queue {
@@ -116,6 +133,9 @@ impl Queue {
             shutdown: AtomicBool::new(false),
             incoming: Mutex::new(None),
             info: Mutex::new(None),
+            segmenting: Mutex::new(None),
+            normalises: AtomicBool::new(false),
+            sessions: Arc::new(Sessions::default()),
         });
 
         let (reply, built) = mpsc::sync_channel(1);
@@ -160,6 +180,28 @@ impl Queue {
             .lock()
             .clone()
             .expect("the worker publishes its model before `start` returns")
+    }
+
+    /// How the loaded separator cuts a track, or `None` when it cannot run
+    /// segment by segment.
+    pub fn segmenting(&self) -> Option<Segmenting> {
+        *self.inner.segmenting.lock()
+    }
+
+    /// Whether the loaded separator needs the whole mix's normalisation.
+    pub fn normalises(&self) -> bool {
+        self.inner.normalises.load(Ordering::SeqCst)
+    }
+
+    pub fn sessions(&self) -> &Arc<Sessions> {
+        &self.inner.sessions
+    }
+
+    /// Tell the worker that session work may be waiting.
+    pub fn wake(&self) {
+        // Notify under `pending` so the worker cannot miss the wake between its check and its wait.
+        let _parked = self.inner.pending.lock();
+        self.inner.ready.notify_all();
     }
 
     /// Stop the worker: refuse new jobs, cancel the one in flight, and wait for it to
@@ -340,6 +382,9 @@ struct Claimed {
 enum Next {
     Install(Staged),
     Job(Claimed),
+    Segment(Arc<Track>, usize),
+    /// Woken with nothing to run: a chance to drop what closed sessions held.
+    Tidy,
 }
 
 impl Inner {
@@ -351,6 +396,7 @@ impl Inner {
     /// same lock that took the job out of `pending`.
     fn next(&self) -> Option<Next> {
         let mut pending = self.pending.lock();
+        let mut woken = false;
         loop {
             // Ahead of the swap as well as the job: building a model while the
             // process is tearing down puts a fresh allocation in front of the C
@@ -362,6 +408,9 @@ impl Inner {
             if let Some(staged) = self.incoming.lock().take() {
                 return Some(Next::Install(staged));
             }
+            if let Some((track, k)) = self.sessions.next(Priority::Critical) {
+                return Some(Next::Segment(track, k));
+            }
             if let Some(work) = pending.pop_front() {
                 let cancel = Arc::new(AtomicBool::new(false));
                 *self.running.lock() = Some(Running {
@@ -370,7 +419,15 @@ impl Inner {
                 });
                 return Some(Next::Job(Claimed { work, cancel }));
             }
+            if let Some((track, k)) = self.sessions.next(Priority::Bonus) {
+                return Some(Next::Segment(track, k));
+            }
+            // Tidy only after every check above, so a wake never skips waiting work.
+            if woken {
+                return Some(Next::Tidy);
+            }
             self.ready.wait(&mut pending);
+            woken = true;
         }
     }
 
@@ -390,6 +447,12 @@ impl Inner {
                 // Published before the reply, so a caller reading it the instant
                 // `install` returns sees the model it just installed.
                 *self.info.lock() = Some(info.clone());
+                // Open sessions hold output from the old model. Close them before the
+                // reply, so `install` returns with them closed.
+                self.sessions.close_all("the server switched models");
+                *self.segmenting.lock() = separator.segmenting();
+                self.normalises
+                    .store(separator.normalises(), Ordering::SeqCst);
                 // The send may find nobody there: a switch superseded between
                 // the build starting and finishing. Keep the model anyway: it is
                 // the newer of the two, and `info` already says so.
@@ -411,6 +474,9 @@ impl Inner {
 /// loaded in place. Whether the separator is still sound cannot be known from
 /// here, so it is reported at `error`.
 fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cache) {
+    // Each open track's partial output, on the device, by track uid. Held here
+    // because MLX arrays belong to the thread that made them.
+    let mut passes: HashMap<u64, Pass> = HashMap::new();
     while let Some(next) = inner.next() {
         match next {
             Next::Install(staged) => {
@@ -422,6 +488,8 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                 match catch_unwind(AssertUnwindSafe(|| inner.build_here(build, &reply))) {
                     Ok(Some(built)) => {
                         separator = built;
+                        // Partial passes hold output from the old model.
+                        passes.clear();
                         tracing::info!("switched to {}", separator.info().model);
                     }
                     // `build_here` has already sent whatever it failed with.
@@ -438,8 +506,12 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                 }
             }
             Next::Job(claimed) => {
+                let pieces = inner.sessions.pieces();
                 let separating = catch_unwind(AssertUnwindSafe(|| {
-                    separate_one(separator.as_mut(), &claimed, cache)
+                    separate_one(separator.as_mut(), &claimed, cache, pieces, &mut |sep| {
+                        serve_critical(inner, sep, &mut passes);
+                        Ok(())
+                    });
                 }));
                 if let Err(payload) = separating {
                     let what = crate::panics::message(&*payload);
@@ -453,8 +525,123 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                 }
                 *inner.running.lock() = None;
             }
+            Next::Segment(track, k) => {
+                run_segment(separator.as_mut(), &inner.sessions, &track, k, &mut passes);
+            }
+            Next::Tidy => {}
+        }
+        passes.retain(|uid, _| inner.sessions.has_track(*uid));
+    }
+}
+
+/// Run every critical session segment that can run now.
+fn serve_critical(inner: &Inner, separator: &mut dyn Separate, passes: &mut HashMap<u64, Pass>) {
+    while !inner.shutdown.load(Ordering::SeqCst)
+        && let Some((track, k)) = inner.sessions.next(Priority::Critical)
+    {
+        run_segment(separator, &inner.sessions, &track, k, passes);
+    }
+}
+
+/// Run one segment of a track, copy what it made final into the track, and
+/// write the pieces that became complete.
+///
+/// A failure closes the track; the worker keeps running.
+fn run_segment(
+    separator: &mut dyn Separate,
+    sessions: &Sessions,
+    track: &Track,
+    k: usize,
+    passes: &mut HashMap<u64, Pass>,
+) {
+    let began = std::time::Instant::now();
+    let ran = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+        let (window, norm) = track.input(k)?;
+        let pass = match passes.entry(track.uid) {
+            std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(separator.begin(track.spec.frames, track.spec.parts, norm)?)
+            }
+        };
+        separator.run(pass, &window, k)?;
+        track.done(k);
+        let finals = newly_final(pass, k);
+        for &(from, to) in &finals {
+            let stems = separator.stems(pass, &track.mix(from, to), from, to)?;
+            track.store(from, to, &stems)?;
+        }
+        if let (Some(pieces), Some(first), Some(last)) =
+            (sessions.pieces(), finals.first(), finals.last())
+        {
+            pieces.publish(sessions, track, first.0..last.1);
+        }
+        Ok(())
+    }));
+    let failure = match ran {
+        Ok(Ok(())) => {
+            tracing::debug!(track = track.uid, "segment {k} in {:.2?}", began.elapsed());
+            return;
+        }
+        Ok(Err(err)) => format!("segment {k}: {err:#}"),
+        Err(payload) => format!(
+            "segment {k} panicked: {}",
+            crate::panics::message(&*payload)
+        ),
+    };
+    tracing::warn!(track = track.uid, "{failure}");
+    track.close(failure);
+    passes.remove(&track.uid);
+}
+
+/// Write a finished job's stems as pieces, so a later session on the same track
+/// starts with them.
+fn write_job_pieces(
+    pieces: &Pieces,
+    model_id: &str,
+    mix: &Audio,
+    stems: &Stems,
+    output: Output,
+    stride: usize,
+) -> Result<()> {
+    let id = track_id(mix);
+    let gain = gain(&output, mix.peak().ok());
+    let name = type_dir(&output, gain);
+    let mut all = output;
+    all.derived = true;
+    let converted = crate::cache::to_output_rate(mix, stems, all)?;
+    let (model, out) = (u64::from(mix.sample_rate), u64::from(output.rate.hz()));
+    let frames = mix.frames();
+    let count = frames.div_ceil(stride);
+    let dir = pieces.verified_dir(model_id, &name, &id);
+    for k in 0..count {
+        let (from, to) = (k * stride, ((k + 1) * stride).min(frames));
+        for (stem, audio) in &converted {
+            let a = output_index(from, model, out).min(audio.frames());
+            let b = output_index(to, model, out).min(audio.frames());
+            let bytes = stemd_core::encode_stem(&excerpt(audio, a, b), output.format, gain)?;
+            pieces.write_verified(&dir, stem, k, output.format.extension(), &bytes)?;
         }
     }
+    tracing::info!("track {id}: wrote {count} pieces of {name}");
+    Ok(())
+}
+
+/// The ranges inside segment `k`'s output that are final now that it has run.
+fn newly_final(pass: &Pass, k: usize) -> Vec<(usize, usize)> {
+    let grid = pass.grid();
+    let own = grid.placement(k);
+    let mut cuts = vec![own.offset, own.end()];
+    for j in grid.covering(own.offset, own.end()) {
+        let other = grid.placement(j);
+        cuts.extend([other.offset, other.end()]);
+    }
+    cuts.retain(|c| (own.offset..=own.end()).contains(c));
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|w| (w[0].unsigned_abs() as usize, w[1].unsigned_abs() as usize))
+        .filter(|&(from, to)| pass.is_final(from, to))
+        .collect()
 }
 
 /// Progress sink for one running job: forwards updates to the handle, and lets
@@ -476,7 +663,13 @@ impl stemd_core::ProgressSink for JobSink {
     }
 }
 
-fn separate_one(separator: &mut dyn Separate, claimed: &Claimed, cache: &Cache) {
+fn separate_one(
+    separator: &mut dyn Separate,
+    claimed: &Claimed,
+    cache: &Cache,
+    pieces: Option<Arc<Pieces>>,
+    between: &mut dyn FnMut(&mut dyn Separate) -> Result<()>,
+) {
     let work = &claimed.work;
     let job = &work.job;
     let started = std::time::Instant::now();
@@ -485,8 +678,37 @@ fn separate_one(separator: &mut dyn Separate, claimed: &Claimed, cache: &Cache) 
         cancel: Arc::clone(&claimed.cancel),
     };
 
-    match separator.separate(&work.mix, work.output.parts, &sink) {
-        Ok(stems) => publish(job, work, &stems, cache, started.elapsed().as_secs_f64()),
+    // Segment by segment where the separator can, so critical session work
+    // waits at most one segment.
+    let segmenting = separator.segmenting();
+    let separated = if segmenting.is_some() {
+        whole_track(separator, &work.mix, work.output.parts, &sink, |sep| {
+            between(sep)
+        })
+    } else {
+        separator.separate(&work.mix, work.output.parts, &sink)
+    };
+    match separated {
+        Ok(stems) => {
+            publish(job, work, &stems, cache, started.elapsed().as_secs_f64());
+            // Off the worker: the job is done for its client, and the next one
+            // should not wait on encoding.
+            if let (Some(pieces), Some(segmenting)) = (pieces, segmenting)
+                && work.output.format != stemd_core::StemFormat::Mp3
+                && let Ok(grid) = segmenting.grid(work.mix.frames())
+            {
+                let (mix, output, model_id) =
+                    (work.mix.clone(), work.output, work.model_id.clone());
+                let stride = grid.stride().unsigned_abs() as usize;
+                std::thread::spawn(move || {
+                    if let Err(err) =
+                        write_job_pieces(&pieces, &model_id, &mix, &stems, output, stride)
+                    {
+                        tracing::warn!("writing a job's pieces: {err:#}");
+                    }
+                });
+            }
+        }
         // Routine, not a failure: the client said so. Logged at info with what
         // it cost, so a client skipping repeatedly is visible in the log without
         // looking like the model is breaking.
@@ -534,6 +756,38 @@ mod tests {
     use std::time::Duration;
     use stemd_core::{BackendInfo, DspMode, OutputRate, ProgressSink, StemFormat, Stems};
 
+    /// The segment methods of a stub that only separates whole tracks.
+    macro_rules! whole_tracks_only {
+        () => {
+            fn normalises(&self) -> bool {
+                false
+            }
+            fn segmenting(&self) -> Option<stemd_core::Segmenting> {
+                None
+            }
+            fn begin(
+                &self,
+                _frames: usize,
+                _parts: stemd_core::Parts,
+                _norm: stemd_core::Normalisation,
+            ) -> anyhow::Result<Pass> {
+                anyhow::bail!("whole tracks only")
+            }
+            fn run(&mut self, _pass: &mut Pass, _window: &Audio, _k: usize) -> anyhow::Result<()> {
+                anyhow::bail!("whole tracks only")
+            }
+            fn stems(
+                &self,
+                _pass: &Pass,
+                _mix: &Audio,
+                _from: usize,
+                _to: usize,
+            ) -> anyhow::Result<Stems> {
+                anyhow::bail!("whole tracks only")
+            }
+        };
+    }
+
     /// A separator that records which model "ran", so a swap is observable
     /// without loading 300 MB of weights onto a GPU.
     struct Stub {
@@ -542,6 +796,8 @@ mod tests {
     }
 
     impl Separate for Stub {
+        whole_tracks_only!();
+
         fn separate(
             &mut self,
             _mix: &Audio,
@@ -586,6 +842,8 @@ mod tests {
     struct Traced(Threads);
 
     impl Separate for Traced {
+        whole_tracks_only!();
+
         fn separate(
             &mut self,
             _mix: &Audio,
@@ -660,6 +918,8 @@ mod tests {
     }
 
     impl Separate for Segmented {
+        whole_tracks_only!();
+
         fn separate(
             &mut self,
             _mix: &Audio,
@@ -699,6 +959,8 @@ mod tests {
     }
 
     impl Separate for Reporting {
+        whole_tracks_only!();
+
         fn separate(
             &mut self,
             _mix: &Audio,
@@ -745,6 +1007,8 @@ mod tests {
     }
 
     impl Separate for Panics {
+        whole_tracks_only!();
+
         fn separate(
             &mut self,
             _mix: &Audio,
@@ -863,6 +1127,7 @@ mod tests {
                     dsp: DspMode::default(),
                     parts: stemd_core::Parts::DEFAULT,
                 },
+                model_id: "test".into(),
             })
             .expect("queue has room");
     }
@@ -1302,5 +1567,440 @@ mod tests {
             .expect("the install thread panicked")
             .expect("the surviving install must still be applied");
         assert_eq!(queue.info().model, "c");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::sessions::{Margin, Request, Session, TrackSpec, WindowRequest};
+    use crate::testkit::cache;
+    use std::time::Duration;
+    use stemd_core::toy::Toy;
+    use stemd_core::{DspMode, Normalisation, OutputRate, Parts, PcmFormat, Silent, StemFormat};
+
+    /// MLX runs on one thread at a time; each queue here has its own worker.
+    static GPU: Mutex<()> = Mutex::new(());
+
+    const SEGMENT: i32 = 4410;
+
+    fn track(frames: usize, seed: u32) -> Audio {
+        let mut state = seed;
+        let data = (0..2)
+            .map(|_| {
+                (0..frames)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        Audio::new(data, stemd_core::toy::RATE)
+    }
+
+    fn output(format: StemFormat) -> Output {
+        Output {
+            format,
+            rate: OutputRate::default(),
+            derived: true,
+            dsp: DspMode::default(),
+            parts: Parts::DEFAULT,
+        }
+    }
+
+    fn start(toy: Toy) -> Queue {
+        let build: BuildSeparator = Box::new(move || Ok(Box::new(toy) as Box<dyn Separate>));
+        Queue::start(build, 8, cache(1 << 30, Duration::from_secs(60)))
+            .expect("the toy builds")
+            .0
+    }
+
+    /// A piece store no other test touches.
+    fn with_pieces(queue: &Queue) -> Arc<Pieces> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "stemd-pieces-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pieces = Pieces::open(root, 1 << 30).expect("a piece store");
+        queue.sessions().set_pieces(Arc::clone(&pieces));
+        pieces
+    }
+
+    fn open_as(
+        queue: &Queue,
+        frames: usize,
+        norm: Option<Normalisation>,
+        format: StemFormat,
+    ) -> Arc<Session> {
+        let grid = queue
+            .segmenting()
+            .expect("the toy segments")
+            .grid(frames)
+            .expect("a grid");
+        queue
+            .sessions()
+            .open(Request {
+                output: output(format),
+                in_format: PcmFormat::F32le,
+                track: TrackSpec {
+                    frames,
+                    channels: 2,
+                    sample_rate: stemd_core::toy::RATE,
+                    grid,
+                    normalises: queue.normalises(),
+                    parts: Parts::DEFAULT,
+                },
+                norm,
+                peak: None,
+                model_id: "toy-00000000".into(),
+            })
+            .expect("room for a session")
+    }
+
+    fn open(queue: &Queue, frames: usize, norm: Option<Normalisation>) -> Arc<Session> {
+        open_as(queue, frames, norm, StemFormat::Pcm32)
+    }
+
+    fn whole(session: &Session) -> WindowRequest {
+        WindowRequest {
+            needle: 0,
+            ahead: Margin {
+                frames: session.track().spec.frames,
+                priority: Priority::Critical,
+            },
+            behind: Margin {
+                frames: 0,
+                priority: Priority::Bonus,
+            },
+        }
+    }
+
+    fn ready_within(session: &Session, from: usize, to: usize, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if session.read("vocals", from, to).is_ok() {
+                return true;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        false
+    }
+
+    fn bits(audio: &Audio) -> Vec<u32> {
+        audio.data.iter().flatten().map(|v| v.to_bits()).collect()
+    }
+
+    fn upload(queue: &Queue, session: &Session, offset: usize, audio: &Audio) {
+        queue
+            .sessions()
+            .upload(session, offset, audio)
+            .expect("uploading");
+    }
+
+    #[test]
+    fn a_session_uploaded_backwards_matches_a_whole_track_run() {
+        let _gpu = GPU.lock();
+        let frames = 31_337;
+        let mix = track(frames, 1);
+        let mut direct = Toy::new(SEGMENT, 0.25);
+        let want = direct
+            .separate(&mix, Parts::DEFAULT, &Silent)
+            .expect("separating");
+
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let session = open(&queue, frames, None);
+        session.set_window(&whole(&session)).expect("open");
+        // Last piece first, so segments wait on their input and on the whole
+        // mix's statistics.
+        for at in (0..frames)
+            .step_by(10_000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let to = (at + 10_000).min(frames);
+            upload(&queue, &session, at, &excerpt(&mix, at, to));
+            queue.wake();
+        }
+        assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+
+        for name in ["harmonics", "vocals"] {
+            let got = session.read(name, 0, frames).expect("ready").audio;
+            let want = want.stem(name).expect("a shipped stem");
+            assert_eq!(bits(&got), bits(want), "{name} differs");
+        }
+        let derived = session.read("drums", 0, frames).expect("ready").audio;
+        assert_eq!(
+            bits(&derived),
+            bits(&want.derived_part(&mix)),
+            "drums differs"
+        );
+    }
+
+    #[test]
+    fn nothing_runs_on_a_normalising_model_until_the_mix_is_whole() {
+        let _gpu = GPU.lock();
+        let frames = 40_000;
+        let mix = track(frames, 2);
+        let toy = Toy::new(SEGMENT, 0.25);
+        let runs = Arc::clone(&toy.runs);
+        let queue = start(toy);
+        let session = open(&queue, frames, None);
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &excerpt(&mix, 0, 30_000));
+        queue.wake();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "ran without the statistics");
+
+        upload(&queue, &session, 30_000, &excerpt(&mix, 30_000, frames));
+        queue.wake();
+        assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn with_the_clients_statistics_a_segment_runs_once_its_own_input_is_in() {
+        let _gpu = GPU.lock();
+        let frames = 400_000;
+        let mix = track(frames, 3);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let session = open(&queue, frames, Some(Normalisation::of(&mix)));
+        let needle = 200_000;
+        session
+            .set_window(&WindowRequest {
+                needle,
+                ahead: Margin {
+                    frames: 10_000,
+                    priority: Priority::Critical,
+                },
+                behind: Margin {
+                    frames: 0,
+                    priority: Priority::Bonus,
+                },
+            })
+            .expect("open");
+        // Only the region around the cue.
+        upload(&queue, &session, 190_000, &excerpt(&mix, 190_000, 220_000));
+        queue.wake();
+        assert!(ready_within(
+            &session,
+            needle,
+            needle + 5_000,
+            Duration::from_secs(20)
+        ));
+        assert!(session.read("vocals", 0, 1_000).is_err());
+    }
+
+    #[test]
+    fn critical_segments_run_between_the_segments_of_a_job() {
+        let _gpu = GPU.lock();
+        let mut toy = Toy::new(SEGMENT, 0.25);
+        toy.delay = Duration::from_millis(20);
+        let queue = start(toy);
+
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let job = store.create("long".into());
+        queue
+            .submit(QueuedWork {
+                job: Arc::clone(&job),
+                // About eighty segments, so well over a second of work.
+                mix: track(80 * 3307, 4),
+                output: output(StemFormat::Pcm32),
+                model_id: "toy-00000000".into(),
+            })
+            .expect("room");
+        thread::sleep(Duration::from_millis(100));
+
+        let frames = 20_000;
+        let mix = track(frames, 5);
+        let session = open(&queue, frames, Some(Normalisation::of(&mix)));
+        upload(&queue, &session, 0, &mix);
+        session.set_window(&whole(&session)).expect("open");
+        queue.wake();
+
+        assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+        assert!(
+            queue.running().is_some(),
+            "the session waited for the whole job"
+        );
+        queue.cancel(&job.id);
+    }
+
+    #[test]
+    fn bonus_segments_wait_for_waiting_jobs() {
+        let _gpu = GPU.lock();
+        let mut toy = Toy::new(SEGMENT, 0.25);
+        toy.delay = Duration::from_millis(10);
+        let queue = start(toy);
+
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let job = store.create("long".into());
+        queue
+            .submit(QueuedWork {
+                job: Arc::clone(&job),
+                mix: track(40 * 3307, 6),
+                output: output(StemFormat::Pcm32),
+                model_id: "toy-00000000".into(),
+            })
+            .expect("room");
+        thread::sleep(Duration::from_millis(50));
+
+        let frames = 20_000;
+        let mix = track(frames, 7);
+        let session = open(&queue, frames, Some(Normalisation::of(&mix)));
+        upload(&queue, &session, 0, &mix);
+        let mut request = whole(&session);
+        request.ahead.priority = Priority::Bonus;
+        session.set_window(&request).expect("open");
+        queue.wake();
+
+        assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+        assert_eq!(
+            job.view().progress.stage,
+            Stage::Done,
+            "a bonus segment ran ahead of the job"
+        );
+    }
+
+    #[test]
+    fn a_model_switch_closes_every_session() {
+        let _gpu = GPU.lock();
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let session = open(&queue, 20_000, None);
+        queue
+            .install(Box::new(|| {
+                Ok(Box::new(Toy::new(SEGMENT, 0.25)) as Box<dyn Separate>)
+            }))
+            .expect("installing");
+        assert!(session.closed().is_some());
+        assert!(queue.sessions().is_empty());
+    }
+
+    #[test]
+    fn a_second_deck_on_the_same_audio_joins_the_first_once_its_upload_completes() {
+        let _gpu = GPU.lock();
+        let frames = 60_000;
+        let mix = track(frames, 8);
+        let toy = Toy::new(SEGMENT, 0.25);
+        let runs = Arc::clone(&toy.runs);
+        let queue = start(toy);
+
+        let a = open_as(&queue, frames, None, StemFormat::Pcm32);
+        a.set_window(&whole(&a)).expect("open");
+        upload(&queue, &a, 0, &mix);
+        queue.wake();
+        assert!(ready_within(&a, 0, frames, Duration::from_secs(20)));
+        let segments = a.track().spec.grid.len();
+        assert_eq!(runs.load(Ordering::SeqCst), segments);
+
+        let b = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &b, 0, &mix);
+        assert!(Arc::ptr_eq(&a.track(), &b.track()), "b did not join a");
+        b.set_window(&whole(&b)).expect("open");
+        queue.wake();
+        assert!(ready_within(&b, 0, frames, Duration::from_secs(1)));
+        assert_eq!(runs.load(Ordering::SeqCst), segments, "b separated again");
+        assert_eq!(
+            a.track().verified().as_deref(),
+            Some(crate::sessions::track_id(&mix).as_str())
+        );
+    }
+
+    #[test]
+    fn a_later_session_on_the_same_audio_finds_its_pieces_on_disk() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 9);
+        let id = crate::sessions::track_id(&mix);
+        let toy = Toy::new(SEGMENT, 0.25);
+        let runs = Arc::clone(&toy.runs);
+        let queue = start(toy);
+        let pieces = with_pieces(&queue);
+
+        let first = open_as(&queue, frames, None, StemFormat::Flac);
+        first.set_window(&whole(&first)).expect("open");
+        upload(&queue, &first, 0, &mix);
+        queue.wake();
+        assert!(ready_within(&first, 0, frames, Duration::from_secs(20)));
+        let count = first.track().spec.grid.len();
+        let type_name = type_dir(&first.output, first.gain);
+        let stems = ["harmonics", "vocals", "drums"];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pieces
+            .cached("toy-00000000", &type_name, &id, &stems, "flac", count)
+            .len()
+            < count
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pieces were never written"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        queue.sessions().remove(&first.id);
+        let ran = runs.load(Ordering::SeqCst);
+
+        // A new session on the same audio, once the first has gone.
+        let second = open_as(&queue, frames, None, StemFormat::Flac);
+        second.set_window(&whole(&second)).expect("open");
+        upload(&queue, &second, 0, &mix);
+        queue.wake();
+        assert_eq!(queue.sessions().cached_for(&second).len(), count);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            ran,
+            "cached pieces were separated again"
+        );
+    }
+
+    #[test]
+    fn a_job_leaves_its_pieces_for_sessions() {
+        let _gpu = GPU.lock();
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_pieces(&queue);
+        let frames = 25_000;
+        let mix = track(frames, 10);
+        let id = crate::sessions::track_id(&mix);
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let job = store.create("for-pieces".into());
+        queue
+            .submit(QueuedWork {
+                job: Arc::clone(&job),
+                mix: mix.clone(),
+                output: output(StemFormat::Flac),
+                model_id: "toy-00000000".into(),
+            })
+            .expect("room");
+        let grid = queue
+            .segmenting()
+            .expect("segments")
+            .grid(frames)
+            .expect("a grid");
+        let name = type_dir(
+            &output(StemFormat::Flac),
+            gain(&output(StemFormat::Flac), mix.peak().ok()),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while pieces
+            .cached(
+                "toy-00000000",
+                &name,
+                &id,
+                &["harmonics", "vocals", "drums"],
+                "flac",
+                grid.len(),
+            )
+            .len()
+            < grid.len()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job wrote no pieces"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 }

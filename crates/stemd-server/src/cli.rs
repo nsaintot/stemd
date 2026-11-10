@@ -71,6 +71,26 @@ pub struct Args {
     #[arg(long, default_value_t = 16)]
     pub queue_depth: usize,
 
+    /// Seconds a session may sit with nothing to run and no request from its
+    /// client before it is ended and its memory freed.
+    #[arg(long, default_value_t = 30)]
+    pub session_idle_secs: u64,
+
+    /// Sessions that may be open at once. Each holds its track and its stems in
+    /// memory: about 0.9 GB for a six-minute track on Fast.
+    #[arg(long, default_value_t = 4)]
+    pub max_sessions: usize,
+
+    /// Where session pieces are kept. Unlike --cache-dir, it survives restarts.
+    /// Defaults to `stemd-pieces` under the platform's cache directory.
+    #[arg(long)]
+    pub pieces_dir: Option<PathBuf>,
+
+    /// Disk the pieces may occupy, in gigabytes. Past this the least recently
+    /// used pieces are dropped.
+    #[arg(long, default_value_t = 8.0)]
+    pub pieces_max_gb: f64,
+
     /// Disk the separated stems may occupy, in gigabytes. Past this the least
     /// recently used tracks are dropped. A five-minute stereo track costs about
     /// 106 MB at s16le and 212 MB at f32le.

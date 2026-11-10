@@ -30,6 +30,9 @@ sha2 = "0.10"
 # The per-platform cache and data directories. See `cache::default_dir`.
 dirs = "6"
 
+[dev-dependencies]
+stemd-core = { path = "../stemd-core", features = ["toy"] }
+
 # winit is eframe's window layer and otherwise an implementation detail. It is
 # named here for a single call: asking for the X11 backend, which is the only
 # one of the three winit implements file drag and drop on. See `ui::run`.

@@ -11,20 +11,27 @@ pub mod backend;
 pub mod hybrid;
 pub mod mixture;
 pub mod mlx;
+pub mod pass;
 pub mod pcm;
 pub mod progress;
 pub mod resample;
 pub mod roformer;
 pub mod stemfmt;
 pub mod stems;
+#[cfg(feature = "toy")]
+pub mod toy;
 
 pub use backend::{BackendInfo, Separate};
 pub use hybrid::{HybridConfig, HybridSeparator};
+pub use mixture::Normalisation;
 pub use mlx::{MlxConfig, MlxSeparator};
+pub use pass::{Pass, Segmenting, whole_track};
 pub use pcm::{Audio, PcmFormat};
 pub use progress::{Cancelled, Progress, ProgressSink, Silent, Stage};
 pub use resample::{DspMode, OutputRate};
 pub use roformer::RoformerSeparator;
+/// Re-exported so the server can plan segments without linking `stemd-mlx`.
+pub use stemd_mlx::apply::{Grid, Placement};
 /// Re-exported so a caller can name a precision without depending on
 /// `stemd-mlx`. stemd-server does exactly that: it has to put the precision in
 /// its cache key and never links the model crate.

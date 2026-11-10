@@ -9,6 +9,14 @@ GET    /v1/jobs/{id}                  progress, then the result object
 GET    /v1/jobs/{id}/stems/{name}     raw interleaved PCM stream
                                       410 if the stems were reaped: resubmit
 DELETE /v1/jobs/{id}                  stop the job, drop the handle
+POST   /v1/sessions                   open a session: track length and output
+PUT    /v1/sessions/{id}/pcm?offset=N PCM placed at track sample N
+PUT    /v1/sessions/{id}/window       needle and margins, JSON
+GET    /v1/sessions/{id}              what has arrived and what is ready
+GET    /v1/sessions/{id}/stems/{name} one ready range, ?from=&to=
+                                      409 if it is not ready
+GET    /v1/sessions/{id}/pieces/{name}/{k}  piece k, encoded, as stored
+DELETE /v1/sessions/{id}              end the session
 GET    /v1/logs                       recent log lines
 ```
 
@@ -291,6 +299,165 @@ sample number instead of frame number, and a decoder that follows that either
 stops partway through the file or reports every frame as out of order. The
 encoder therefore excludes the trailing partial block from the declared minimum,
 as libFLAC and ffmpeg do.
+
+## Sessions
+
+A session separates one track in pieces, around a playhead, in the order the
+client asks. Use it to get stems near the needle within a segment or two instead
+of after the whole track.
+
+Once a session's whole upload has arrived, the server hashes it into a
+[track id](#track-id). A session whose audio matches a track another session
+already has open joins it, so two decks playing one song share the model work
+and the memory from then on. Finished pieces are written to disk under that id,
+survive restarts, and serve any later session on the same audio without a model
+run.
+
+All positions are track samples at the model's rate (`sample_rate` in
+`/v1/health`), whatever the output rate.
+
+### 1. Open
+
+```
+POST /v1/sessions?frames=<track length>&format=f32le&output_format=f32le&mean=<m>&std=<s>&peak=<p>
+```
+
+| Parameter | |
+| --- | --- |
+| `frames` | Required. Track length. |
+| `sample_rate`, `channels`, `format` | The upload. `sample_rate` must be the model's rate. |
+| `output_format`, `output_sample_rate`, `parts`, `include_derived`, `dsp_mode` | As for `/v1/jobs`. `mp3` is refused. |
+| `mean`, `std` | Optional. Mean and standard deviation of the mono mixdown `(L + R) / 2` over the whole track, in f64, sent as f32. |
+| `peak` | Optional. Largest absolute sample of the mix, both channels. Sets the gain, and so the piece directory: send it to share pieces with whole-track jobs, which use the true peak. |
+
+The body is optional PCM from sample 0. The answer is `201` and the session view.
+`429` means the `--max-sessions` limit is reached; `409` means the loaded model cannot run
+segment by segment.
+
+### Track id
+
+The server computes it, as it does a job's cache key: SHA-256 over
+
+1. three fields, each a little-endian `u32` byte length then its UTF-8 bytes:
+   `stemd-track-1`, the sample rate (`44100`), the channel count (`2`);
+2. every frame's samples as little-endian `f32`, channel by channel within the
+   frame, at the model's rate.
+
+It is the first 24 lowercase hex characters, the same whether the upload was
+`s16le` or `f32le`. The view's `track` holds it once the whole track has
+arrived, with `verified: true`.
+
+When the upload completes:
+
+| The server finds | It does |
+| --- | --- |
+| an open track with the same id and parts | moves the session onto it; what that track separated is ready at once |
+| pieces on disk for the id and this output | lists them in `pieces` and drops the segments they cover from the plan |
+| neither | writes this track's pieces as they complete |
+
+Until then a session separates on its own, cue region first as usual. A second
+deck loading a song already open separates its cue once, then joins. If the
+client sent `mean` and `std` and they are not the mix's, the track is never
+shared or stored, since its stems differ from a whole-track run's.
+
+### 2. Upload
+
+```
+PUT /v1/sessions/{id}/pcm?offset=<sample>
+```
+
+Any piece, in any order, in the session's `format`. Send the cue region first,
+and the rest after: nothing is shared or stored until the whole track has
+arrived.
+
+A sample uploaded twice must match to the bit; a difference is `409`.
+
+### 3. Ask for a window
+
+```json
+PUT /v1/sessions/{id}/window
+{"needle": 661500,
+ "ahead":  {"frames": 705600, "priority": "critical"},
+ "behind": {"frames": 88200,  "priority": "bonus"}}
+```
+
+| Priority | Runs |
+| --- | --- |
+| `critical` | before whole-track jobs, also between two segments of one |
+| `bonus` | when no job is waiting |
+
+Each request replaces the last one's plan; segments already run are kept. The
+segments under the needle go first, at the higher of the two priorities, then
+both sides outward, two from the higher-priority side for each one from the
+other. Only what a window asks for is separated.
+
+### 4. Read ready ranges
+
+`GET /v1/sessions/{id}` lists `arrived` and `ready` as `[from, to]` pairs. A
+sample is ready once every segment covering it has run: the last ~25% of a
+segment waits for its neighbour.
+
+```
+GET /v1/sessions/{id}/stems/{name}?from=<sample>&to=<sample>
+```
+
+| Header | |
+| --- | --- |
+| `x-stemd-from` | First sample of the body, at the output rate. |
+| `x-stemd-frames` | Samples in the body. |
+| `x-stemd-gain` | Multiply by `1.0 / gain`. |
+| `x-stemd-clipped` | Samples clipped to fit a 16-bit format. |
+
+`from..to` must sit inside one ready range. The derived part is served when
+`include_derived` is set.
+
+### Pieces
+
+Piece `k` is track samples `[k * stride_frames, (k + 1) * stride_frames)`. The
+view's `pieces` lists those stored for this session's output; fetch one whole,
+already encoded, with
+
+```
+GET /v1/sessions/{id}/pieces/{name}/{k}
+```
+
+It carries the same `x-stemd-*` headers. A stored piece is sent as it is; one
+that is ready in memory but not stored yet is encoded on the way out. A segment
+whose pieces are all stored is not run again, so a cached window shows in
+`pieces` rather than in `ready`.
+
+On disk, under `--pieces-dir` (default `stemd-pieces` in the platform's cache
+directory, capped by `--pieces-max-gb`, least recently used first):
+
+```
+<model_id>/<format>-<rate>[-dsp<N>]-<parts>-g<gain>/<track id>/<stem>/<k>.<ext>
+htdemucs-22c7f2c9/flac-44100-harmonics.vocals-g1/f9c29cbfe3466b674f9903d9/vocals/0003.flac
+```
+
+The derived part is always stored beside the others. A whole-track job writes
+its pieces here too, so a session on a track already separated by a job starts
+with every piece.
+
+- **Gain** is one value for the whole session, since a stem's own peak is only
+  known once all of it is separated: 3 dB over `peak`, or over full scale when
+  `peak` is not given. `f32le` always ships at 1.0.
+- **At another output rate** a range is converted with up to 8192 samples of
+  context on each side, taken from the ready range around it. Its edges can
+  differ slightly from a whole-track job's.
+
+### 5. End
+
+`DELETE /v1/sessions/{id}`, or let it go idle: a session with nothing to run and
+no request for `--session-idle-secs` (default 30) is ended. A model switch ends
+every session.
+
+| Segments | Fast, Balanced | Quality |
+| --- | --- | --- |
+| length | 343,980 samples (7.8 s) | 588,800 samples (13.35 s) |
+| step at `--overlap 0.25` | 257,985 samples | 441,600 samples |
+
+Read the exact values from the session view's `segment_frames`, `stride_frames`
+and `segments`.
 
 ## Caching on the client
 
