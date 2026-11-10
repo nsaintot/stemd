@@ -387,11 +387,6 @@ fn dialog_body(
                 "{} will load when the track in flight finishes",
                 preset.label()
             ));
-            ui.label(
-                egui::RichText::new("It keeps running on the current model.")
-                    .size(10.5)
-                    .color(palette.muted),
-            );
             ui.add_space(8.0);
             ui.spinner();
         }
@@ -450,21 +445,18 @@ fn rate_label(rate: OutputRate) -> String {
 
 fn rate_hint(rate: OutputRate) -> &'static str {
     match rate {
-        OutputRate::Hz24000 => "Half the bandwidth, half the bytes.",
-        OutputRate::Hz44100 => "The model's own rate. No conversion runs.",
+        OutputRate::Hz24000 => "Half the bandwidth, half the size.",
+        OutputRate::Hz44100 => "Model's native rate, no conversion.",
         OutputRate::Hz48000 => "Converted from 44.1 kHz.",
-        OutputRate::Hz96000 => "Converted from 44.1 kHz. Twice the bytes, no more detail.",
+        OutputRate::Hz96000 => "Converted from 44.1 kHz. Twice the size without quality improvment",
     }
 }
 
 fn format_hint(format: StemFormat) -> &'static str {
     match format {
-        StemFormat::Flac => "Lossless, about half the bytes of a WAV, and openable everywhere.",
+        StemFormat::Flac => "Lossless, about half size of a WAV, and openable everywhere.",
         StemFormat::Wav => "The same 16-bit samples as FLAC, uncompressed. For anything fussy.",
-        StemFormat::Mp3 => {
-            "320 kbps, and the only lossy option. Stems will not sum back to \
-                            the mix, so it is for listening rather than for a deck."
-        }
+        StemFormat::Mp3 => "320 kbps lossy, The outputs cannot be summed back",
         StemFormat::Pcm16 => "Raw 16-bit samples: no container, no decode step.",
         StemFormat::Pcm32 => {
             "Raw floats. Twice the bytes, no ceiling at full scale, and the \

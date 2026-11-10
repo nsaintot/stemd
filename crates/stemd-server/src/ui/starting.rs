@@ -34,9 +34,6 @@ pub fn show(ui: &mut egui::Ui, launch: &Launch) {
 
 /// Draw `stage`. Returns the preset picked this frame, if any.
 pub(super) fn body(ui: &mut egui::Ui, stage: &Stage, palette: &Palette) -> Option<Preset> {
-    let note = |ui: &mut egui::Ui, text: &str| {
-        ui.label(egui::RichText::new(text).size(10.5).color(palette.muted));
-    };
     match stage {
         Stage::Starting => {
             ui.label("Checking the GPU");
@@ -58,8 +55,6 @@ pub(super) fn body(ui: &mut egui::Ui, stage: &Stage, palette: &Palette) -> Optio
             );
             ui.add_space(8.0);
             progress(ui, file, *done, *total, palette);
-            ui.add_space(6.0);
-            note(ui, "Later launches start from the copy on disk.");
         }
         Stage::Verifying(preset) => {
             ui.label(format!("Checking the {} model", preset.label()));
@@ -88,9 +83,7 @@ pub(super) fn body(ui: &mut egui::Ui, stage: &Stage, palette: &Palette) -> Optio
 fn choose(ui: &mut egui::Ui, installed: &[Preset], palette: &Palette) -> Option<Preset> {
     let small = |text: String| egui::RichText::new(text).size(10.5).color(palette.muted);
     ui.label("Choose a model");
-    ui.label(small(
-        "It is downloaded once. You can switch later from the model menu.".into(),
-    ));
+    ui.label(small("You can switch later from the model menu.".into()));
     ui.add_space(8.0);
     let mut picked = None;
     for preset in Preset::ALL {
