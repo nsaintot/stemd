@@ -19,6 +19,7 @@ use crate::cache::{self, Cache};
 use crate::cli::Args;
 use crate::discovery::Advertiser;
 use crate::jobs::JobStore;
+use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::models::{self, DEFAULT_PRESET, Preset};
 use crate::precision::Precisions;
@@ -41,8 +42,8 @@ pub struct Server {
 /// model needs it. See [`crate::queue::BuildSeparator`].
 ///
 /// `addr` is where the listener is already bound, not where it was asked to be, so
-/// it is the real port under `--bind :0`.
-pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr) -> Result<Server> {
+/// it is the real port under `--bind :0`. Progress is reported through `launch`.
+pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) -> Result<Server> {
     // Asked once. The accelerator cannot change under a running server, and
     // every model loaded from here on is chosen against the same answer.
     let precisions = Precisions::detect(args.forced_precision());
@@ -68,7 +69,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr) -> Result<Server>
     // The same clock that reaps an uncollected separation is the right one.
     let store = Arc::new(JobStore::new(args.unfetched_ttl()));
 
-    let (model, queue, info) = load_model(args, &settings, &stems, precisions)?;
+    let (model, queue, info) = load_model(args, &settings, &stems, precisions, launch)?;
     let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
     log_model(&info, precisions, args.max_track_secs(), max_upload);
 
@@ -168,6 +169,9 @@ struct LoadedModel {
 /// the launch, since the window is the only way to choose differently. A model
 /// named on the command line is not covered.
 ///
+/// Behind a window, a saved preset that is not on disk is not fetched: the window
+/// asks which model to download, and the answer is saved once it has loaded.
+///
 /// [`Queue::start`] does not return until the worker has a model or has failed to
 /// get one.
 fn load_model(
@@ -175,10 +179,25 @@ fn load_model(
     settings: &SettingsStore,
     stems: &Arc<Cache>,
     precisions: Precisions,
+    launch: &Launch,
 ) -> Result<(LoadedModel, Arc<Queue>, stemd_core::BackendInfo)> {
     let saved = settings.get().preset;
+    if args.demucs_model.is_none() && launch.asks() && !args.offline {
+        let dirs = search_dirs(&args.models, &models::cache_dir()?);
+        if models::locate(&dirs, saved).is_none() {
+            let installed = Preset::ALL
+                .into_iter()
+                .filter(|p| models::locate(&dirs, *p).is_some())
+                .collect();
+            tracing::info!("no {} model on disk; choose one", saved.label());
+            let chosen = launch.choose(installed);
+            let loaded = load_artefact(args, chosen.artefact(), stems, precisions, launch)?;
+            settings.set_preset(chosen);
+            return Ok(loaded);
+        }
+    }
     let Some(requested) = args.demucs_model.clone() else {
-        return load_artefact(args, saved.artefact(), stems, precisions).or_else(|err| {
+        return load_artefact(args, saved.artefact(), stems, precisions, launch).or_else(|err| {
             if saved == DEFAULT_PRESET {
                 return Err(err);
             }
@@ -187,10 +206,10 @@ fn load_model(
                 saved.artefact(),
                 DEFAULT_PRESET.artefact()
             );
-            load_artefact(args, DEFAULT_PRESET.artefact(), stems, precisions)
+            load_artefact(args, DEFAULT_PRESET.artefact(), stems, precisions, launch)
         });
     };
-    load_artefact(args, &requested, stems, precisions)
+    load_artefact(args, &requested, stems, precisions, launch)
 }
 
 fn load_artefact(
@@ -198,8 +217,10 @@ fn load_artefact(
     artefact: &str,
     stems: &Arc<Cache>,
     precisions: Precisions,
+    launch: &Launch,
 ) -> Result<(LoadedModel, Arc<Queue>, stemd_core::BackendInfo)> {
     let preset = Preset::from_artefact(artefact);
+    let shown = preset.map_or_else(|| artefact.to_owned(), |p| p.label().to_owned());
     let download_cache = models::cache_dir()?;
     let search_dirs = search_dirs(&args.models, &download_cache);
     let dir = resolve_models(
@@ -208,9 +229,11 @@ fn load_artefact(
         preset,
         artefact,
         args.offline,
+        launch,
     )?;
 
     // Starting the worker *is* loading the model, it builds what it will run.
+    launch.set(Stage::Loading(shown));
     let (queue, info) = Queue::start(
         builder(&dir, artefact, preset, args.overlap, precisions),
         args.queue_depth,
@@ -328,6 +351,7 @@ fn resolve_models(
     preset: Option<Preset>,
     artefact: &str,
     offline: bool,
+    launch: &Launch,
 ) -> Result<PathBuf> {
     let marker = format!("{artefact}{}", models::WEIGHTS_EXTENSION);
     let present = |dir: &Path| match preset {
@@ -339,6 +363,7 @@ fn resolve_models(
         // that verified it, and loading damaged weights is not a failure mode
         // worth saving a second on.
         if let Some(preset) = preset {
+            launch.set(Stage::Verifying(preset));
             models::verify(dir, cache, preset, offline)?;
         }
         return Ok(dir.canonicalize().unwrap_or_else(|_| dir.clone()));
@@ -356,7 +381,7 @@ fn resolve_models(
     if offline {
         anyhow::bail!("{}", offline_refusal(dirs, cache, preset));
     }
-    fetch_preset(cache, preset)
+    fetch_preset(cache, preset, launch)
 }
 
 /// Why an absent model cannot be obtained while `--offline` is in force.
@@ -380,7 +405,7 @@ fn offline_refusal(dirs: &[PathBuf], cache: &Path, preset: Preset) -> String {
 ///
 /// Anything already there is skipped, so a machine with Balanced installed
 /// pays only for Quality's other half.
-fn fetch_preset(cache: &Path, preset: Preset) -> Result<PathBuf> {
+fn fetch_preset(cache: &Path, preset: Preset, launch: &Launch) -> Result<PathBuf> {
     let wanted: u64 = preset
         .source()
         .files
@@ -394,6 +419,12 @@ fn fetch_preset(cache: &Path, preset: Preset) -> Result<PathBuf> {
         wanted as f64 / 1e6,
         cache.display()
     );
+    launch.set(Stage::Downloading {
+        preset,
+        file: String::new(),
+        done: 0,
+        total: wanted,
+    });
     models::fetch(cache, preset.source(), |name, done, total| {
         let pct = if total > 0 { done * 100 / total } else { 0 };
         tracing::info!(
@@ -401,13 +432,19 @@ fn fetch_preset(cache: &Path, preset: Preset) -> Result<PathBuf> {
             done as f64 / 1e6,
             total as f64 / 1e6
         );
+        launch.set(Stage::Downloading {
+            preset,
+            file: name.to_owned(),
+            done,
+            total,
+        });
     })
     .context("fetching the model")?;
 
     if !models::is_complete(cache, preset.source()) {
         anyhow::bail!(
             "fetched {} but {} is still incomplete — the release does not \
-             match what this build expects",
+             match what stemd expects",
             preset.artefact(),
             cache.display()
         );

@@ -21,6 +21,7 @@ mod discovery;
 mod drops;
 mod ident;
 mod jobs;
+mod launch;
 mod logbuf;
 mod models;
 mod panics;
@@ -35,7 +36,7 @@ mod switch;
 mod testkit;
 mod ui;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -57,9 +58,11 @@ fn main() -> Result<()> {
     // have the port should find that out before it loads a model or touches the
     // cache that another server is using.
     let listener = serve::bind(args.bind)?;
-    let addr = listener.local_addr().context("reading the bound address")?;
-    let server = startup::prepare(&args, logs, addr)?;
-    serve::run(server, listener, args.headless)
+    if args.headless {
+        serve::headless(&args, logs, listener)
+    } else {
+        serve::windowed(args, logs, listener)
+    }
 }
 
 /// Fetch the CUDA runtime and stop, without loading a model or binding a port.

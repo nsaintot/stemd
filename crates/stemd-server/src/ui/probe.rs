@@ -266,6 +266,109 @@ fn the_download_dialog_does_not_clip_its_own_text() {
     );
 }
 
+/// Every text the window draws in `shapes`.
+fn drawn_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first-run download shows its model, its progress, and fits.
+#[test]
+fn the_startup_download_shows_its_progress() {
+    let ctx = egui::Context::default();
+    let palette = super::theme::Palette::of(&ctx);
+    let stage = crate::launch::Stage::Downloading {
+        preset: crate::models::Preset::Fast,
+        file: "htdemucs.safetensors".into(),
+        done: 84_000_000,
+        total: 168_000_000,
+    };
+
+    let shapes = frame(&ctx, None, false, |ui| {
+        let _ = super::starting::body(ui, &stage, &palette);
+    });
+
+    let clipped = clipped_text(&shapes);
+    assert!(clipped.is_empty(), "clipped text: {clipped:?}");
+    let drawn = drawn_text(&shapes);
+    for want in ["Downloading the Fast model", "50%", "168 MB"] {
+        assert!(
+            drawn.iter().any(|t| t.contains(want)),
+            "{want:?} is not drawn: {drawn:?}"
+        );
+    }
+}
+
+/// A first run offers every preset with its download size, and a click picks one.
+#[test]
+fn a_first_run_offers_every_model_and_picks_the_clicked_one() {
+    let ctx = egui::Context::default();
+    let palette = super::theme::Palette::of(&ctx);
+    let stage = crate::launch::Stage::Choosing(vec![crate::models::Preset::Balanced]);
+
+    let mut picked = None;
+    let shapes = frame(&ctx, None, false, |ui| {
+        picked = super::starting::body(ui, &stage, &palette);
+    });
+    assert_eq!(picked, None, "nothing was clicked");
+    let drawn = drawn_text(&shapes);
+    for preset in crate::models::Preset::ALL {
+        assert!(
+            drawn.iter().any(|t| t == preset.label()),
+            "{preset:?} is not offered: {drawn:?}"
+        );
+    }
+    assert!(drawn.iter().any(|t| t == "installed"), "{drawn:?}");
+    assert!(
+        drawn.iter().any(|t| t.ends_with("MB download")),
+        "{drawn:?}"
+    );
+
+    // Click the middle of the first button, found by its label.
+    let at = shapes
+        .iter()
+        .find_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t) if t.galley.text() == "Fast" => {
+                Some(t.pos + t.galley.rect.center().to_vec2())
+            }
+            _ => None,
+        })
+        .expect("the Fast button");
+    // A press and release need a frame with the pointer already there.
+    frame(&ctx, Some(at), false, |ui| {
+        let _ = super::starting::body(ui, &stage, &palette);
+    });
+    frame(&ctx, Some(at), true, |ui| {
+        picked = super::starting::body(ui, &stage, &palette);
+    });
+    assert_eq!(picked, Some(crate::models::Preset::Fast));
+}
+
+/// A failed startup says why and offers a way out.
+#[test]
+fn a_failed_startup_shows_the_error_and_a_quit_button() {
+    let ctx = egui::Context::default();
+    let palette = super::theme::Palette::of(&ctx);
+    let stage = crate::launch::Stage::Failed("fetching the model: GET https://x: timed out".into());
+
+    let shapes = frame(&ctx, None, false, |ui| {
+        let _ = super::starting::body(ui, &stage, &palette);
+    });
+
+    let drawn = drawn_text(&shapes);
+    for want in ["stemd could not start", "timed out", "Quit"] {
+        assert!(
+            drawn.iter().any(|t| t.contains(want)),
+            "{want:?} is not drawn: {drawn:?}"
+        );
+    }
+}
+
 /// The figure beside a bar never reads 100% before the work is done, and never
 /// runs past three characters.
 ///

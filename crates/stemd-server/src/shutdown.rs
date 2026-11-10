@@ -17,6 +17,7 @@
 use std::io::Write;
 
 use crate::api::AppState;
+use crate::launch::Launch;
 use crate::queue::STOP_GRACE;
 
 unsafe extern "C" {
@@ -24,6 +25,22 @@ unsafe extern "C" {
     /// static destructors. [`std::process::exit`] runs both, which is the whole
     /// problem this module exists to avoid.
     safe fn _exit(status: i32) -> !;
+}
+
+/// End the process, whether or not startup has finished.
+///
+/// Before it has, there is no worker or advertisement to stop yet. A download in
+/// flight leaves only its `.part` file, which the next run replaces.
+pub fn quit(launch: &Launch, reason: &str) -> ! {
+    match launch.ready() {
+        Some(state) => now(state, reason),
+        None => {
+            tracing::info!("{reason} during startup, shutting down");
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            _exit(0)
+        }
+    }
 }
 
 /// Stop the worker, withdraw the advertisement, and end the process.

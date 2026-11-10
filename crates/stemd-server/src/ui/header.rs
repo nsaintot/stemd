@@ -19,7 +19,7 @@ const MODEL_WIDTH: f32 = 112.0;
 const FORMAT_WIDTH: f32 = 88.0;
 const RATE_WIDTH: f32 = 82.0;
 const PARTS_WIDTH: f32 = 72.0;
-const DIALOG_WIDTH: f32 = 300.0;
+pub(super) const DIALOG_WIDTH: f32 = 300.0;
 
 /// Text size in the header row.
 const TEXT: f32 = 12.0;
@@ -327,6 +327,11 @@ pub(super) fn downloading(
             .color(palette.muted),
     );
     ui.add_space(8.0);
+    progress(ui, file, done, total, palette);
+}
+
+/// A download's bar, with the file name and the byte count underneath it.
+pub(super) fn progress(ui: &mut egui::Ui, file: &str, done: u64, total: u64, palette: &Palette) {
     let fraction = if total > 0 {
         done as f32 / total as f32
     } else {
@@ -352,12 +357,6 @@ pub(super) fn downloading(
             )));
         });
     });
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new("Separation keeps running on the current model.")
-            .size(10.5)
-            .color(palette.muted),
-    );
 }
 
 fn dialog_body(
