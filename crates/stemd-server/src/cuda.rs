@@ -175,7 +175,7 @@ fn unpack_libraries(archive: &Path, into: &Path) -> Result<usize> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.to_ascii_lowercase().ends_with(".dll") {
+        if !wanted(name) {
             continue;
         }
 
@@ -192,6 +192,21 @@ fn unpack_libraries(archive: &Path, into: &Path) -> Result<usize> {
         placed += 1;
     }
     Ok(placed)
+}
+
+/// cuDNN libraries MLX never loads: it uses only the graph API, and no other
+/// cuDNN library links these.
+const UNUSED: &[&str] = &[
+    "cudnn_adv64_9.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_ext64_9.dll",
+];
+
+/// Whether an archive entry is a DLL to install.
+fn wanted(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".dll") && !UNUSED.contains(&name.as_str())
 }
 
 /// Fail on a read-only install directory before spending a gigabyte finding out.
@@ -269,6 +284,19 @@ mod tests {
                 "{library} would come from {component}, which is not fetched"
             );
         }
+    }
+
+    #[test]
+    fn the_unused_cudnn_libraries_are_skipped() {
+        assert!(wanted("cudnn64_9.dll"));
+        assert!(wanted("cudnn_graph64_9.dll"));
+        assert!(wanted("cublasLt64_13.dll"));
+        assert!(!wanted("cudnn_ops64_9.dll"));
+        assert!(!wanted("CUDNN_ADV64_9.DLL"));
+        assert!(!wanted("cudnn_cnn64_9.dll"));
+        assert!(!wanted("cudnn_ext64_9.dll"));
+        assert!(wanted("cudnn_engines_tensor_ir64_9.dll"));
+        assert!(!wanted("cudnn.h"));
     }
 
     /// Distinct names, since they share one staging directory.

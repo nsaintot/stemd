@@ -82,9 +82,16 @@ soname() { readelf -d "$1" | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p'; }
 # cuDNN opens its engine libraries itself and NVRTC opens its builtins, so no
 # NEEDED entry names them. They go into the walk so their own dependencies come
 # too. Copied under their soname, which is the name they are opened by.
+# cuDNN's adv, ops, cnn and ext libraries are left out: MLX uses only the
+# graph API, which never loads them, and no other cuDNN library links them.
+unused_cudnn() {
+    case "$1" in libcudnn_adv.so*|libcudnn_ops.so*|libcudnn_cnn.so*|libcudnn_ext.so*) return 0 ;; esac
+    return 1
+}
 queue=("$exe")
 for f in "$cudnn"/lib/libcudnn*.so.9 "$cuda"/lib64/libnvrtc-builtins.so; do
     [[ -f "$f" ]] || continue
+    unused_cudnn "$(basename "$f")" && continue
     name="$(soname "$f")"
     [[ -f "$prefix/lib/$name" ]] && continue
     cp -L "$f" "$prefix/lib/$name"
@@ -102,6 +109,7 @@ while [[ ${#queue[@]} -gt 0 ]]; do
     resolved="$(ldd "$target" | awk '$2 == "=>" {print $1, ($3 == "not" ? "" : $3)}')"
     for name in $(readelf -d "$target" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
         host_owned "$name" && continue
+        unused_cudnn "$name" && die "$(basename "$target") links $name, which is left out as unused"
         [[ "$seen" == *" $name "* ]] && continue
         seen="$seen$name "
         path="$(awk -v n="$name" '$1 == n {print $2}' <<<"$resolved")"

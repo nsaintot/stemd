@@ -161,7 +161,7 @@ at run time.
 | `jit-headers.sh` | writes `jit-headers.txt`, the toolkit headers MLX's run-time compiler reads; rerun after an MLX or CUDA update |
 
 Every package carries CUDA, cuDNN, BLAS and avahi-compat in `/opt/stemd/lib`,
-about 2 GB unpacked. The driver (`libcuda.so.1`), the display stack and the C++
+about 1.7 GB unpacked. The driver (`libcuda.so.1`), the display stack and the C++
 runtime come from the machine. NVIDIA's libraries are copied unmodified, as
 their licences require; the executables find them through `DT_RPATH`
 (`$ORIGIN/../lib`), which also covers what cuDNN opens at run time.
