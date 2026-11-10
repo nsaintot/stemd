@@ -30,7 +30,7 @@ use crate::backend::{BackendInfo, Separate};
 use crate::mixture::{Normalisation, fold_into_shipped};
 use crate::pcm::Audio;
 use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
-use crate::stems::{FOUR_STEM_SOURCES, Stems, unexplained_db};
+use crate::stems::{FOUR_STEM_SOURCES, Parts, Stems, unexplained_db};
 
 pub struct MlxConfig {
     /// Fraction of a segment shared with its neighbour. demucs uses 0.25.
@@ -181,7 +181,7 @@ impl MlxSeparator {
 }
 
 impl Separate for MlxSeparator {
-    fn separate(&mut self, mix: &Audio, sink: &dyn ProgressSink) -> Result<Stems> {
+    fn separate(&mut self, mix: &Audio, _parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
         self.check_geometry(mix)?;
         sink.update(Progress::new(Stage::Analysing));
 
@@ -214,11 +214,21 @@ impl Separate for MlxSeparator {
 
         sink.update(Progress::new(Stage::Reconstructing));
         let sources = self.to_sources(&separated, &norm, frames)?;
+        // The model's own sources, for a job asking for them one by one. They do not
+        // sum to the mix; the leftover lands on whatever part the job leaves out.
+        let more = ["drums", "bass", "other"]
+            .into_iter()
+            .filter_map(|name| {
+                let index = self.sources.iter().position(|s| s == name)?;
+                Some((name, sources[index].clone()))
+            })
+            .collect();
 
         Ok(Stems {
             model_residual_db: unexplained_db(mix, &sources),
             shipped: fold_into_shipped(&sources, &self.sources)
                 .context("folding the model's sources into the shipped stems")?,
+            more,
         })
     }
 
@@ -234,6 +244,7 @@ impl Separate for MlxSeparator {
             // anything else; a CUDA build on a machine with no usable card
             // falls back to the CPU and used to say otherwise.
             device: stemd_mlx::Accelerator::detect().as_str().into(),
+            parts: crate::stems::all_parts(),
         }
     }
 }

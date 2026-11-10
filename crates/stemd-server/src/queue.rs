@@ -485,7 +485,7 @@ fn separate_one(separator: &mut dyn Separate, claimed: &Claimed, cache: &Cache) 
         cancel: Arc::clone(&claimed.cancel),
     };
 
-    match separator.separate(&work.mix, &sink) {
+    match separator.separate(&work.mix, work.output.parts, &sink) {
         Ok(stems) => publish(job, work, &stems, cache, started.elapsed().as_secs_f64()),
         // Routine, not a failure: the client said so. Logged at info with what
         // it cost, so a client skipping repeatedly is visible in the log without
@@ -542,7 +542,12 @@ mod tests {
     }
 
     impl Separate for Stub {
-        fn separate(&mut self, _mix: &Audio, _sink: &dyn ProgressSink) -> anyhow::Result<Stems> {
+        fn separate(
+            &mut self,
+            _mix: &Audio,
+            _parts: stemd_core::Parts,
+            _sink: &dyn ProgressSink,
+        ) -> anyhow::Result<Stems> {
             self.seen.lock().push(self.name);
             anyhow::bail!("stub");
         }
@@ -555,6 +560,7 @@ mod tests {
                 channels: 2,
                 device: "stub".into(),
                 stems: vec![],
+                parts: vec![],
             }
         }
     }
@@ -580,7 +586,12 @@ mod tests {
     struct Traced(Threads);
 
     impl Separate for Traced {
-        fn separate(&mut self, _mix: &Audio, _sink: &dyn ProgressSink) -> anyhow::Result<Stems> {
+        fn separate(
+            &mut self,
+            _mix: &Audio,
+            _parts: stemd_core::Parts,
+            _sink: &dyn ProgressSink,
+        ) -> anyhow::Result<Stems> {
             self.0.lock().push(("ran", thread::current().id()));
             anyhow::bail!("stub produces no stems")
         }
@@ -593,6 +604,7 @@ mod tests {
                 channels: 2,
                 device: "stub".into(),
                 stems: vec![],
+                parts: vec![],
             }
         }
     }
@@ -648,7 +660,12 @@ mod tests {
     }
 
     impl Separate for Segmented {
-        fn separate(&mut self, _mix: &Audio, sink: &dyn ProgressSink) -> anyhow::Result<Stems> {
+        fn separate(
+            &mut self,
+            _mix: &Audio,
+            _parts: stemd_core::Parts,
+            sink: &dyn ProgressSink,
+        ) -> anyhow::Result<Stems> {
             bump(&self.state, |s| s.started += 1);
             for _ in 0..self.segments {
                 if sink.cancelled() {
@@ -668,6 +685,7 @@ mod tests {
                 channels: 2,
                 device: "stub".into(),
                 stems: vec![],
+                parts: vec![],
             }
         }
     }
@@ -681,7 +699,12 @@ mod tests {
     }
 
     impl Separate for Reporting {
-        fn separate(&mut self, _mix: &Audio, sink: &dyn ProgressSink) -> anyhow::Result<Stems> {
+        fn separate(
+            &mut self,
+            _mix: &Audio,
+            _parts: stemd_core::Parts,
+            sink: &dyn ProgressSink,
+        ) -> anyhow::Result<Stems> {
             bump(&self.state, |s| s.started += 1);
             for done in 0..self.segments {
                 if sink.cancelled() {
@@ -708,6 +731,7 @@ mod tests {
                 channels: 2,
                 device: "stub".into(),
                 stems: vec![],
+                parts: vec![],
             }
         }
     }
@@ -721,7 +745,12 @@ mod tests {
     }
 
     impl Separate for Panics {
-        fn separate(&mut self, _mix: &Audio, _sink: &dyn ProgressSink) -> anyhow::Result<Stems> {
+        fn separate(
+            &mut self,
+            _mix: &Audio,
+            _parts: stemd_core::Parts,
+            _sink: &dyn ProgressSink,
+        ) -> anyhow::Result<Stems> {
             bump(&self.state, |s| s.started += 1);
             panic!("the model came apart mid-pass");
         }
@@ -734,6 +763,7 @@ mod tests {
                 channels: 2,
                 device: "stub".into(),
                 stems: vec![],
+                parts: vec![],
             }
         }
     }
@@ -831,6 +861,7 @@ mod tests {
                     rate: OutputRate::default(),
                     derived: false,
                     dsp: DspMode::default(),
+                    parts: stemd_core::Parts::DEFAULT,
                 },
             })
             .expect("queue has room");

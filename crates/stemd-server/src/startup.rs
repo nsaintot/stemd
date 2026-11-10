@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use stemd_core::{
-    HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, OutputRate, PcmFormat, Separate,
-    StemFormat,
+    HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, OutputRate, PcmFormat,
+    RoformerSeparator, Separate, StemFormat,
 };
 
 use crate::api::AppState;
@@ -261,30 +261,15 @@ fn build(
     overlap: f32,
     precisions: Precisions,
 ) -> Result<Box<dyn Separate>> {
-    // One question per model rather than one per run. A chained preset puts two
-    // architectures in front of the same card, and on CUDA they want opposite
-    // precisions; see `crate::precision`.
+    // Precision is asked per model family; see `crate::precision`.
     let families = Preset::families(preset);
-    let hybrid = |cascade| HybridConfig {
-        overlap,
-        vocals_precision: precisions.of(families[0]),
-        drums_precision: precisions.of(*families.last().expect("a preset runs at least one model")),
-        cascade,
-    };
     match preset {
-        //  Chained: the drums half is handed `mix - vocals` rather than the track. See
-        //  `stemd_core::hybrid`.
-        //  Which BS-RoFormer variant the vocals artefact holds is decided by its own
-        //  tensors rather than by the preset. See `stemd_mlx::roformer::Config::of`.
-        Some(Preset::Quality) => {
-            let names = Preset::Quality.artefacts();
-            Ok(Box::new(HybridSeparator::roformer_and_demucs(
-                dir,
-                names[0],
-                names[1],
-                hybrid(true),
-            )?))
-        }
+        Some(Preset::Quality) => Ok(Box::new(RoformerSeparator::load(
+            dir,
+            Preset::Quality.artefact(),
+            precisions.of(families[0]),
+            overlap,
+        )?)),
         // Two of the artefact's four models, not all four: it only ever needed
         // three, and two is both cheaper and better. Not chained: this tier's
         // vocals half is a demucs specialist, and handing on what it leaves
@@ -292,7 +277,12 @@ fn build(
         Some(Preset::Balanced) => Ok(Box::new(HybridSeparator::demucs_specialists(
             dir,
             artefact,
-            hybrid(false),
+            HybridConfig {
+                overlap,
+                vocals_precision: precisions.of(families[0]),
+                drums_precision: precisions.of(families[0]),
+                cascade: false,
+            },
         )?)),
         _ => Ok(Box::new(MlxSeparator::load(
             dir,
@@ -616,7 +606,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("building {preset:?}: {e:#}"));
 
             let advertised: Vec<String> = sep.info().stems;
-            let stems = sep.separate(&mix, &Silent).expect("separating");
+            let stems = sep
+                .separate(&mix, stemd_core::Parts::DEFAULT, &Silent)
+                .expect("separating");
             let shipped: Vec<&str> = stems.shipped.iter().map(|(n, _)| *n).collect();
 
             // What the player would rebuild, and what it gets at unity.
@@ -709,7 +701,9 @@ mod tests {
                 Precisions::stated(None, stemd_core::Accelerator::Metal),
             )
             .unwrap_or_else(|e| panic!("building {preset:?}: {e:#}"));
-            let stems = sep.separate(&mix, &Silent).expect("separating");
+            let stems = sep
+                .separate(&mix, stemd_core::Parts::DEFAULT, &Silent)
+                .expect("separating");
             let pick = |want: &str| {
                 stems
                     .shipped

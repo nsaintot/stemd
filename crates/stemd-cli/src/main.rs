@@ -71,6 +71,12 @@ struct Args {
     #[arg(long)]
     include_derived: bool,
 
+    /// Parts to ask for, comma-separated, such as `bass,other,vocals`. Defaults
+    /// to the server's `harmonics,vocals`. Whatever the list leaves out is
+    /// rebuilt here from the mix; `/v1/health` lists what a server offers.
+    #[arg(long)]
+    parts: Option<String>,
+
     /// Filter the server converts the stems with. 0, the default, converts any
     /// rate pair; a numbered mode covers one pair and is refused on any other.
     ///
@@ -113,6 +119,7 @@ fn main() -> Result<()> {
     let formats = Formats::new(args.f32)
         .at_rate(args.output_sample_rate)
         .with_derived(args.include_derived)
+        .with_parts(args.parts.as_deref())
         .with_dsp_mode(args.dsp_mode);
 
     let started = Instant::now();
@@ -174,7 +181,7 @@ fn report_server(health: &Health) {
         health.model, health.sample_rate
     );
     println!(
-        "transfers    : {} stems [{}] — `{DERIVED}` is rebuilt here, never sent",
+        "transfers    : {} stems [{}] by default — `{DERIVED}` is rebuilt here",
         health.stems.len(),
         health.stems.join(", "),
     );
@@ -214,7 +221,7 @@ fn load_input(args: &Args, health: &Health) -> Result<Decoded> {
 }
 
 /// Upload the mix and wait for the stems.
-fn separate(server: &Server, audio: &Decoded, formats: Formats) -> Result<JobResult> {
+fn separate(server: &Server, audio: &Decoded, formats: Formats<'_>) -> Result<JobResult> {
     let body = audio.to_interleaved(formats.upload == "f32le");
     println!(
         "uploading    : {:.1} MB as {}, stems back as {}",
@@ -259,8 +266,11 @@ fn assemble(
         });
     }
 
-    // Already sent, because it was asked for.
-    if parts.iter().any(|part| part.name == DERIVED) {
+    // Nothing left to rebuild, or already sent because it was asked for.
+    let Some(derived_name) = result.derived_stem.as_deref() else {
+        return Ok(parts);
+    };
+    if parts.iter().any(|part| part.name == derived_name) {
         return Ok(parts);
     }
 
@@ -271,7 +281,7 @@ fn assemble(
     // --include-derived to have the server send it instead.
     if result.sample_rate != audio.sample_rate {
         println!(
-            "note         : stems at {} Hz, so `{DERIVED}` is not rebuilt — pass \
+            "note         : stems at {} Hz, so `{derived_name}` is not rebuilt — pass \
              --include-derived to have the server send it",
             result.sample_rate
         );
@@ -286,7 +296,7 @@ fn assemble(
     }
     parts.push(Part {
         origin: "rebuilt here",
-        name: DERIVED.to_owned(),
+        name: derived_name.to_owned(),
         samples: derived,
     });
 
@@ -331,10 +341,16 @@ fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, el
             names.join("+")
         );
     }
-    println!(
-        "model resid  : {:.1} dB (the model's own error — it all lands on `{DERIVED}`)",
-        result.model_residual_db,
-    );
+    match result.derived_stem.as_deref() {
+        Some(derived) => println!(
+            "model resid  : {:.1} dB (the model's own error — it all lands on `{derived}`)",
+            result.model_residual_db,
+        ),
+        None => println!(
+            "model resid  : {:.1} dB (the model's own error — no part is left to absorb it)",
+            result.model_residual_db,
+        ),
+    }
     println!("total        : {elapsed:.1}s end to end");
 }
 

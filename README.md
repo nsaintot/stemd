@@ -97,7 +97,7 @@ stemd-cli path/to/track.wav
 | --- | --- | --- |
 | **Fast** | `htdemucs` v4 | 168 MB |
 | Balanced | `htdemucs_ft` | 672 MB |
-| Quality | BS PolarFormer + `htdemucs_ft` | 102 MB plus the above |
+| Quality | stemd RoFormer | 251 MB |
 
 Measured on a 64 s clip, warm, against a 6:38 track on an M1 Pro:
 
@@ -105,7 +105,7 @@ Measured on a 64 s clip, warm, against a 6:38 track on an M1 Pro:
 | --- | --- | --- |
 | **Fast** | 106x realtime | 18x realtime |
 | Balanced | 55x | 8x |
-| Quality | 10x | 1.6x |
+| Quality | 18x | 3.6x |
 
 The first separation after launch costs about twice the warm figure: the GPU
 kernels are compiled on first use.
@@ -151,7 +151,9 @@ Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE). Use
 whichever of the two you prefer.
 
 The model weights are not covered by either and state their own terms; see the
-[models release](https://github.com/nsaintot/stemd/releases/tag/models-v2).
+[models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) and
+[models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) releases.
+`stemd_roformer`, which Quality runs, is CC BY-NC 4.0.
 
 The MP3 encoder is LAME 3.100, which is under the GNU Library General Public
 License version 2 and links statically, so redistributing a built binary carries

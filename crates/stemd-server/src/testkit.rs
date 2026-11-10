@@ -43,6 +43,7 @@ pub fn stems(frames: usize) -> (Audio, Stems) {
         Stems {
             shipped,
             model_residual_db: -30.0,
+            more: Vec::new(),
         },
     )
 }
@@ -59,6 +60,7 @@ pub fn publish(cache: &Cache, key: &str, frames: usize, separation_secs: f64) ->
                 rate: OutputRate::default(),
                 derived: false,
                 dsp: DspMode::default(),
+                parts: stemd_core::Parts::DEFAULT,
             },
             separation_secs,
         )

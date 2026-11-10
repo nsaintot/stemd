@@ -15,9 +15,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use stemd_core::stems::remainder;
+
 use stemd_core::{
-    Audio, HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, PcmFormat, Precision, Separate,
-    Silent,
+    Audio, HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, Parts, PcmFormat, Precision,
+    Separate, Silent,
 };
 
 /// Raw interleaved stereo 16-bit PCM at 44.1 kHz.
@@ -77,7 +79,9 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
         };
 
         let started = Instant::now();
-        let stems = mlx.separate(&mix, &watch).expect("separating");
+        let stems = mlx
+            .separate(&mix, Parts::DEFAULT, &watch)
+            .expect("separating");
         let elapsed = started.elapsed().as_secs_f64();
         println!(
             "  {precision:>4}: {elapsed:6.1} s  ({:.1}x realtime, model residual {:.1} dB)",
@@ -199,7 +203,9 @@ fn the_hybrid_separates_a_real_track() {
     };
 
     let started = Instant::now();
-    let stems = hybrid.separate(&mix, &watch).expect("separating");
+    let stems = hybrid
+        .separate(&mix, Parts::DEFAULT, &watch)
+        .expect("separating");
     let elapsed = started.elapsed().as_secs_f64();
     println!(
         "hybrid: {elapsed:6.1} s for {seconds:.0} s ({:.1}x realtime)",
@@ -282,7 +288,9 @@ fn what_half_precision_costs_the_roformer() {
         )
         .expect("loading the quality tier");
         let started = Instant::now();
-        let stems = sep.separate(&mix, &Silent).expect("separating");
+        let stems = sep
+            .separate(&mix, Parts::DEFAULT, &Silent)
+            .expect("separating");
         (stems, started.elapsed().as_secs_f64())
     };
 
@@ -369,7 +377,8 @@ fn chaining_the_halves_against_running_them_side_by_side() {
             HybridSeparator::roformer_and_demucs(&dir, "bs_roformer_viperx", "htdemucs_ft", config)
         }
         .expect("loading the tier");
-        sep.separate(&mix, &Silent).expect("separating")
+        sep.separate(&mix, Parts::DEFAULT, &Silent)
+            .expect("separating")
     };
 
     let side_by_side = run(false);
@@ -489,7 +498,9 @@ fn polarformer_against_the_viperx_roformer() {
         )
         .unwrap_or_else(|e| panic!("loading {vocals}: {e:#}"));
         let started = Instant::now();
-        let stems = sep.separate(&mix, &Silent).expect("separating");
+        let stems = sep
+            .separate(&mix, Parts::DEFAULT, &Silent)
+            .expect("separating");
         (stems, started.elapsed().as_secs_f64())
     };
 
@@ -605,7 +616,9 @@ fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
 
     let stems_of = |mut sep: HybridSeparator| {
         let started = Instant::now();
-        let stems = sep.separate(&mix, &Silent).expect("separating");
+        let stems = sep
+            .separate(&mix, Parts::DEFAULT, &Silent)
+            .expect("separating");
         (stems, started.elapsed().as_secs_f64())
     };
 
@@ -708,4 +721,122 @@ fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
         "the two tiers rebuild different drums ({null:.1} dB), so they differ \
          somewhere other than the vocals estimate"
     );
+}
+
+/// `stemd_roformer` against the former Quality tier, BS PolarFormer chained into
+/// `htdemucs_ft`, on MUSDB test tracks.
+///
+/// Prints global SDR per part, averaged over tracks, and seconds per track.
+///
+/// ```text
+/// STEMD_AB_MUSDB=<dir> STEMD_AB_MLX=<dir with bs_polarformer, htdemucs_ft and
+/// stemd_roformer> cargo test --release -p stemd-core --test separating \
+///     -- --ignored stemd_roformer --nocapture
+/// ```
+///
+/// `STEMD_AB_MUSDB` holds `NN.mix.pcm`, `NN.drums.pcm` and `NN.vocals.pcm`: raw
+/// f32le stereo at 44.1 kHz, with the mix the sum of all four stems.
+#[test]
+#[ignore]
+fn stemd_roformer_against_quality() {
+    let (Some(tracks), Some(dir)) = (env_dir("STEMD_AB_MUSDB"), env_dir("STEMD_AB_MLX")) else {
+        return;
+    };
+    let read = |path: PathBuf| {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        Audio::from_interleaved(&bytes, PcmFormat::F32le, 2, 44100).expect("f32le stereo")
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&tracks)
+        .expect("reading the track directory")
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".mix.pcm").map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no NN.mix.pcm in {}", tracks.display());
+
+    let sdr = |truth: &Audio, est: &Audio| {
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (t, e) in truth.data.iter().zip(&est.data) {
+            for (x, y) in t.iter().zip(e) {
+                signal += f64::from(*x).powi(2);
+                error += f64::from(x - y).powi(2);
+            }
+        }
+        10.0 * (signal / error).log10()
+    };
+    let score = |label: &str, sep: &mut dyn Separate| {
+        let (mut sums, mut seconds) = ([0.0f64; 3], 0.0f64);
+        for name in &names {
+            let mix = read(tracks.join(format!("{name}.mix.pcm")));
+            let drums = read(tracks.join(format!("{name}.drums.pcm")));
+            let vocals = read(tracks.join(format!("{name}.vocals.pcm")));
+            let harmonics = remainder(&mix, [&drums, &vocals]);
+
+            let started = Instant::now();
+            let stems = sep
+                .separate(&mix, Parts::DEFAULT, &Silent)
+                .expect("separating");
+            seconds += started.elapsed().as_secs_f64();
+            let of = |stem: &str| {
+                stems
+                    .stem(stem)
+                    .unwrap_or_else(|| panic!("no {stem} shipped"))
+            };
+            let (est_h, est_v) = (of("harmonics"), of("vocals"));
+            // What the player does: drums are the mix less the shipped stems.
+            let est_d = remainder(&mix, [est_h, est_v]);
+            let row = [
+                sdr(&drums, &est_d),
+                sdr(&harmonics, est_h),
+                sdr(&vocals, est_v),
+            ];
+            println!(
+                "  {label:<8} {name}  drums {:6.2}  harmonics {:6.2}  vocals {:6.2}",
+                row[0], row[1], row[2]
+            );
+            for (s, v) in sums.iter_mut().zip(row) {
+                *s += v;
+            }
+        }
+        let n = names.len() as f64;
+        let mean = sums.map(|s| s / n);
+        println!(
+            "RESULT {label:<8} drums {:.2} harmonics {:.2} vocals {:.2} mean {:.2}  {:.1} s per track",
+            mean[0],
+            mean[1],
+            mean[2],
+            mean.iter().sum::<f64>() / 3.0,
+            seconds / n
+        );
+    };
+
+    let on = stemd_core::Accelerator::detect();
+    let roformer = Precision::preferred(stemd_core::Family::Roformer, on);
+    let demucs = Precision::preferred(stemd_core::Family::HtDemucs, on);
+
+    let mut stemd = stemd_core::RoformerSeparator::load(
+        &dir,
+        "stemd_roformer",
+        roformer,
+        stemd_mlx::apply::DEFAULT_OVERLAP,
+    )
+    .expect("loading stemd_roformer");
+    score("stemd", &mut stemd);
+    drop(stemd);
+
+    let mut quality = HybridSeparator::roformer_and_demucs(
+        &dir,
+        "bs_polarformer",
+        "htdemucs_ft",
+        HybridConfig {
+            vocals_precision: roformer,
+            drums_precision: demucs,
+            cascade: true,
+            ..HybridConfig::default()
+        },
+    )
+    .expect("loading the quality tier");
+    score("quality", &mut quality);
 }

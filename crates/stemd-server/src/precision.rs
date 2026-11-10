@@ -89,34 +89,22 @@ mod tests {
         Precisions::stated(None, a)
     }
 
-    /// The whole point: Quality's two halves disagree on CUDA and nowhere else.
+    /// Quality is one RoFormer: half on Metal, full on CUDA and the CPU.
     #[test]
-    fn only_cuda_splits_a_chained_preset() {
+    fn quality_runs_at_what_a_roformer_wants() {
         let q = Some(Preset::Quality);
-        assert_eq!(on(Accelerator::Metal).for_preset(q), [Precision::F16; 2]);
-        assert_eq!(on(Accelerator::Cpu).for_preset(q), [Precision::F32; 2]);
-        assert_eq!(
-            on(Accelerator::Cuda).for_preset(q),
-            [Precision::F32, Precision::F16],
-            "on CUDA the RoFormer half wants full and the demucs half wants half"
-        );
-    }
-
-    /// A key that has not changed is a cache that survives. Metal and CPU keep
-    /// the compact form they have always had.
-    #[test]
-    fn the_key_only_splits_when_the_models_do() {
-        let q = Some(Preset::Quality);
+        assert_eq!(on(Accelerator::Metal).for_preset(q), [Precision::F16]);
+        assert_eq!(on(Accelerator::Cpu).for_preset(q), [Precision::F32]);
+        assert_eq!(on(Accelerator::Cuda).for_preset(q), [Precision::F32]);
         assert_eq!(on(Accelerator::Metal).key(q), "f16");
-        assert_eq!(on(Accelerator::Cpu).key(q), "f32");
-        assert_eq!(on(Accelerator::Cuda).key(q), "f32+f16");
+        assert_eq!(on(Accelerator::Cuda).key(q), "f32");
     }
 
     /// A preset that is all one architecture never splits, on any backend.
     #[test]
     fn a_single_family_preset_never_splits() {
         for a in [Accelerator::Metal, Accelerator::Cuda, Accelerator::Cpu] {
-            for preset in [Some(Preset::Fast), Some(Preset::Balanced), None] {
+            for preset in Preset::ALL.map(Some).into_iter().chain([None]) {
                 let key = on(a).key(preset);
                 assert!(!key.contains('+'), "{a} {preset:?} split into {key}");
             }
@@ -127,10 +115,7 @@ mod tests {
     #[test]
     fn forcing_full_precision_overrides_every_model() {
         let forced = Precisions::stated(Some(Precision::F32), Accelerator::Cuda);
-        assert_eq!(
-            forced.for_preset(Some(Preset::Quality)),
-            [Precision::F32; 2]
-        );
+        assert_eq!(forced.for_preset(Some(Preset::Quality)), [Precision::F32]);
         assert_eq!(forced.key(Some(Preset::Quality)), "f32");
     }
 }

@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::pcm::Audio;
 use crate::progress::ProgressSink;
-use crate::stems::Stems;
+use crate::stems::{Parts, Stems};
 
 /// What a backend advertises about itself.
 #[derive(Debug, Clone, Serialize)]
@@ -23,9 +23,12 @@ pub struct BackendInfo {
     pub stems: Vec<String>,
     /// Where the work runs: "gpu", "cpu".
     pub device: String,
+    /// Parts a job may ask for, from [`crate::stems::PART_NAMES`].
+    pub parts: Vec<String>,
 }
 
 pub trait Separate: Send {
-    fn separate(&mut self, mix: &Audio, sink: &dyn ProgressSink) -> Result<Stems>;
+    /// Separate `mix` into at least [`crate::SHIPPED`] and whatever `parts` adds.
+    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems>;
     fn info(&self) -> BackendInfo;
 }

@@ -540,7 +540,7 @@ however narrow the matmul behind them.
 
 **What that means for the tier.** Quality runs at 1.7x realtime, so 1.82x puts
 it near 3.1x: a 6:38 track going from 235 s to about 130 s. Halved, and still
-more than twice the 50 s budget the `⚠` mark exists for. That is a real
+more than twice the 50 s budget. That is a real
 improvement for identical quality, and it is not the transformative one the
 first number suggested.
 
@@ -628,7 +628,8 @@ The remaining speed gap has a name and a fix: a fused attention that tolerates
 `v` being narrower than `q`, but it is no longer the reason to care about this
 model.
 
-**`Quality` runs this one now** and `bs_roformer_viperx` is retired. It was not
+**`Quality` ran this one with `htdemucs_ft` until `stemd_roformer`** (below), and
+`bs_roformer_viperx` is retired. It was not
 replaced for being wrong, it is a faithful port, nulled stage by stage, and it
 carried this tier from the day it existed. It was replaced because something
 leaves less voice in the harmonics for the same money, and because that turned
@@ -641,6 +642,37 @@ longer fetches.
 `tools/eval/polarformer.py` for quality, `tools/eval/roformer_speed.py` for
 speed. Both need ZFTurbo's Music-Source-Separation-Training on the path for the
 model class, and `PoPE-pytorch` installed.
+
+## stemd's own model: Quality in one pass
+
+`Quality` now runs one BS-RoFormer trained for stemd: PolarFormer's shape (dim
+256, hop 512, chunk 588,800) with rotary position and four mask estimators
+(bass, drums, other, vocals), 125.2M parameters. It ships drums and vocals and
+builds harmonics as the remainder, like the tier it replaced.
+
+Scored on the 12 MUSDB18-HQ test tracks it was not trained on, full length,
+global SDR, through stemd
+(`stemd_roformer_against_quality` in `crates/stemd-core/tests/separating.rs`). The
+25 benchmark clips above include MUSDB train tracks the model saw, so they do
+not apply to it.
+
+| | drums | harmonics | vocals | mean | s per track, M1 Pro | s per track, RTX 3090 Ti |
+|---|---|---|---|---|---|---|
+| PolarFormer + `htdemucs_ft` (chained) | 8.79 | 9.89 | **12.49** | 10.39 | 111.9 | 20.8 |
+| stemd RoFormer | **11.07** | **11.54** | 11.34 | **11.32** | **60.6** | **13.1** |
+
+The tracks average 234 s. SDR is the same on both machines to the second
+decimal: Metal runs the RoFormer at float16, CUDA at float32.
+
+- Wins drums by 2.3 dB and harmonics by 1.7 dB; loses vocals by 1.2 dB.
+- 3.6x realtime on a warm 64 s clip on the M1 Pro, against 1.6x: about 110 s
+  for a 6:38 track. On the 3090 Ti, 17.9x against 11.3x over the 12 tracks.
+- One artefact, 251 MB in float16, against 102 MB + 672 MB.
+- The MLX port nulls against the PyTorch reference at -117 dB on all four stems.
+- Harmonics as the remainder measured 11.49 against 11.39 for `bass + other`.
+
+The weights come from `tools/export/convert_stemd_roformer.py`, then
+`tools/export/convert_roformer.py`.
 
 ## Tuning levers
 

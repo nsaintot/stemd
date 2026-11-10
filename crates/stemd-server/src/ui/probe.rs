@@ -6,9 +6,9 @@
 
 use eframe::egui;
 
-/// A 460x470 window, matching [`super::WINDOW_SIZE`].
+/// A 520x470 window, matching [`super::WINDOW_SIZE`].
 fn screen() -> egui::Rect {
-    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(460.0, 470.0))
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 470.0))
 }
 
 /// Run one frame with the pointer at `pointer`, optionally clicking, and return

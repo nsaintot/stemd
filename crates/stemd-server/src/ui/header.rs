@@ -6,10 +6,11 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use stemd_core::{OutputRate, StemFormat};
+use stemd_core::{OutputRate, PART_NAMES, StemFormat};
 
 use crate::api::AppState;
 use crate::models::Preset;
+use crate::settings::DropParts;
 use crate::switch::{SwitchState, Switcher};
 
 use super::theme::Palette;
@@ -17,6 +18,7 @@ use super::theme::Palette;
 const MODEL_WIDTH: f32 = 112.0;
 const FORMAT_WIDTH: f32 = 88.0;
 const RATE_WIDTH: f32 = 82.0;
+const PARTS_WIDTH: f32 = 72.0;
 const DIALOG_WIDTH: f32 = 300.0;
 
 /// Text size in the header row.
@@ -64,7 +66,7 @@ pub fn borderless_rows(ui: &mut egui::Ui) {
 /// here has to be checked against those fonts rather than assumed.
 const DOWNLOAD_MARK: &str = " ⬇";
 
-/// Marks a preset that cannot meet the latency target the player expects.
+/// Marks a part that costs an extra model on the loaded preset.
 const SLOW_MARK: &str = " ⚠";
 
 /// Shown on an output control a command-line flag fixed for this run.
@@ -78,7 +80,7 @@ pub fn row(ui: &mut egui::Ui, state: &AppState, palette: &Palette) {
     ui.horizontal(|ui| {
         model(ui, state, palette);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            output(ui, state);
+            output(ui, state, palette);
         });
     });
 }
@@ -137,14 +139,16 @@ fn model(ui: &mut egui::Ui, state: &AppState, palette: &Palette) {
                 .color(palette.bad),
         );
     }
-    if current.is_some_and(Preset::over_budget) {
-        ui.label(egui::RichText::new("slow").size(11.0).color(palette.warn));
+    let parts = state.settings.get().drop_parts;
+    if current == Some(Preset::Balanced) && (parts.has("bass") || parts.has("other")) {
+        ui.label(egui::RichText::new("slow").size(11.0).color(palette.warn))
+            .on_hover_text(SPLIT_COST);
     }
 }
 
 /// What a client gets when it does not ask for a format or a rate, and what a
 /// drop is written as.
-fn output(ui: &mut egui::Ui, state: &AppState) {
+fn output(ui: &mut egui::Ui, state: &AppState, palette: &Palette) {
     let settings = Arc::clone(&state.settings);
     let current = settings.get();
     let pinned = settings.pinned();
@@ -194,6 +198,85 @@ fn output(ui: &mut egui::Ui, state: &AppState) {
     })
     .response
     .on_disabled_hover_text(PINNED_HINT);
+
+    let split_costs = state.switcher.current() == Some(Preset::Balanced);
+    drop_parts(ui, &settings, current.drop_parts, split_costs, palette);
+}
+
+/// Shown on `bass` and `other` while Balanced is loaded.
+const SPLIT_COST: &str = "On Balanced, bass and other need one more model: about 1.5x the time.";
+
+/// The same, short enough for one line in the parts menu.
+const SPLIT_NOTE: &str = "bass/other: about 1.5x the time";
+
+/// Which parts a dropped track writes, as ticks. Requests over HTTP name their
+/// own parts and are not affected.
+fn drop_parts(
+    ui: &mut egui::Ui,
+    settings: &crate::settings::SettingsStore,
+    current: DropParts,
+    split_costs: bool,
+    palette: &Palette,
+) {
+    let count = current.names().count();
+    let costly = split_costs && (current.has("bass") || current.has("other"));
+    let mark = if costly { SLOW_MARK } else { "" };
+    egui::ComboBox::from_id_salt("drop-parts")
+        .selected_text(egui::RichText::new(format!("{count} parts{mark}")).size(TEXT))
+        .width(PARTS_WIDTH)
+        .height(MENU_CAP)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            borderless_rows(ui);
+            for part in PART_NAMES {
+                let slow = split_costs && matches!(part, "bass" | "other");
+                let label = if slow {
+                    format!("{part}{SLOW_MARK}")
+                } else {
+                    part.to_owned()
+                };
+                let mut on = current.has(part);
+                if ui
+                    .checkbox(&mut on, label)
+                    .on_hover_text(if slow { SPLIT_COST } else { part_hint(part) })
+                    .clicked()
+                {
+                    settings.set_drop_parts(current.toggle(part));
+                }
+            }
+            if costly {
+                ui.separator();
+                // One line, no wrap: a wrapped label inside the menu's scroll
+                // area measures short and gets clipped.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{} {SPLIT_NOTE}", SLOW_MARK.trim()))
+                            .size(10.5)
+                            .color(palette.warn),
+                    )
+                    .extend(),
+                );
+            }
+        })
+        .response
+        .on_hover_text(format!(
+            "What a dropped track writes: {}.{}",
+            current.names().collect::<Vec<_>>().join(", "),
+            if costly {
+                format!(" {SPLIT_COST}")
+            } else {
+                String::new()
+            }
+        ));
+}
+
+fn part_hint(part: &str) -> &'static str {
+    match part {
+        "harmonics" => "bass and other together; clears bass and other",
+        "bass" | "other" => "split out of harmonics; clears harmonics",
+        "drums" => "rebuilt as the mix minus the other parts",
+        _ => "",
+    }
 }
 
 /// The download / load dialog. Only drawn while a switch is in flight or has
@@ -341,9 +424,6 @@ fn entry_for(switcher: &Switcher, preset: Preset) -> String {
     let mut entry = preset.label().to_owned();
     if !switcher.is_local(preset) {
         entry.push_str(DOWNLOAD_MARK);
-    }
-    if preset.over_budget() {
-        entry.push_str(SLOW_MARK);
     }
     entry
 }

@@ -385,6 +385,7 @@ mod tests {
                         rate: OutputRate::default(),
                         derived: false,
                         dsp: DspMode::default(),
+                        parts: stemd_core::Parts::DEFAULT,
                     },
                 })
                 .expect("queue has room");

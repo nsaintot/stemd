@@ -35,8 +35,8 @@ use theme::{Palette, Sheen};
 /// Small on purpose: this is a drop target that reports, not a console. It grows
 /// to fit if both sections are opened, and the minimum still shows a whole drop
 /// zone.
-const WINDOW_SIZE: [f32; 2] = [460.0, 470.0];
-const MIN_WINDOW_SIZE: [f32; 2] = [380.0, 360.0];
+const WINDOW_SIZE: [f32; 2] = [520.0, 470.0];
+const MIN_WINDOW_SIZE: [f32; 2] = [480.0, 360.0];
 const PAD: f32 = 12.0;
 
 /// Nothing here is event-driven, the server writes from other threads, so the
@@ -180,6 +180,7 @@ impl eframe::App for Window {
                 sheen: &mut self.sheen,
                 armed,
                 current: self.current.as_deref(),
+                parts: self.state.settings.get().drop_parts,
             }
             .show(ui);
             if clicked {

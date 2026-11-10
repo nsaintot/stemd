@@ -279,9 +279,11 @@ load naming the tensor that disagreed. How many models a file holds is asked of
 the tensor names rather than guessed from the filename.
 
 **Which models run is the preset's business, not the file's.** `Fast` is one
-model over the track. `Balanced` and `Quality` are two, each supplying the one
-stem it is best at, with `harmonics` as the remainder: `stemd_core::hybrid`,
-and evaluation.md for why that arrangement rather than the obvious one.
+model over the track. `Balanced` is two, each supplying the one stem it is best
+at, with `harmonics` as the remainder: `stemd_core::hybrid`, and evaluation.md
+for why that arrangement rather than the obvious one. `Quality` is one 4-stem
+BS-RoFormer that keeps drums and vocals and ships the same remainder:
+`stemd_core::roformer`.
 
 A fine-tuned set like `htdemucs_ft` therefore does not load as a plain model:
 four checkpoints each produce a usable version of exactly one source, so taking
@@ -323,7 +325,9 @@ which would stall the stem downloads of a client already waiting.
 ## Model artefacts
 
 Weights are 168–672 MB that never change, so they are fetched on first run from
-[this project's release](https://github.com/nsaintot/stemd/releases/tag/models-v2)
+this project's releases
+([models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2),
+[models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3))
 into `~/Library/Application Support/stemd/models`: never into the bundle, whose
 contents the code signature covers.
 
@@ -332,10 +336,6 @@ demucs conversions are mlx-community's and the RoFormer one has no upstream at
 all; either publisher could retag or vanish, and a pinned digest turns that into
 a failed install rather than a wrong model, but a failed install is still a
 broken app. One release under this project's control is one thing to keep alive.
-
-`Quality` is the only preset needing two files, and its second is `Balanced`'s,
-pinned identically. The fetcher skips what it finds, so a machine with Balanced
-installed pays for the difference and not the pair.
 
 Downloads are pinned by SHA-256 and verified before the file is put in place, via
 a temporary file and a rename so an interrupted run cannot leave something
