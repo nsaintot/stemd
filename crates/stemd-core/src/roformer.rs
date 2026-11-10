@@ -8,15 +8,15 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use mlx_rs::ops::indexing::IndexOp;
 use stemd_mlx::Precision;
-use stemd_mlx::apply::over_track;
+use stemd_mlx::apply::{Accumulator, Chunked, Grid};
 use stemd_mlx::roformer::{BsRoformer, Config};
 
 use crate::backend::{BackendInfo, Separate};
-use crate::hybrid::{check_geometry, open, remainder_stems, to_array, to_planes};
+use crate::hybrid::{check_geometry, open, remainder_stems};
+use crate::mixture::Normalisation;
+use crate::pass::{Pass, Segmenting, check_range, chunk, source_planes};
 use crate::pcm::Audio;
-use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
 use crate::stems::{Parts, Stems, all_parts};
 
 /// The model's output order.
@@ -66,48 +66,52 @@ impl RoformerSeparator {
 }
 
 impl Separate for RoformerSeparator {
-    fn separate(&mut self, mix: &Audio, _parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
+    /// Trained on raw audio, so no track normalisation.
+    fn normalises(&self) -> bool {
+        false
+    }
+
+    fn segmenting(&self) -> Option<Segmenting> {
+        Some(Segmenting {
+            segment: self.model.chunk(),
+            overlap: self.overlap,
+        })
+    }
+
+    fn begin(&self, frames: usize, parts: Parts, norm: Normalisation) -> Result<Pass> {
+        let grid = Grid::new(i32::try_from(frames)?, self.model.chunk(), self.overlap)?;
+        let mut pass = Pass::new(grid, parts, norm);
+        pass.halves.push(Accumulator::new(
+            grid,
+            1,
+            self.model.sources(),
+            i32::try_from(self.channels())?,
+        )?);
+        Ok(pass)
+    }
+
+    fn run(&mut self, pass: &mut Pass, window: &Audio, k: usize) -> Result<()> {
+        check_geometry(window, self.channels(), self.sample_rate())?;
+        let input = chunk(window, &pass.grid, k, None)?;
+        let separated = self.model.separate_chunk(&input)?;
+        pass.halves[0].add(k, &separated)
+    }
+
+    fn stems(&self, pass: &Pass, mix: &Audio, from: usize, to: usize) -> Result<Stems> {
         check_geometry(mix, self.channels(), self.sample_rate())?;
-        sink.update(Progress::new(Stage::Analysing));
-
-        let frames = mix.frames();
-        if frames == 0 {
-            bail!("nothing to separate: the mix has no frames");
-        }
-
-        // Trained on raw audio, so no track normalisation.
-        let input = to_array(mix, None)?;
-        let out = over_track(&self.model, &input, self.overlap, &mut |done, total| {
-            if sink.cancelled() {
-                return Err(Cancelled.into());
-            }
-            sink.update(Progress::counted(
-                Stage::Separating,
-                u32::try_from(done).unwrap_or(u32::MAX),
-                u32::try_from(total).unwrap_or(u32::MAX),
-            ));
-            Ok(())
-        })?;
-        let drums = to_planes(
-            &out.index((0, index("drums"))),
-            self.channels(),
-            None,
-            frames,
-        )?;
-        let vocals = to_planes(
-            &out.index((0, index("vocals"))),
-            self.channels(),
-            None,
-            frames,
-        )?;
-        let bass = to_planes(
-            &out.index((0, index("bass"))),
-            self.channels(),
-            None,
-            frames,
-        )?;
-
-        sink.update(Progress::new(Stage::Reconstructing));
+        check_range(mix, from, to)?;
+        pass.check_final(from, to)?;
+        let plane = |name: &str| {
+            source_planes(
+                &pass.halves[0],
+                index(name),
+                from,
+                to,
+                self.channels(),
+                None,
+            )
+        };
+        let (drums, vocals, bass) = (plane("drums")?, plane("vocals")?, plane("bass")?);
         Ok(remainder_stems(mix, drums, vocals, Some(bass)))
     }
 

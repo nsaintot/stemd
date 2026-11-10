@@ -66,6 +66,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}", delete(delete_job))
         .route("/v1/jobs/{id}/stems/{name}", get(get_stem))
         .route("/v1/logs", get(get_logs))
+        .merge(crate::session_api::routes())
         .with_state(state)
 }
 
@@ -175,43 +176,43 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateParams {
+pub(crate) struct CreateParams {
     #[serde(default = "default_rate")]
-    sample_rate: u32,
+    pub(crate) sample_rate: u32,
     #[serde(default = "default_channels")]
-    channels: usize,
+    pub(crate) channels: usize,
     /// Encoding of the uploaded body.
     #[serde(default)]
-    format: Option<String>,
+    pub(crate) format: Option<String>,
     /// Container for the stems returned: `flac`, `s16le` or `f32le`. Defaults to
     /// `default_output_format` from `/v1/health`.
     #[serde(default)]
-    output_format: Option<String>,
+    pub(crate) output_format: Option<String>,
     /// Rate the stems are converted to: 24000, 44100, 48000 or 96000. Defaults
     /// to `default_output_sample_rate` from `/v1/health`.
     #[serde(default)]
-    output_sample_rate: Option<String>,
+    pub(crate) output_sample_rate: Option<String>,
     /// Ship the derived part as well. Off by default: a client holding the mix
     /// can rebuild it for free, and not sending it keeps the transfer at two
     /// stems.
     #[serde(default)]
-    include_derived: Option<bool>,
+    pub(crate) include_derived: Option<bool>,
     /// Comma-separated parts to ship, such as `bass,other,vocals`. Defaults to
     /// `default_parts` from `/v1/health`. They must not overlap, and must leave out
     /// one part or none: that part is the one `include_derived` adds.
     #[serde(default)]
-    parts: Option<String>,
+    pub(crate) parts: Option<String>,
     /// Filter the conversion to `output_sample_rate` runs through. `0`, the
     /// default, converts any pair. See `dsp_modes` in `/v1/health`.
     #[serde(default)]
-    dsp_mode: Option<String>,
+    pub(crate) dsp_mode: Option<String>,
 }
 
-const fn default_rate() -> u32 {
+pub(crate) const fn default_rate() -> u32 {
     44100
 }
 
-const fn default_channels() -> usize {
+pub(crate) const fn default_channels() -> usize {
     2
 }
 
@@ -255,83 +256,104 @@ struct Submission {
     model_rate: u32,
 }
 
+/// The upload format and the output a request asks for, checked against the
+/// loaded model.
+pub(crate) fn parse_output(
+    params: &CreateParams,
+    state: &AppState,
+) -> Result<(PcmFormat, Output, u32), ApiError> {
+    let in_format: PcmFormat = params
+        .format
+        .as_deref()
+        .unwrap_or("s16le")
+        .parse()
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+    // Read once: the window can change these between two requests, and a job
+    // whose format and rate came from different instants is not one anybody
+    // asked for.
+    let defaults = state.settings.get();
+    let out_format = match params.output_format.as_deref() {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
+        None => defaults.format,
+    };
+    let out_rate = match params.output_sample_rate.as_deref() {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
+        None => defaults.rate,
+    };
+    let dsp: DspMode = match params.dsp_mode.as_deref() {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
+        None => DspMode::default(),
+    };
+
+    let info = state.queue.info();
+    let model_rate = info.sample_rate;
+    let parts = match params.parts.as_deref() {
+        Some(list) => Parts::parse(list).map_err(ApiError::bad_request)?,
+        None => Parts::DEFAULT,
+    };
+    if let Some(missing) = parts.names().find(|p| !info.parts.iter().any(|q| q == p)) {
+        return Err(ApiError::bad_request(format!(
+            "{} cannot produce {missing}; it offers {:?}",
+            info.model, info.parts
+        )));
+    }
+    check_dsp_mode(dsp, model_rate, out_rate).map_err(ApiError::bad_request)?;
+
+    // Said out loud, because the way this goes wrong is inaudible from here
+    // and unmistakable at the other end. A client rebuilding the derived
+    // part subtracts these stems from a mix it resampled itself, and the two
+    // filters have to be the same one: mode 1 carries 64 samples of group
+    // delay that the general resampler does not, which at 1.5 kHz is a third
+    // of a cycle, so the vocals come back rather than cancelling. Not an
+    // error, because plenty of clients ask for a rate and subtract nothing.
+    if dsp == DspMode::General
+        && let Some(other) = DspMode::for_pair(model_rate, out_rate.hz())
+    {
+        tracing::info!(
+            "converting {model_rate} to {} Hz with the general resampler; \
+                 dsp_mode {other} is this server's copy of one client's own \
+                 filter for that pair, and this job did not ask for it",
+            out_rate.hz()
+        );
+    }
+
+    // Refused rather than quietly honoured at a rate the format can carry:
+    // a client that asked for 96 kHz mp3 and got 48 has no way to notice.
+    if !out_format.carries(out_rate) {
+        return Err(ApiError::bad_request(format!(
+            "{out_format} has no {} Hz mode; it carries {}",
+            out_rate.hz(),
+            out_format
+                .rates()
+                .map(|r| r.hz().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    Ok((
+        in_format,
+        Output {
+            format: out_format,
+            rate: out_rate,
+            derived: params.include_derived.unwrap_or(false),
+            dsp,
+            parts,
+        },
+        model_rate,
+    ))
+}
+
 impl Submission {
     /// Reject anything malformed before the upload is hashed or decoded.
     fn parse(params: &CreateParams, body: &Bytes, state: &AppState) -> Result<Self, ApiError> {
-        let in_format: PcmFormat = params
-            .format
-            .as_deref()
-            .unwrap_or("s16le")
-            .parse()
-            .map_err(|e| ApiError::bad_request(format!("{e}")))?;
-        // Read once: the window can change these between two requests, and a job
-        // whose format and rate came from different instants is not one anybody
-        // asked for.
-        let defaults = state.settings.get();
-        let out_format = match params.output_format.as_deref() {
-            Some(s) => s
-                .parse()
-                .map_err(|e| ApiError::bad_request(format!("{e}")))?,
-            None => defaults.format,
-        };
-        let out_rate = match params.output_sample_rate.as_deref() {
-            Some(s) => s
-                .parse()
-                .map_err(|e| ApiError::bad_request(format!("{e}")))?,
-            None => defaults.rate,
-        };
-        let dsp: DspMode = match params.dsp_mode.as_deref() {
-            Some(s) => s
-                .parse()
-                .map_err(|e| ApiError::bad_request(format!("{e}")))?,
-            None => DspMode::default(),
-        };
-
-        let info = state.queue.info();
-        let model_rate = info.sample_rate;
-        let parts = match params.parts.as_deref() {
-            Some(list) => Parts::parse(list).map_err(ApiError::bad_request)?,
-            None => Parts::DEFAULT,
-        };
-        if let Some(missing) = parts.names().find(|p| !info.parts.iter().any(|q| q == p)) {
-            return Err(ApiError::bad_request(format!(
-                "{} cannot produce {missing}; it offers {:?}",
-                info.model, info.parts
-            )));
-        }
-        check_dsp_mode(dsp, model_rate, out_rate).map_err(ApiError::bad_request)?;
-
-        // Said out loud, because the way this goes wrong is inaudible from here
-        // and unmistakable at the other end. A client rebuilding the derived
-        // part subtracts these stems from a mix it resampled itself, and the two
-        // filters have to be the same one: mode 1 carries 64 samples of group
-        // delay that the general resampler does not, which at 1.5 kHz is a third
-        // of a cycle, so the vocals come back rather than cancelling. Not an
-        // error, because plenty of clients ask for a rate and subtract nothing.
-        if dsp == DspMode::General
-            && let Some(other) = DspMode::for_pair(model_rate, out_rate.hz())
-        {
-            tracing::info!(
-                "converting {model_rate} to {} Hz with the general resampler; \
-                 dsp_mode {other} is this server's copy of one client's own \
-                 filter for that pair, and this job did not ask for it",
-                out_rate.hz()
-            );
-        }
-
-        // Refused rather than quietly honoured at a rate the format can carry:
-        // a client that asked for 96 kHz mp3 and got 48 has no way to notice.
-        if !out_format.carries(out_rate) {
-            return Err(ApiError::bad_request(format!(
-                "{out_format} has no {} Hz mode; it carries {}",
-                out_rate.hz(),
-                out_format
-                    .rates()
-                    .map(|r| r.hz().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
+        let (in_format, output, model_rate) = parse_output(params, state)?;
 
         if body.is_empty() {
             return Err(ApiError::bad_request("empty payload"));
@@ -360,13 +382,7 @@ impl Submission {
 
         Ok(Self {
             in_format,
-            output: Output {
-                format: out_format,
-                rate: out_rate,
-                derived: params.include_derived.unwrap_or(false),
-                dsp,
-                parts,
-            },
+            output,
             channels: params.channels,
             sample_rate: params.sample_rate,
             model_rate,
@@ -521,6 +537,7 @@ fn enqueue(
             job: Arc::clone(job),
             mix,
             output: submission.output,
+            model_id: state.switcher.published_identity(),
         })
         .map_err(|full| {
             job.fail(format!("{full}"));
@@ -642,22 +659,22 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
         }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
-    fn not_found() -> Self {
+    pub(crate) fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "not found")
     }
 }

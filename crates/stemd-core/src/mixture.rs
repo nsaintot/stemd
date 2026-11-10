@@ -16,6 +16,7 @@ pub const STD_FLOOR: f32 = 1e-8;
 
 /// The loudness normalisation demucs applies to the whole track and undoes at
 /// the end.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Normalisation {
     mean: f32,
     std: f32,
@@ -25,11 +26,24 @@ pub struct Normalisation {
 impl Normalisation {
     pub fn of(mix: &Audio) -> Self {
         let (mean, std) = mono_mean_std(mix);
+        Self::new(mean, std)
+    }
+
+    /// From a mean and standard deviation computed as [`Normalisation::of`] does.
+    pub fn new(mean: f32, std: f32) -> Self {
         Self {
             mean,
             std,
             inv_std: 1.0 / (std + STD_FLOOR),
         }
+    }
+
+    pub const fn mean(&self) -> f32 {
+        self.mean
+    }
+
+    pub const fn std(&self) -> f32 {
+        self.std
     }
 
     pub fn apply(&self, v: f32) -> f32 {

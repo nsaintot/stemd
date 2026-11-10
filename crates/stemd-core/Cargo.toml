@@ -22,6 +22,10 @@ flacenc = { version = "0.5.1", default-features = false, features = ["log", "par
 rubato = "5.0.0"
 mp3lame-encoder = "0.2.4"
 
+[features]
+# A small model with no weights, for testing what drives a separator.
+toy = []
+
 [dev-dependencies]
 # A decoder written by someone else, so the FLAC round-trip test cannot agree
 # with the encoder about a misreading of the format.

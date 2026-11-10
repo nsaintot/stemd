@@ -387,6 +387,7 @@ mod tests {
                         dsp: DspMode::default(),
                         parts: stemd_core::Parts::DEFAULT,
                     },
+                    model_id: "test".into(),
                 })
                 .expect("queue has room");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);

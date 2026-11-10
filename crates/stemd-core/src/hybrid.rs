@@ -40,13 +40,14 @@ use anyhow::{Context, Result, bail};
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 use stemd_mlx::Precision;
-use stemd_mlx::apply::{Chunked, DEFAULT_OVERLAP, over_track};
+use stemd_mlx::apply::{Accumulator, Chunked, DEFAULT_OVERLAP, over_track};
 use stemd_mlx::htdemucs::HtDemucs;
 use stemd_mlx::roformer::BsRoformer;
 use stemd_mlx::weights::Weights;
 
 use crate::backend::{BackendInfo, Separate};
 use crate::mixture::Normalisation;
+use crate::pass::{Pass, Segmenting, check_range, chunk, source_planes, whole_track};
 use crate::pcm::Audio;
 use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
 use crate::stems::{Parts, Stems, minus};
@@ -316,10 +317,40 @@ impl HybridSeparator {
     fn halves_cost_the_same(&self) -> bool {
         self.vocals.model.chunk() == self.drums.model.chunk()
     }
-}
 
-impl Separate for HybridSeparator {
-    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
+    /// True when the halves can run segment by segment: one grid, and no half
+    /// waits on another's output.
+    fn segmentable(&self) -> bool {
+        !self.config.cascade
+            && self.halves_cost_the_same()
+            && self
+                .bass
+                .as_ref()
+                .is_none_or(|b| b.model.chunk() == self.vocals.model.chunk())
+    }
+
+    /// The halves a job for `parts` runs, in [`Pass`] order.
+    fn halves_for(&self, parts: Parts) -> Vec<&Half> {
+        let bass = self
+            .bass
+            .as_ref()
+            .filter(|_| parts.contains("bass") || parts.contains("other"));
+        [Some(&self.vocals), Some(&self.drums), bass]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Both halves over the whole track, one after the other.
+    ///
+    /// Used for a cascade, whose drums half needs the vocals over its whole window
+    /// first, and for halves on different grids.
+    fn separate_in_halves(
+        &mut self,
+        mix: &Audio,
+        parts: Parts,
+        sink: &dyn ProgressSink,
+    ) -> Result<Stems> {
         check_geometry(mix, self.channels, self.sample_rate)?;
         sink.update(Progress::new(Stage::Analysing));
 
@@ -409,6 +440,79 @@ impl Separate for HybridSeparator {
 
         sink.update(Progress::new(Stage::Reconstructing));
         Ok(remainder_stems(mix, drums, vocals, bass))
+    }
+}
+
+impl Separate for HybridSeparator {
+    fn normalises(&self) -> bool {
+        self.vocals.normalised
+            || self.drums.normalised
+            || self.bass.as_ref().is_some_and(|b| b.normalised)
+    }
+
+    fn segmenting(&self) -> Option<Segmenting> {
+        self.segmentable().then(|| Segmenting {
+            segment: self.vocals.model.chunk(),
+            overlap: self.config.overlap,
+        })
+    }
+
+    fn begin(&self, frames: usize, parts: Parts, norm: Normalisation) -> Result<Pass> {
+        let Some(segmenting) = self.segmenting() else {
+            bail!(
+                "{} separates whole tracks only: its halves cannot run segment by segment",
+                self.model
+            );
+        };
+        let grid = segmenting.grid(frames)?;
+        let mut pass = Pass::new(grid, parts, norm);
+        for _ in self.halves_for(parts) {
+            // One source per half: the one it is the specialist for.
+            pass.halves
+                .push(Accumulator::new(grid, 1, 1, i32::try_from(self.channels)?)?);
+        }
+        Ok(pass)
+    }
+
+    fn run(&mut self, pass: &mut Pass, window: &Audio, k: usize) -> Result<()> {
+        check_geometry(window, self.channels, self.sample_rate)?;
+        let halves = self.halves_for(pass.parts);
+        for (i, half) in halves.into_iter().enumerate() {
+            let input = chunk(window, &pass.grid, k, half.normalised.then_some(&pass.norm))?;
+            let separated = half.model.separate_chunk(&input)?;
+            let own = separated.index((.., half.source..half.source + 1));
+            pass.halves[i].add(k, &own)?;
+        }
+        Ok(())
+    }
+
+    fn stems(&self, pass: &Pass, mix: &Audio, from: usize, to: usize) -> Result<Stems> {
+        check_geometry(mix, self.channels, self.sample_rate)?;
+        check_range(mix, from, to)?;
+        pass.check_final(from, to)?;
+        let halves = self.halves_for(pass.parts);
+        let mut planes = halves.iter().enumerate().map(|(i, half)| {
+            source_planes(
+                &pass.halves[i],
+                0,
+                from,
+                to,
+                self.channels,
+                half.normalised.then_some(&pass.norm),
+            )
+        });
+        let vocals = planes.next().context("the pass has no vocals half")??;
+        let drums = planes.next().context("the pass has no drums half")??;
+        let bass = planes.next().transpose()?;
+        Ok(remainder_stems(mix, drums, vocals, bass))
+    }
+
+    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
+        if self.segmentable() {
+            whole_track(self, mix, parts, sink, |_| Ok(()))
+        } else {
+            self.separate_in_halves(mix, parts, sink)
+        }
     }
 
     fn info(&self) -> BackendInfo {

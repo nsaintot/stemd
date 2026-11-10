@@ -552,7 +552,7 @@ fn clear_contents(dir: &Path) -> std::io::Result<()> {
 ///
 /// Separation runs at the model's rate and this is the only place the output rate
 /// is applied, so the cached bytes and the rate an entry reports cannot disagree.
-fn to_output_rate(
+pub(crate) fn to_output_rate(
     mix: &Audio,
     stems: &Stems,
     output: Output,

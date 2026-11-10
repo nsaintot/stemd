@@ -6,6 +6,8 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::mixture::Normalisation;
+use crate::pass::{Pass, Segmenting, whole_track};
 use crate::pcm::Audio;
 use crate::progress::ProgressSink;
 use crate::stems::{Parts, Stems};
@@ -28,7 +30,30 @@ pub struct BackendInfo {
 }
 
 pub trait Separate: Send {
-    /// Separate `mix` into at least [`crate::SHIPPED`] and whatever `parts` adds.
-    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems>;
     fn info(&self) -> BackendInfo;
+
+    /// True when the models expect the whole mix's [`Normalisation`].
+    fn normalises(&self) -> bool;
+
+    /// How the models cut a track into segments, or `None` when they cannot run
+    /// segment by segment.
+    fn segmenting(&self) -> Option<Segmenting>;
+
+    /// Start separating a track of `frames` samples into `parts`.
+    ///
+    /// `norm` is the whole mix's normalisation, ignored by models trained on raw
+    /// audio.
+    fn begin(&self, frames: usize, parts: Parts, norm: Normalisation) -> Result<Pass>;
+
+    /// Run segment `k` on `window`, the mix over the samples [`Pass::window`] names.
+    fn run(&mut self, pass: &mut Pass, window: &Audio, k: usize) -> Result<()>;
+
+    /// The stems over samples `from..to`, given the mix over the same samples.
+    /// [`Pass::is_final`] must hold for them.
+    fn stems(&self, pass: &Pass, mix: &Audio, from: usize, to: usize) -> Result<Stems>;
+
+    /// Separate `mix` into at least [`crate::SHIPPED`] and whatever `parts` adds.
+    fn separate(&mut self, mix: &Audio, parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
+        whole_track(self, mix, parts, sink, |_| Ok(()))
+    }
 }

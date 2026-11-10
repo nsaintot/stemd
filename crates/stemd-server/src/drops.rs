@@ -305,6 +305,7 @@ fn separate(
                 job: Arc::clone(&job),
                 mix: mix.clone(),
                 output,
+                model_id: state.switcher.published_identity(),
             })?;
             job
         }

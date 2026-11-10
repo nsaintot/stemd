@@ -13,23 +13,22 @@
 //!   first `eval` with `There is no Stream(gpu, N) in current thread`. The
 //!   server's queue worker constructs its own separator and never accepts one:
 //!   see `stemd_server::queue::BuildSeparator`.
-//! * The whole track is held as one array. A six-minute stereo track is about
-//!   140 MB in and the four separated sources about 560 MB out, which is the
-//!   price of doing the overlap-add on the GPU.
+//! * The separated track is held as one array: the four sources of a six-minute
+//!   stereo track are about 560 MB, the price of doing the overlap-add on the GPU.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use mlx_rs::Array;
 use stemd_mlx::Precision;
-use stemd_mlx::apply::{DEFAULT_OVERLAP, over_track};
+use stemd_mlx::apply::{Accumulator, Chunked, DEFAULT_OVERLAP, Grid};
 use stemd_mlx::htdemucs::{Config, HtDemucs};
 use stemd_mlx::weights::Weights;
 
 use crate::backend::{BackendInfo, Separate};
 use crate::mixture::{Normalisation, fold_into_shipped};
+use crate::pass::{Pass, Segmenting, check_range, chunk};
 use crate::pcm::Audio;
-use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
 use crate::stems::{FOUR_STEM_SOURCES, Parts, Stems, unexplained_db};
 
 pub struct MlxConfig {
@@ -141,22 +140,11 @@ impl MlxSeparator {
         Ok(())
     }
 
-    /// The normalised mixture as a `[1, C, T]` array.
-    fn to_array(&self, mix: &Audio, norm: &Normalisation) -> Result<Array> {
-        let frames = mix.frames();
-        let mut flat = Vec::with_capacity(self.channels * frames);
-        for channel in &mix.data {
-            flat.extend(channel.iter().map(|&v| norm.apply(v)));
-        }
-        let shape = [1, i32::try_from(self.channels)?, i32::try_from(frames)?];
-        Ok(Array::from_slice(&flat, &shape))
-    }
-
-    /// A `[1, S, C, T]` result back into one [`Audio`] per model source, with
+    /// A `[1, S, C, n]` result back into one [`Audio`] per model source, with
     /// the normalisation undone.
     fn to_sources(&self, out: &Array, norm: &Normalisation, frames: usize) -> Result<Vec<Audio>> {
-        // Evaluated already by `separate`, but reading the buffer of a lazy
-        // array is undefined rather than merely slow, so this is not optional.
+        // Reading the buffer of a lazy array is undefined rather than merely
+        // slow, so this is not optional.
         mlx_rs::transforms::eval([out])?;
         let flat = out
             .try_as_slice::<f32>()
@@ -181,39 +169,46 @@ impl MlxSeparator {
 }
 
 impl Separate for MlxSeparator {
-    fn separate(&mut self, mix: &Audio, _parts: Parts, sink: &dyn ProgressSink) -> Result<Stems> {
-        self.check_geometry(mix)?;
-        sink.update(Progress::new(Stage::Analysing));
+    fn normalises(&self) -> bool {
+        true
+    }
 
-        let frames = mix.frames();
-        if frames == 0 {
-            bail!("nothing to separate: the mix has no frames");
-        }
-        let norm = Normalisation::of(mix);
-        let input = self.to_array(mix, &norm)?;
+    fn segmenting(&self) -> Option<Segmenting> {
+        Some(Segmenting {
+            segment: self.demucs.chunk(),
+            overlap: self.config.overlap,
+        })
+    }
 
-        // Cancellation costs one segment rather than one track, because the
-        // callback can refuse to continue and `over_track` stops where it is.
-        // The partial overlap-add is worth nothing on its own and is dropped.
-        let separated = over_track(
-            &self.demucs,
-            &input,
+    fn begin(&self, frames: usize, parts: Parts, norm: Normalisation) -> Result<Pass> {
+        let grid = Grid::new(
+            i32::try_from(frames)?,
+            self.demucs.chunk(),
             self.config.overlap,
-            &mut |done, total| {
-                if sink.cancelled() {
-                    return Err(Cancelled.into());
-                }
-                sink.update(Progress::counted(
-                    Stage::Separating,
-                    u32::try_from(done).unwrap_or(u32::MAX),
-                    u32::try_from(total).unwrap_or(u32::MAX),
-                ));
-                Ok(())
-            },
         )?;
+        let mut pass = Pass::new(grid, parts, norm);
+        pass.halves.push(Accumulator::new(
+            grid,
+            1,
+            self.demucs.sources(),
+            i32::try_from(self.channels)?,
+        )?);
+        Ok(pass)
+    }
 
-        sink.update(Progress::new(Stage::Reconstructing));
-        let sources = self.to_sources(&separated, &norm, frames)?;
+    fn run(&mut self, pass: &mut Pass, window: &Audio, k: usize) -> Result<()> {
+        self.check_geometry(window)?;
+        let input = chunk(window, &pass.grid, k, Some(&pass.norm))?;
+        let separated = self.demucs.separate_chunk(&input)?;
+        pass.halves[0].add(k, &separated)
+    }
+
+    fn stems(&self, pass: &Pass, mix: &Audio, from: usize, to: usize) -> Result<Stems> {
+        self.check_geometry(mix)?;
+        check_range(mix, from, to)?;
+        pass.check_final(from, to)?;
+        let out = pass.halves[0].range(i32::try_from(from)?, i32::try_from(to)?)?;
+        let sources = self.to_sources(&out, &pass.norm, to - from)?;
         // The model's own sources, for a job asking for them one by one. They do not
         // sum to the mix; the leftover lands on whatever part the job leaves out.
         let more = ["drums", "bass", "other"]

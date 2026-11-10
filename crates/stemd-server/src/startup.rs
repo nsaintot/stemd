@@ -70,6 +70,12 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
     let store = Arc::new(JobStore::new(args.unfetched_ttl()));
 
     let (model, queue, info) = load_model(args, &settings, &stems, precisions, launch)?;
+    queue.sessions().set_limits(
+        std::time::Duration::from_secs(args.session_idle_secs),
+        args.max_sessions,
+    );
+    queue.sessions().set_pieces(open_pieces(args)?);
+    spawn_session_reaper(Arc::clone(&queue));
     let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
     log_model(&info, precisions, args.max_track_secs(), max_upload);
 
@@ -475,6 +481,26 @@ fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
     Ok((cache, summary))
 }
 
+/// Open the piece store, which keeps pieces across restarts.
+fn open_pieces(args: &Args) -> Result<Arc<crate::pieces::Pieces>> {
+    let root = match args.pieces_dir.clone() {
+        Some(dir) => dir,
+        None => dirs::cache_dir()
+            .context("no cache directory for this platform")?
+            .join("stemd-pieces"),
+    };
+    let max_bytes = (args.pieces_max_gb * 1e9) as u64;
+    let pieces = crate::pieces::Pieces::open(root.clone(), max_bytes)
+        .with_context(|| format!("preparing the piece store in {}", root.display()))?;
+    tracing::info!(
+        "pieces in {}: {:.0} MB of {:.1} GB",
+        root.display(),
+        pieces.bytes() as f64 / 1e6,
+        max_bytes as f64 / 1e9
+    );
+    Ok(pieces)
+}
+
 /// Announce over mDNS unless asked not to.
 ///
 /// Discovery is a convenience, not a precondition: a client with the address
@@ -514,7 +540,10 @@ fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
                         reaped.bytes as f64 / 1e6
                     );
                 }
-                idle_sweeps = if queue.running().is_some() || queue.depth() > 0 {
+                idle_sweeps = if queue.running().is_some()
+                    || queue.depth() > 0
+                    || !queue.sessions().is_empty()
+                {
                     0
                 } else {
                     idle_sweeps + 1
@@ -538,6 +567,21 @@ fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
             }
         })
         .expect("spawning the cache reaper");
+}
+
+/// End idle sessions once a second, and let the worker free what they held.
+fn spawn_session_reaper(queue: Arc<Queue>) {
+    std::thread::Builder::new()
+        .name("stemd-sessions".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if queue.sessions().reap() > 0 {
+                    queue.wake();
+                }
+            }
+        })
+        .expect("spawning the session reaper");
 }
 
 /// Consecutive idle sweeps before MLX's cache is handed back.
