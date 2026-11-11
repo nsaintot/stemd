@@ -20,7 +20,9 @@ pub fn cache(max_bytes: u64, ttl: Duration) -> Arc<Cache> {
         std::process::id(),
         ROOT_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    Cache::new(root, max_bytes, ttl).expect("cache root")
+    let cache = Cache::new(root, max_bytes, ttl).expect("cache root");
+    cache.ignore_disk();
+    cache
 }
 
 /// A mix and its three parts, each `frames` long.

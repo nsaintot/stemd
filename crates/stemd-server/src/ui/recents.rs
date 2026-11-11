@@ -1,197 +1,268 @@
 //! The list of tracks this window has separated.
 //!
-//! A finished row's only job is to get you to the stems, so the whole row opens the
-//! folder. Failures stay in the list with their reason rather than disappearing.
-//!
-//! Rows leave two ways: the cross removes one and deletes its stems, and a row
-//! whose folder has been deleted behind the window's back removes itself when
-//! anyone asks it to open that folder.
+//! One glass panel, a hairline between rows. A finished row opens its folder;
+//! hovering it swaps the detail for "Open folder" and a cross that removes the row
+//! and deletes its stems. On a running row the cross stops the drop. A row whose
+//! folder has been deleted removes itself when asked to open it.
 
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, Stroke};
+use eframe::egui::{self, Rect, Sense, Stroke, pos2, vec2};
 
 use crate::drops::{Dropped, Drops, State};
 
-use super::theme::{CARD_RADIUS, Palette, Sheen};
+use super::icons;
+use super::theme::{self, Brushes, Glass, Palette, Weight, white};
 
-const ROW_HEIGHT: f32 = 40.0;
-const DOT_RADIUS: f32 = 3.5;
+pub const ROW_HEIGHT: f32 = 40.0;
 
-/// How many rows the list shows before it scrolls, in rows rather than points
-/// so it stays four of them if [`ROW_HEIGHT`] ever moves. The half is the point
-/// of it: a whole number of rows ends the list on a clean edge and looks like
-/// the whole list, while half a row showing under the fourth says there is more
-/// below. Without a cap the window grew by a row per track and twelve of them
-/// took it past the bottom of the screen.
-const VISIBLE_ROWS: f32 = 4.5;
+const RADIUS: f32 = 16.0;
 
-/// How tall the list gets before it scrolls.
-///
-/// Read off the ui rather than stated as a constant because the gap between
-/// rows comes from the theme, and a cap that ignored it would be a row short of
-/// what it claims the moment the spacing moves.
-pub fn visible_height(ui: &egui::Ui) -> f32 {
-    ROW_HEIGHT * VISIBLE_ROWS + ui.spacing().item_spacing.y * (VISIBLE_ROWS - 1.0)
+/// Hit target and drawn box of the remove control.
+const CROSS_BOX: f32 = 26.0;
+
+/// The list's height for `rows` rows in `max_height`, never under one row.
+pub fn height(rows: usize, max_height: f32) -> f32 {
+    (ROW_HEIGHT * rows as f32).min(max_height.max(ROW_HEIGHT))
 }
 
-/// Hit target for the delete control. Bigger than the cross it draws: a
-/// nine-point glyph is not something to ask anyone to hit.
-const CROSS_BOX: f32 = 22.0;
-
-/// Arm length of the painted cross, from its centre.
-const CROSS_ARM: f32 = 3.5;
-
+/// Draw the list. Returns a running drop whose cross was clicked, for the
+/// caller to stop.
 pub fn list(
     ui: &mut egui::Ui,
     palette: &Palette,
-    sheen: &mut Sheen,
+    brushes: &Brushes,
     drops: &Drops,
     items: &[Arc<Dropped>],
-) {
+    max_height: f32,
+) -> Option<Arc<Dropped>> {
     if items.is_empty() {
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("No separated tracks")
-                .size(11.5)
-                .color(palette.muted),
-        );
-        return;
+        placeholder(ui, palette, brushes, max_height);
+        return None;
     }
 
-    // The window sizes itself to this panel, so the cap here is what stops a
-    // long list from resizing the window off the screen. `auto_shrink` on the
-    // vertical keeps a short list the height of its own rows: a fixed box would
-    // leave empty space under one row, which reads as a list that lost
-    // something.
+    let height = height(items.len(), max_height);
+    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    brushes.glass(ui.painter(), panel, RADIUS, Glass::List);
+
+    let mut inside = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(panel)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    inside.set_clip_rect(panel.intersect(ui.clip_rect()));
+    inside.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    inside.spacing_mut().scroll = egui::style::ScrollStyle {
+        bar_width: 6.0,
+        ..egui::style::ScrollStyle::floating()
+    };
+    let now = ui.input(|i| i.time) as f32;
+    let mut stop = None;
     egui::ScrollArea::vertical()
         .id_salt("recents")
-        .max_height(visible_height(ui))
+        .max_height(height)
         .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for item in items {
-                row(ui, palette, sheen, drops, item);
+        .show(&mut inside, |ui| {
+            for (n, item) in items.iter().enumerate() {
+                if row(ui, palette, drops, item, n == 0, n + 1 == items.len(), now) {
+                    stop = Some(Arc::clone(item));
+                }
             }
         });
+    stop
+}
+
+/// The empty list: the panel at three rows, or what fits, faded, with faint
+/// sample rows under one line of text.
+fn placeholder(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, max_height: f32) {
+    let height = height(3, max_height);
+    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let mut painter = ui.painter().with_clip_rect(ui.clip_rect());
+    painter.multiply_opacity(0.5);
+    brushes.glass(&painter, panel, RADIUS, Glass::List);
+    painter.set_clip_rect(panel.intersect(ui.clip_rect()));
+
+    // Sample rows: a dot where the icon goes and bars for the title and detail,
+    // each row fainter than the one above. The bars stop short of the centred text.
+    let rows = (height / ROW_HEIGHT).floor().max(1.0) as usize;
+    let titles = [84.0, 64.0, 76.0];
+    for n in 0..rows {
+        let row = Rect::from_min_size(
+            panel.min + vec2(0.0, ROW_HEIGHT * n as f32),
+            vec2(panel.width(), ROW_HEIGHT),
+        );
+        let alpha = 1.0 - 0.3 * n as f32;
+        if n > 0 {
+            painter.line_segment(
+                [
+                    row.left_top() + vec2(0.0, 0.5),
+                    row.right_top() + vec2(0.0, 0.5),
+                ],
+                Stroke::new(1.0, palette.hairline.gamma_multiply(alpha)),
+            );
+        }
+        let ghost = white(0.05 * alpha);
+        let y = row.center().y;
+        painter.circle_filled(pos2(row.left() + 20.0, y), 6.0, ghost);
+        let title = Rect::from_min_size(
+            pos2(row.left() + 36.0, y - 4.0),
+            vec2(titles[n % titles.len()], 8.0),
+        );
+        painter.rect_filled(title, 4.0, ghost);
+        let detail = Rect::from_min_size(pos2(row.right() - 14.0 - 64.0, y - 3.0), vec2(64.0, 6.0));
+        painter.rect_filled(detail, 3.0, ghost);
+    }
+
+    painter.set_opacity(1.0);
+    let text = painter.layout_no_wrap(
+        "Separated tracks will appear here.".to_owned(),
+        theme::font(12.0, Weight::Regular),
+        palette.muted,
+    );
+    painter.galley(panel.center() - text.size() / 2.0, text, palette.muted);
 }
 
 fn row(
     ui: &mut egui::Ui,
     palette: &Palette,
-    sheen: &mut Sheen,
     drops: &Drops,
     item: &Arc<Dropped>,
-) {
+    first: bool,
+    last: bool,
+    now: f32,
+) -> bool {
     let state = item.state();
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::hover());
-    let inner = rect.shrink2(egui::vec2(12.0, 6.0));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
 
-    // Interacted by an id derived from the track rather than by allocation
-    // order. An automatic id is a counter over the widgets before it, so it
-    // shifts whenever the list above changes shape, and an id that changes
-    // between frames cannot correlate a press with its release, which is
-    // exactly a row that highlights on hover and does nothing when clicked.
-    //
-    // Keyed on the source path rather than the title: two different files can
-    // share a title (different folders, same name), and `title` alone would
-    // hand both rows the same id, colliding in exactly the way this comment
-    // warns about.
+    // Keyed on the source path: an automatic id is a counter that shifts as the
+    // list changes, and an id that moves between frames cannot pair a press with
+    // its release. Two files can share a title, so not the title either.
     let id = ui.id().with(("recent", &item.source));
-    let response = ui.interact(rect, id.with("row"), egui::Sense::click());
-
-    // Registered after the row and overlapping it, so egui hands it the pointer
-    // first: the last widget to claim a spot is the one on top of it.
-    let removable = !item.is_running();
-    let cross_rect = egui::Rect::from_center_size(
-        egui::pos2(inner.right() - CROSS_BOX / 2.0, inner.center().y),
-        egui::Vec2::splat(CROSS_BOX),
-    );
-    let cross = removable.then(|| ui.interact(cross_rect, id.with("remove"), egui::Sense::click()));
+    let response = ui.interact(rect, id.with("row"), Sense::click());
 
     let openable = matches!(state, State::Done(_));
-    // The cross sits inside the row, so pointing at it takes the hover off the
-    // row underneath. Without this the control would vanish as it was reached.
-    let touched = response.hovered() || cross.as_ref().is_some_and(egui::Response::hovered);
-    sheen.card(
-        ui,
-        rect,
-        CARD_RADIUS,
-        if touched && openable {
-            palette.card_hover
-        } else {
-            palette.card
-        },
-        Stroke::new(1.0, palette.outline),
+    let running = item.is_running();
+    let cross_rect = Rect::from_center_size(
+        pos2(rect.right() - 8.0 - CROSS_BOX / 2.0, rect.center().y),
+        vec2(CROSS_BOX, CROSS_BOX),
     );
+    // Registered after the row and on top of it, so it gets the pointer first.
+    let cross = ui.interact(cross_rect, id.with("remove"), Sense::click());
+    let touched = response.hovered() || cross.hovered();
 
-    //  Painted, not laid out as widgets. A `ui.label` inside the row registers its own
-    //  interaction rect on top of the row's, so egui hands the pointer to the label and
-    //  the row beneath stops seeing the hover: the whole card clickable except over its
-    //  own text. The painter takes no part in interaction.
     let painter = ui.painter();
-    painter.circle_filled(
-        egui::pos2(inner.left() + DOT_RADIUS, inner.center().y),
-        DOT_RADIUS,
-        colour_for(palette, &state),
-    );
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hover"), touched, 0.12);
+    if hover > 0.0 {
+        let corners = egui::CornerRadius {
+            nw: if first { RADIUS as u8 - 1 } else { 0 },
+            ne: if first { RADIUS as u8 - 1 } else { 0 },
+            sw: if last { RADIUS as u8 - 1 } else { 0 },
+            se: if last { RADIUS as u8 - 1 } else { 0 },
+        };
+        painter.rect_filled(rect.shrink(1.0), corners, white(0.05 * hover));
+    }
+    if !first {
+        painter.line_segment(
+            [
+                rect.left_top() + vec2(0.0, 0.5),
+                rect.right_top() + vec2(0.0, 0.5),
+            ],
+            Stroke::new(1.0, palette.hairline),
+        );
+    }
 
-    let text_left = inner.left() + DOT_RADIUS * 2.0 + 8.0;
-    painter.text(
-        egui::pos2(text_left, inner.center().y - 1.0),
-        egui::Align2::LEFT_BOTTOM,
-        &item.title,
-        egui::FontId::proportional(12.5),
+    //  Painted: a `ui.label` registers its own interaction rect on top of the
+    //  row's and takes the pointer from it.
+    let icon = icons::square(pos2(rect.left() + 14.0 + 6.0, rect.center().y), 12.0);
+    let waiting = matches!(&state, State::Working(p) if p.stage == stemd_core::Stage::Queued);
+    match &state {
+        State::Done(_) => icons::check(painter, icon, palette.good, 1.6),
+        State::Failed(_) => icons::cross(painter, icon.shrink(1.0), palette.danger, 1.5),
+        _ if waiting => icons::clock(painter, icon, palette.muted, 1.4),
+        State::Reading | State::Working(_) => {
+            icons::spinner(painter, icon, palette.text, 1.6, now.rem_euclid(1.0));
+        }
+    }
+
+    let swapped = touched && openable;
+    let meta_font = theme::font(12.0, Weight::Regular);
+    let meta_right = if touched {
+        cross_rect.left() - 4.0 - 6.0
+    } else {
+        rect.right() - 8.0 - 6.0
+    };
+    let meta_left = if swapped {
+        let open =
+            painter.layout_no_wrap("Open folder".to_owned(), meta_font.clone(), palette.text);
+        let x = cross_rect.left() - 4.0 - 6.0 - open.size().x;
+        painter.galley(
+            pos2(x, rect.center().y - open.size().y / 2.0),
+            open,
+            palette.text,
+        );
+        x
+    } else {
+        let colour = if matches!(state, State::Failed(_)) {
+            palette.danger
+        } else {
+            palette.muted
+        };
+        let mut job = egui::text::LayoutJob::single_section(
+            detail(&state),
+            egui::TextFormat::simple(meta_font, colour),
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() * 0.45);
+        let meta = painter.layout_job(job);
+        let x = meta_right - meta.size().x;
+        painter.galley(pos2(x, rect.center().y - meta.size().y / 2.0), meta, colour);
+        x
+    };
+
+    let title_left = icon.right() + 10.0;
+    let mut job = egui::text::LayoutJob::single_section(
+        item.title.clone(),
+        egui::TextFormat::simple(theme::font(13.0, Weight::Medium), palette.text),
+    );
+    job.wrap =
+        egui::text::TextWrapping::truncate_at_width((meta_left - 10.0 - title_left).max(20.0));
+    let title = painter.layout_job(job);
+    painter.galley(
+        pos2(title_left, rect.center().y - title.size().y / 2.0),
+        title,
         palette.text,
     );
-    painter.text(
-        egui::pos2(text_left, inner.center().y + 2.0),
-        egui::Align2::LEFT_TOP,
-        detail(&state),
-        egui::FontId::proportional(10.5),
-        match &state {
-            State::Failed(_) => palette.bad,
-            _ => palette.muted,
-        },
-    );
 
-    if touched && openable {
-        painter.text(
-            egui::pos2(cross_rect.left() - 6.0, inner.center().y),
-            egui::Align2::RIGHT_CENTER,
-            "Show in Finder",
-            egui::FontId::proportional(10.5),
-            palette.accent,
+    if touched {
+        let lit = ui
+            .ctx()
+            .animate_bool_with_time(id.with("cross"), cross.hovered(), 0.12);
+        if lit > 0.0 {
+            painter.rect_filled(cross_rect, 8.0, white(0.08 * lit));
+        }
+        icons::cross(
+            painter,
+            icons::square(cross_rect.center(), 9.0),
+            theme::mix(palette.muted, palette.danger, lit),
+            1.5,
         );
     }
 
-    // Only under the pointer: twelve permanent crosses down the side of the list
-    // would be the loudest thing in the window, and the least often wanted.
-    if let Some(cross) = &cross
-        && touched
+    if cross
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(match &state {
+            State::Done(_) => "Remove from the list and delete the stems",
+            _ if running => "Cancel and remove from the list",
+            _ => "Remove from the list",
+        })
+        .clicked()
     {
-        draw_cross(
-            ui,
-            cross_rect.center(),
-            if cross.hovered() {
-                palette.bad
-            } else {
-                palette.muted
-            },
-        );
-    }
-
-    if let Some(cross) = cross
-        && cross
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(match &state {
-                State::Done(_) => "Remove this, and delete its stems",
-                _ => "Remove this from the list",
-            })
-            .clicked()
-    {
+        if running {
+            return true;
+        }
         drops.discard(item);
-        return;
+        return false;
     }
 
     if openable
@@ -200,9 +271,8 @@ fn row(
             .clicked()
         && let State::Done(finished) = &state
     {
-        // Deleted behind the window's back: in Finder, or by the cross on a
-        // second copy of the same track. Opening nothing and saying nothing is
-        // the one outcome that reads as broken, so the row goes instead.
+        // Deleted behind the window's back. Opening nothing and saying nothing
+        // reads as broken, so the row goes instead.
         if finished.dir.is_dir() {
             reveal(&finished.dir);
         } else {
@@ -210,57 +280,31 @@ fn row(
             drops.forget(item);
         }
     }
-}
-
-/// A cross, painted rather than typed, for the same reason the drop zone's arrow
-/// is: egui bundles three fonts and most symbol glyphs are in none of them.
-fn draw_cross(ui: &egui::Ui, centre: egui::Pos2, colour: Color32) {
-    let painter = ui.painter();
-    let stroke = Stroke::new(1.3, colour);
-    for dx in [-CROSS_ARM, CROSS_ARM] {
-        painter.line_segment(
-            [
-                egui::pos2(centre.x - dx, centre.y - CROSS_ARM),
-                egui::pos2(centre.x + dx, centre.y + CROSS_ARM),
-            ],
-            stroke,
-        );
-    }
-}
-
-fn colour_for(palette: &Palette, state: &State) -> Color32 {
-    match state {
-        State::Reading | State::Working(_) => palette.accent,
-        State::Done(_) => palette.good,
-        State::Failed(_) => palette.bad,
-    }
+    false
 }
 
 fn detail(state: &State) -> String {
+    let dot = theme::DOT;
     match state {
         State::Reading => "reading".to_owned(),
         State::Working(progress) => super::dropzone::stage_label(progress.stage).to_owned(),
         State::Done(finished) if finished.cached => {
-            format!("{} parts · already separated", finished.parts.len())
+            format!("{} parts{dot}already separated", finished.parts.len())
         }
-        State::Done(finished) => format!(
-            "{} parts · separated in {:.0}s",
-            finished.parts.len(),
-            finished.secs
-        ),
+        State::Done(finished) => {
+            format!("{} parts{dot}{:.0} s", finished.parts.len(), finished.secs)
+        }
         State::Failed(why) => why.clone(),
     }
 }
 
 /// Open the stems folder in the system's file manager.
 ///
-/// A failure here is worth a log line and nothing more: the stems are written
-/// either way, and the row still shows where they are.
+/// A failure is worth a log line and nothing more: the stems are written either
+/// way.
 fn reveal(dir: &std::path::Path) {
-    // macOS takes the absolute path rather than bare `open`: a bundle launched
-    // from Finder inherits a minimal PATH, and "the button does nothing" is a
-    // bad way to find that out. The other two are resolved through PATH because
-    // that is the only place they are.
+    // The absolute path on macOS: a bundle launched from Finder inherits a minimal
+    // PATH.
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("/usr/bin/open");
     #[cfg(windows)]
@@ -270,5 +314,21 @@ fn reveal(dir: &std::path::Path) {
 
     if let Err(err) = cmd.arg(dir).spawn() {
         tracing::warn!("could not reveal {}: {err}", dir.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_list_takes_its_rows_up_to_the_room_it_has() {
+        assert_eq!(
+            height(2, 1000.0),
+            2.0 * ROW_HEIGHT,
+            "two rows grew past themselves"
+        );
+        assert_eq!(height(20, 300.0), 300.0);
+        assert_eq!(height(20, 0.0), ROW_HEIGHT, "no room hid the list entirely");
     }
 }

@@ -30,7 +30,7 @@ pub fn discover(timeout: Duration) -> Result<String> {
     let _ = daemon.shutdown();
     bail!(
         "no stemd server found on the network after {}s — is it running? \
-         start it with `open dist/stemd.app`, or pass --host host:port",
+         start it with `open dist/Stemd.app`, or pass --host host:port",
         timeout.as_secs()
     )
 }

@@ -59,12 +59,12 @@ impl Preset {
         }
     }
 
-    /// One line for the dropdown. Times are for a 6:38 track on an idle M1 Pro.
+    /// One line about the model. Times are for a 6:38 track on an idle M1 Pro.
     pub const fn detail(self) -> &'static str {
         match self {
-            Self::Fast => "htdemucs v4 — ~22 s per track",
-            Self::Balanced => "htdemucs ft — ~48 s per track",
-            Self::Quality => "stemd RoFormer — ~110 s per track",
+            Self::Fast => "htdemucs v4 · about 22 s per track",
+            Self::Balanced => "htdemucs ft · about 48 s per track",
+            Self::Quality => "Stemd RoFormer · about 110 s per track",
         }
     }
 

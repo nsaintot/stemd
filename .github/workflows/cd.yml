@@ -215,7 +215,7 @@ jobs:
         if: env.SIGNED != 'true'
         run: scripts/bundle-app.sh
       - name: Start check
-        run: dist/stemd.app/Contents/MacOS/stemd --version
+        run: dist/Stemd.app/Contents/MacOS/stemd --version
       - name: Remove credentials
         if: always()
         run: |
@@ -271,14 +271,14 @@ jobs:
           Test-Version dist\stemd-windows\stemd-server.exe
           $setup = Get-Item dist\stemd-*-setup.exe
           Start-Process $setup.FullName -ArgumentList '/S' -Wait
-          $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\Stemd'
           Test-Version (Join-Path $installed 'stemd-server.exe')
           Test-Version (Join-Path $installed 'stemd-cli.exe')
       # The runner has no NVIDIA driver.
       - name: CPU separation
         timeout-minutes: 30
         run: |
-          $installed = Join-Path $env:LOCALAPPDATA 'Programs\stemd'
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\Stemd'
           .github/scripts/cpu-separation.ps1 -Server (Join-Path $installed 'stemd-server.exe') -Cli (Join-Path $installed 'stemd-cli.exe')
       - uses: actions/upload-artifact@v4
         with:

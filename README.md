@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="resources/stemd-icon-mac-256.png" width="120" alt="stemd">
+<img src="resources/stemd-icon-mac-256.png" width="120" alt="Stemd">
 
-# stemd
+# Stemd
 
 **Split any track into stems, on your own machine.**
 
 Drop a file on the window. Get `harmonics`, `vocals` and `drums` in a folder
 beside it.
 
-<img src="resources/screenshot.png" width="440" alt="The stemd window, with a drop zone reading Drop a track">
+<img src="resources/screenshot.png" width="440" alt="The Stemd window: a drop zone reading Drop a track, and the Separated list below it">
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#install)
@@ -43,7 +43,7 @@ track bit for bit.
 
 **macOS.** Open the `macos-arm64` disk image from the
 [latest release](https://github.com/nsaintot/stemd/releases/latest) and drag
-stemd to Applications. Signed and notarized, and the ticket is stapled to the
+Stemd to Applications. Signed and notarized, and the ticket is stapled to the
 app as well as to the image, so it opens without argument and the first launch
 does not need a network.
 
@@ -54,7 +54,7 @@ installer.
 
 On a machine with an NVIDIA card, tick the box at the end of the installer or run
 `install-cuda.cmd` once afterwards: about 1.2 GB of NVIDIA's own runtime, fetched
-once and pinned by digest. No toolkit and no repository. Without it stemd runs on
+once and pinned by digest. No toolkit and no repository. Without it Stemd runs on
 the CPU, correctly and far slower.
 
 **Linux.** Take the package for your distribution and architecture
@@ -81,7 +81,7 @@ Drop a track on the window, or click to choose one. The stems appear in
 
 ### From another machine
 
-stemd is also a server. It announces itself over mDNS, so a client does not need
+Stemd is also a server. It announces itself over mDNS, so a client does not need
 to be told an address, and it speaks plain HTTP:
 
 ```bash
@@ -126,7 +126,7 @@ by the audio and by everything else that changes the output.
 
 ## Build from source
 
-Needs `cmake`, Rust 1.85 or later, and a recursive clone. Per-platform
+Needs `cmake`, Rust 1.89 or later, and a recursive clone. Per-platform
 toolchains, packaging and every flag are in
 [docs/building.md](docs/building.md).
 

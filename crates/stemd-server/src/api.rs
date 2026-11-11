@@ -31,7 +31,6 @@ use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, Stage, resample};
 use tokio_util::io::ReaderStream;
 
 use crate::cache::{Cache, Ingredients, Output};
-use crate::discovery::Advertiser;
 use crate::jobs::JobStore;
 use crate::logbuf::LogBuffer;
 use crate::models::Preset;
@@ -53,9 +52,9 @@ pub struct AppState {
     /// `/v1/health` so a client can refuse locally instead of uploading a track
     /// it will be told to take back.
     pub max_track_secs: f64,
-    /// Present unless --no-mdns. Shared so every exit path can withdraw the
-    /// advertisement rather than relying on Drop, which macOS skips on Cmd-Q.
-    pub advertiser: Option<Arc<Advertiser>>,
+    /// Whether the API answers, and its mDNS advertisement. Shared so every
+    /// exit path can withdraw the advertisement: macOS skips Drop on Cmd-Q.
+    pub serving: crate::serving::Serving,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -67,7 +66,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}/stems/{name}", get(get_stem))
         .route("/v1/logs", get(get_logs))
         .merge(crate::session_api::routes())
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            refuse_when_off,
+        ))
         .with_state(state)
+}
+
+/// 503 for every request while the server is turned off in the window.
+async fn refuse_when_off(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.serving.is_on() {
+        next.run(request).await
+    } else {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is turned off in the Stemd window",
+        )
+        .into_response()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -518,6 +538,16 @@ async fn create_job(
         return Ok((StatusCode::OK, Json(job.view())).into_response());
     }
 
+    // Stems are written to the cache before they are served, and a full disk
+    // also leaves the system no room to swap.
+    if let Err(full) = crate::disk::ensure_room(state.cache.root()) {
+        job.fail(full.to_string());
+        return Err(ApiError::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            full.to_string(),
+        ));
+    }
+
     let mix = decode_upload(body, submission, &job).await?;
     enqueue(&state, &job, mix, submission)?;
     Ok((StatusCode::ACCEPTED, Json(job.view())).into_response())
@@ -538,6 +568,7 @@ fn enqueue(
             mix,
             output: submission.output,
             model_id: state.switcher.published_identity(),
+            from_api: true,
         })
         .map_err(|full| {
             job.fail(format!("{full}"));
@@ -626,6 +657,7 @@ async fn get_stem(
 
     // Only once the bytes are provably readable. Marking on request would let a
     // failed fetch count as consumption and keep an entry nobody can use.
+    entry.hand_out();
     entry.mark_fetched(&name);
 
     Ok(Response::builder()

@@ -74,7 +74,7 @@ impl Accelerator {
         if !gpu {
             return (Self::Cpu, false);
         }
-        if !gpu_computes() {
+        if !gpu_computes_on_kept_thread() {
             return (Self::demote(), true);
         }
         let which = if cfg!(target_vendor = "apple") {
@@ -116,6 +116,24 @@ impl std::fmt::Display for Accelerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.backend())
     }
+}
+
+/// [`gpu_computes`] on a thread that never exits.
+///
+/// MLX keeps CUDA state per thread, and on Windows its destructor throws when the
+/// thread exits. Windows reports that as a crash and freezes the whole process for
+/// about 3 s while it writes the report.
+fn gpu_computes_on_kept_thread() -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("stemd-gpu-probe".into())
+        .spawn(move || {
+            let _ = tx.send(gpu_computes());
+            loop {
+                std::thread::park();
+            }
+        });
+    spawned.is_ok() && rx.recv().unwrap_or(false)
 }
 
 /// Whether the GPU MLX offered returns right answers.

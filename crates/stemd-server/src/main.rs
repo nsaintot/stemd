@@ -7,9 +7,8 @@
 //! shutdown  the one way the process ends, however it was asked to
 //! ```
 //!
-//! The port is taken first so that a launch which cannot have it stops before it
-//! loads a model or clears a cache another server is serving from. See
-//! [`serve::bind`].
+//! The cache root is locked and the port taken first, so a second launch stops
+//! before it loads a model or clears the cache of the server already running.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod api;
@@ -18,6 +17,7 @@ mod cli;
 #[cfg(windows)]
 mod cuda;
 mod discovery;
+mod disk;
 mod drops;
 mod ident;
 mod jobs;
@@ -29,6 +29,7 @@ mod pieces;
 mod precision;
 mod queue;
 mod serve;
+mod serving;
 mod session_api;
 mod sessions;
 mod settings;
@@ -57,9 +58,8 @@ fn main() -> Result<()> {
     if args.install_cuda {
         return install_cuda();
     }
-    // Before `prepare`, and the reason is in `serve::bind`: a launch that cannot
-    // have the port should find that out before it loads a model or touches the
-    // cache that another server is using.
+    // Before `prepare`, which clears the cache root. Held until the process ends.
+    let _instance = cache::lock(&cache::root(&args)?)?;
     let listener = serve::bind(args.bind)?;
     if args.headless {
         serve::headless(&args, logs, listener)

@@ -22,7 +22,8 @@ clap = { version = "4.6.6", features = ["derive"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 parking_lot = "0.12.5"
 thiserror.workspace = true
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
+# `persistence` saves the window's position and size between launches.
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 if-addrs = "0.15.0"
 # First-run model fetch: HTTP plus a pinned digest.
 ureq = "3.4.0"
@@ -51,6 +52,12 @@ winit = { version = "0.30.13", default-features = false, features = ["x11"] }
 # download only there. See `cuda`.
 [target.'cfg(windows)'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Free disk space, see `disk.rs`.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+# statvfs and sysctl, see `disk.rs`.
+libc = "0.2"
 
 # `default-features = false` above is what keeps wgpu and accesskit out, but it
 # also drops `x11` and `wayland`, and those are not extras — winit has no Linux
@@ -62,6 +69,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 eframe = { version = "0.35.0", default-features = false, features = [
     "glow",
     "default_fonts",
+    "persistence",
     "x11",
     "wayland",
 ] }

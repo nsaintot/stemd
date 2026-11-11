@@ -6,9 +6,21 @@
 
 use eframe::egui;
 
-/// A 520x470 window, matching [`super::WINDOW_SIZE`].
+/// A 560x600 window, matching [`super::WINDOW_SIZE`].
 fn screen() -> egui::Rect {
-    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 470.0))
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(560.0, 600.0))
+}
+
+/// A context with the window's fonts and style in place.
+///
+/// Fonts are bound at the start of the frame after they are set, and the
+/// weighted families do not exist before that, so this runs one empty frame.
+fn themed() -> egui::Context {
+    let ctx = egui::Context::default();
+    frame(&ctx, None, false, |_| {});
+    super::theme::install(&ctx);
+    frame(&ctx, None, false, |_| {});
+    ctx
 }
 
 /// Run one frame with the pointer at `pointer`, optionally clicking, and return
@@ -39,96 +51,6 @@ fn frame(
     ctx.run_ui(input, |ui| build(ui)).shapes
 }
 
-/// Rects narrow enough to be a scroll bar and tall enough to be worth drawing.
-///
-/// egui's floating bars are about a point wide and animate in and out, so this
-/// deliberately catches a partly-faded one: a bar on its way in is still a bar
-/// that appeared.
-fn scroll_bars(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
-    fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::Rect>) {
-        match shape {
-            egui::epaint::Shape::Rect(r) if r.rect.width() <= 12.0 && r.rect.height() >= 20.0 => {
-                out.push(r.rect);
-            }
-            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for clipped in shapes {
-        walk(&clipped.shape, &mut out);
-    }
-    out
-}
-
-/// A dropdown built the way [`super::header`] builds its three.
-fn dropdown(ui: &mut egui::Ui, borderless: bool) {
-    egui::ComboBox::from_id_salt("probe")
-        .selected_text("MP3 320")
-        .width(88.0)
-        .height(super::header::MENU_CAP)
-        .show_ui(ui, |ui| {
-            if borderless {
-                super::header::borderless_rows(ui);
-            }
-            for label in ["FLAC", "WAV", "MP3 320", "PCM 16", "PCM 32"] {
-                ui.selectable_label(false, label)
-                    .on_hover_text("320 kbps, and the only lossy option.");
-            }
-        });
-}
-
-/// Open the dropdown, then walk the pointer down the open list, counting the
-/// positions at which a scroll bar is drawn.
-///
-/// A sweep rather than a hand-picked coordinate: row heights come out of the
-/// theme, so a guessed position lands between rows the moment the theme changes
-/// and the test silently stops testing anything.
-fn positions_growing_a_bar(borderless: bool) -> usize {
-    let ctx = egui::Context::default();
-    let build = |ui: &mut egui::Ui| dropdown(ui, borderless);
-
-    // A frame before `install`, which reads the context's current theme.
-    frame(&ctx, None, false, build);
-    super::theme::install(&ctx);
-    frame(&ctx, None, false, build);
-
-    let button = egui::pos2(40.0, 10.0);
-    frame(&ctx, Some(button), true, build);
-    frame(&ctx, Some(button), false, build);
-
-    (0..60u8)
-        .filter(|step| {
-            let at = egui::pos2(40.0, 4.0 * f32::from(*step));
-            // Twice: egui settles a frame behind its own input.
-            frame(&ctx, Some(at), false, build);
-            !scroll_bars(&frame(&ctx, Some(at), false, build)).is_empty()
-        })
-        .count()
-}
-
-/// A list of five items in a box that caps at 600 points has nothing to scroll,
-/// and must not say otherwise.
-#[test]
-fn no_dropdown_grows_a_scroll_bar() {
-    assert_eq!(
-        positions_growing_a_bar(true),
-        0,
-        "a dropdown grew a scroll bar with nothing to scroll to"
-    );
-}
-
-/// The above passing means nothing unless it can fail. This is the same sweep
-/// over the same list with the row borders left on: the bug as it shipped.
-#[test]
-fn the_sweep_catches_the_bar_it_is_meant_to_catch() {
-    assert!(
-        positions_growing_a_bar(false) > 0,
-        "the sweep found no bar even with the borders that caused it, so it is \
-         not testing anything"
-    );
-}
-
 /// The vertical extent of every log line drawn, given `total` buffered lines.
 fn log_text_extent(total: usize) -> egui::Rect {
     use crate::logbuf::LogLine;
@@ -140,13 +62,12 @@ fn log_text_extent(total: usize) -> egui::Rect {
             message: format!("line number {i} of the log"),
         })
         .collect();
-    let ctx = egui::Context::default();
-    frame(&ctx, None, false, |_| {});
-    super::theme::install(&ctx);
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
     let mut view = super::logs::View::default();
     let mut build = |ui: &mut egui::Ui| {
-        let _ = super::logs::show(ui, &palette, &mut view, &lines);
+        let _ = super::logs::show(ui, &palette, &brushes, &mut view, &lines);
     };
     frame(&ctx, None, false, &mut build);
     let shapes = frame(&ctx, None, false, &mut build);
@@ -163,11 +84,7 @@ fn log_text_extent(total: usize) -> egui::Rect {
 }
 
 /// A log with far more lines than fit must draw enough of them to fill the box.
-///
-/// `show_rows` decides how many rows to hand out by adding `item_spacing.y` to the
-/// row height it is given, so spacing set inside its closure comes too late and the
-/// rows draw short of the box. The tolerance is one row, not zero: the last row may
-/// be partly clipped.
+/// The tolerance is one row: the last row may be partly clipped.
 #[test]
 fn a_full_log_fills_the_box_it_is_given() {
     let drawn = log_text_extent(200).height();
@@ -219,50 +136,51 @@ fn clipped_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
     out
 }
 
-/// The model-download dialog draws its byte count somewhere it fits.
-///
-/// It did not: the count was the progress bar's own text, and the bar is six
-/// points tall to match the hairlines elsewhere in the window, so egui clipped
-/// a fourteen-point string into it. The fix moves the count out of the bar,
-/// and this is what says it stayed out.
+/// A model download shows in the drop zone, with its byte count and figure,
+/// and offers no file button while it runs.
 #[test]
-fn the_download_dialog_does_not_clip_its_own_text() {
-    let ctx = egui::Context::default();
+fn a_model_download_shows_in_the_drop_zone() {
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let motion = super::globe::Motion::default();
 
-    let shapes = frame(&ctx, None, false, |ui| {
-        super::header::downloading(
-            ui,
-            crate::models::Preset::Quality,
-            "bs_roformer_viperx.safetensors",
-            6_000_000,
-            639_109_056,
-            &palette,
-        );
-    });
+    let mut build = |ui: &mut egui::Ui| {
+        let _ = super::dropzone::Zone {
+            palette: &palette,
+            brushes: &brushes,
+            motion: &motion,
+            armed: false,
+            current: None,
+            parts: crate::settings::DropParts::DEFAULT,
+            batch: super::dropzone::Batch::default(),
+            note: None,
+            maxed: false,
+            switch: Some(super::dropzone::Switch::Downloading {
+                preset: crate::models::Preset::Quality,
+                file: "stemd_roformer.safetensors",
+                done: 6_000_000,
+                total: 639_109_056,
+            }),
+            intro: None,
+        }
+        .show(ui);
+    };
+    frame(&ctx, None, false, &mut build);
+    let shapes = frame(&ctx, None, false, &mut build);
 
     let clipped = clipped_text(&shapes);
+    assert!(clipped.is_empty(), "clipped text: {clipped:?}");
+    let drawn = drawn_text(&shapes);
+    for want in ["Downloading the Quality model", "639 MB", "0%"] {
+        assert!(
+            drawn.iter().any(|t| t.contains(want)),
+            "{want:?} is not drawn: {drawn:?}"
+        );
+    }
     assert!(
-        clipped.is_empty(),
-        "text is drawn taller than the region it is clipped to: {clipped:?}"
-    );
-
-    // And the count is actually on screen, rather than absent and therefore
-    // trivially unclipped.
-    let drawn: Vec<String> = shapes
-        .iter()
-        .filter_map(|c| match &c.shape {
-            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        drawn.iter().any(|t| t.contains("639 MB")),
-        "the byte count is not drawn at all: {drawn:?}"
-    );
-    assert!(
-        drawn.iter().any(|t| t.contains("0%")),
-        "the percentage is not drawn at all: {drawn:?}"
+        !drawn.iter().any(|t| t == "Choose a file"),
+        "the file button shows during a download"
     );
 }
 
@@ -280,8 +198,10 @@ fn drawn_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
 /// The first-run download shows its model, its progress, and fits.
 #[test]
 fn the_startup_download_shows_its_progress() {
-    let ctx = egui::Context::default();
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let mut view = super::starting::View::default();
     let stage = crate::launch::Stage::Downloading {
         preset: crate::models::Preset::Fast,
         file: "htdemucs.safetensors".into(),
@@ -290,7 +210,7 @@ fn the_startup_download_shows_its_progress() {
     };
 
     let shapes = frame(&ctx, None, false, |ui| {
-        let _ = super::starting::body(ui, &stage, &palette);
+        let _ = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
     });
 
     let clipped = clipped_text(&shapes);
@@ -304,16 +224,48 @@ fn the_startup_download_shows_its_progress() {
     }
 }
 
+/// Without the model rows, the globe and the text under it sit in the middle.
+#[test]
+fn checking_the_model_at_startup_is_centred() {
+    let ctx = themed();
+    let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let mut view = super::starting::View::default();
+    let stage = crate::launch::Stage::Verifying(crate::models::Preset::Quality);
+
+    let shapes = frame(&ctx, None, false, |ui| {
+        let _ = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
+    });
+    let title = shapes
+        .iter()
+        .find_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t)
+                if t.galley.text() == "Checking downloaded Quality model" =>
+            {
+                Some(t.pos.y)
+            }
+            _ => None,
+        })
+        .expect("the title");
+    let height = screen().height();
+    assert!(
+        title > height * 0.45 && title < height * 0.65,
+        "the title sits at {title:.0} of {height:.0} points"
+    );
+}
+
 /// A first run offers every preset with its download size, and a click picks one.
 #[test]
 fn a_first_run_offers_every_model_and_picks_the_clicked_one() {
-    let ctx = egui::Context::default();
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let mut view = super::starting::View::default();
     let stage = crate::launch::Stage::Choosing(vec![crate::models::Preset::Balanced]);
 
     let mut picked = None;
     let shapes = frame(&ctx, None, false, |ui| {
-        picked = super::starting::body(ui, &stage, &palette);
+        picked = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
     });
     assert_eq!(picked, None, "nothing was clicked");
     let drawn = drawn_text(&shapes);
@@ -324,10 +276,7 @@ fn a_first_run_offers_every_model_and_picks_the_clicked_one() {
         );
     }
     assert!(drawn.iter().any(|t| t == "installed"), "{drawn:?}");
-    assert!(
-        drawn.iter().any(|t| t.ends_with("MB download")),
-        "{drawn:?}"
-    );
+    assert!(drawn.iter().any(|t| t.ends_with(" MB")), "{drawn:?}");
 
     // Click the middle of the first button, found by its label.
     let at = shapes
@@ -341,10 +290,10 @@ fn a_first_run_offers_every_model_and_picks_the_clicked_one() {
         .expect("the Fast button");
     // A press and release need a frame with the pointer already there.
     frame(&ctx, Some(at), false, |ui| {
-        let _ = super::starting::body(ui, &stage, &palette);
+        let _ = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
     });
     frame(&ctx, Some(at), true, |ui| {
-        picked = super::starting::body(ui, &stage, &palette);
+        picked = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
     });
     assert_eq!(picked, Some(crate::models::Preset::Fast));
 }
@@ -352,16 +301,18 @@ fn a_first_run_offers_every_model_and_picks_the_clicked_one() {
 /// A failed startup says why and offers a way out.
 #[test]
 fn a_failed_startup_shows_the_error_and_a_quit_button() {
-    let ctx = egui::Context::default();
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let mut view = super::starting::View::default();
     let stage = crate::launch::Stage::Failed("fetching the model: GET https://x: timed out".into());
 
     let shapes = frame(&ctx, None, false, |ui| {
-        let _ = super::starting::body(ui, &stage, &palette);
+        let _ = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
     });
 
     let drawn = drawn_text(&shapes);
-    for want in ["stemd could not start", "timed out", "Quit"] {
+    for want in ["Stemd could not start", "timed out", "Quit"] {
         assert!(
             drawn.iter().any(|t| t.contains(want)),
             "{want:?} is not drawn: {drawn:?}"
@@ -398,70 +349,86 @@ fn the_percentage_beside_a_bar_is_honest_and_fits() {
     }
 }
 
-/// The horizontal extent of everything drawn, ignoring the backdrop egui paints
-/// across the whole panel.
-fn drawn_extent(shapes: &[egui::epaint::ClippedShape], within: egui::Rect) -> Option<(f32, f32)> {
-    fn walk(shape: &egui::epaint::Shape, within: egui::Rect, out: &mut Vec<egui::Rect>) {
+/// Rectangles drawn, at any depth.
+fn rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+    fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::Rect>) {
         match shape {
-            egui::epaint::Shape::Rect(r) => {
-                // Anything spanning the full width is the background, not
-                // content, and would make every layout look centred.
-                if r.rect.width() < within.width() - 1.0 && r.rect.width() > 0.0 {
-                    out.push(r.rect);
-                }
-            }
-            egui::epaint::Shape::Text(t) => out.push(t.galley.rect.translate(t.pos.to_vec2())),
-            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, within, out)),
+            egui::epaint::Shape::Rect(r) => out.push(r.rect),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
             _ => {}
         }
     }
-    let mut rects = Vec::new();
+    let mut out = Vec::new();
     for clipped in shapes {
-        walk(&clipped.shape, within, &mut rects);
+        walk(&clipped.shape, &mut out);
     }
-    let left = rects.iter().map(|r| r.left()).fold(f32::MAX, f32::min);
-    let right = rects.iter().map(|r| r.right()).fold(f32::MIN, f32::max);
-    (left <= right).then_some((left, right))
+    out
 }
 
-/// The drop zone's bar and its figure sit centred, as one row.
+/// A working drop shows its title, its stage and a bar centred under them.
 ///
-/// Wrapping the pair in a plain `ui.horizontal` gives it the whole available width,
-/// so its contents start hard against the left edge while the title and caption
-/// stay centred. A test that only asks whether the text fits cannot see that.
+/// The bar and its figure are one row: centring the bar alone would push the row
+/// right by half the figure's width.
 #[test]
-fn the_drop_zone_progress_row_is_centred() {
-    let ctx = egui::Context::default();
+fn the_drop_zone_progress_bar_is_centred() {
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let motion = super::globe::Motion::default();
+    let item = crate::drops::Dropped::working(
+        "Bells Of Eternity",
+        stemd_core::Progress {
+            stage: stemd_core::Stage::Separating,
+            completed: 7,
+            total: 24,
+            fraction: 0.31,
+            detail: None,
+        },
+    );
 
-    let shapes = frame(&ctx, None, false, |ui| {
-        let width = ui.available_width();
-        let mut centred = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_size(
-                    ui.min_rect().min,
-                    egui::vec2(width, 60.0),
-                ))
-                .layout(egui::Layout::top_down(egui::Align::Center)),
+    let mut zone_rect = egui::Rect::NOTHING;
+    let mut build = |ui: &mut egui::Ui| {
+        zone_rect = ui.available_rect_before_wrap();
+        let _ = super::dropzone::Zone {
+            palette: &palette,
+            brushes: &brushes,
+            motion: &motion,
+            armed: false,
+            current: Some(&item),
+            parts: crate::settings::DropParts::DEFAULT,
+            batch: super::dropzone::Batch::default(),
+            note: None,
+            maxed: false,
+            switch: None,
+            intro: None,
+        }
+        .show(ui);
+    };
+    frame(&ctx, None, false, &mut build);
+    let shapes = frame(&ctx, None, false, &mut build);
+
+    let drawn = drawn_text(&shapes);
+    for want in [
+        "Bells Of Eternity",
+        "separating · 7/24",
+        "31%",
+        "Queue another track",
+    ] {
+        assert!(
+            drawn.iter().any(|t| t == want),
+            "{want:?} is not drawn: {drawn:?}"
         );
-        super::dropzone::progress_row(&mut centred, Some(0.31), &palette);
-    });
+    }
 
-    let bounds = screen();
-    let (left, right) = drawn_extent(&shapes, bounds).expect("the row drew something");
-    let before = left - bounds.left();
-    let after = bounds.right() - right;
-
-    //  The row is allocated at exactly its own width and centred by the enclosing
-    //  layout, so what is left is ink: the figure keeps a fixed 34-point box so the bar
-    //  does not twitch as the number goes from one digit to three.
-    //
-    //  Measured: 79 and 85 with the row allocated, 0 and 164 without.
-    let slack = super::dropzone::PERCENT_WIDTH / 2.0;
+    let track = rects(&shapes)
+        .into_iter()
+        .find(|r| (r.width() - 260.0).abs() < 0.5 && (r.height() - 8.0).abs() < 0.5)
+        .expect("the progress track");
+    let before = track.left() - zone_rect.left();
+    let after = zone_rect.right() - track.right();
     assert!(
-        (before - after).abs() <= slack,
-        "the row is not centred: {before:.0} points of space on the left, \
-         {after:.0} on the right"
+        (before - after).abs() <= 1.0,
+        "the bar is not centred: {before:.1} points on the left, {after:.1} on the right"
     );
 }
 
@@ -473,12 +440,12 @@ fn the_drop_zone_progress_row_is_centred() {
 /// cannot be closed at all except by quitting the process another way.
 #[test]
 fn the_quit_confirmation_offers_both_answers() {
-    let ctx = egui::Context::default();
-    super::theme::install(&ctx);
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
 
     let shapes = frame(&ctx, None, false, |ui| {
-        super::quit::dialog(ui, &palette, "Bells Of Eternity.flac");
+        super::quit::dialog(ui, &palette, &brushes, "Bells Of Eternity.flac");
     });
 
     let drawn: Vec<String> = shapes
@@ -516,11 +483,9 @@ fn the_quit_confirmation_offers_both_answers() {
 /// list that reports twelve rows tall grows the window whether or not it paints
 /// them.
 fn recents_height(rows: usize) -> f32 {
-    let ctx = egui::Context::default();
-    frame(&ctx, None, false, |_| {});
-    super::theme::install(&ctx);
+    let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
-    let mut sheen = super::theme::Sheen::new(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
 
     let drops = crate::drops::Drops::default();
     let dir = std::path::Path::new("/Music/track-stems");
@@ -531,7 +496,9 @@ fn recents_height(rows: usize) -> f32 {
     let mut height = 0.0;
     let mut build = |ui: &mut egui::Ui| {
         height = ui
-            .scope(|ui| super::recents::list(ui, &palette, &mut sheen, &drops, &items))
+            .scope(|ui| {
+                super::recents::list(ui, &palette, &brushes, &drops, &items, visible_cap());
+            })
             .response
             .rect
             .height();
@@ -542,12 +509,7 @@ fn recents_height(rows: usize) -> f32 {
     height
 }
 
-/// A full list must stop growing at the cap.
-///
-/// It had no cap at all: every separated track added forty points to the
-/// sections panel, `match_window_to` handed each one to the window, and twelve
-/// drops, the most the list remembers, took a 470-point window past 1000 and
-/// off the bottom of the screen.
+/// A full list stops at the room it is given.
 #[test]
 fn a_long_separated_list_stops_at_the_cap() {
     let drawn = recents_height(crate::drops::REMEMBERED);
@@ -558,7 +520,7 @@ fn a_long_separated_list_stops_at_the_cap() {
     );
 }
 
-/// And the other direction: two rows must not be stretched to fill the cap.
+/// And two rows are not stretched to fill it.
 #[test]
 fn a_short_separated_list_stays_short() {
     let drawn = recents_height(2);
@@ -569,15 +531,105 @@ fn a_short_separated_list_stays_short() {
     );
 }
 
-/// The cap [`super::recents`] applies, read through the same theme the tests
-/// draw under.
+/// The room the list is given in these probes: three and a half rows.
 fn visible_cap() -> f32 {
-    let ctx = egui::Context::default();
-    frame(&ctx, None, false, |_| {});
-    super::theme::install(&ctx);
-    let mut cap = 0.0;
-    frame(&ctx, None, false, |ui| {
-        cap = super::recents::visible_height(ui)
-    });
-    cap
+    super::recents::ROW_HEIGHT * 3.5
+}
+
+/// Every non-ASCII character the window draws as text has a glyph in the fonts
+/// it binds. A missing glyph draws nothing at all, so this fails silently on
+/// screen.
+#[test]
+fn the_marks_drawn_as_text_have_glyphs() {
+    use super::theme::{Weight, font};
+    let ctx = themed();
+    for weight in [Weight::Regular, Weight::Medium, Weight::Semibold] {
+        for c in ['·', '…'] {
+            let id = font(13.0, weight);
+            assert!(
+                ctx.fonts_mut(|f| f.has_glyph(&id, c)),
+                "{c:?} (U+{:04X}) has no glyph at {weight:?}",
+                c as u32
+            );
+        }
+    }
+}
+
+/// Milliseconds of CPU per frame for the drop zone, building and tessellating.
+///
+/// `cargo test --release -p stemd-server frame_cost -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn frame_cost() {
+    let ctx = themed();
+    let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let item = crate::drops::Dropped::working(
+        "Bells Of Eternity",
+        stemd_core::Progress {
+            stage: stemd_core::Stage::Separating,
+            completed: 7,
+            total: 24,
+            fraction: 0.31,
+            detail: None,
+        },
+    );
+    for (name, working) in [("idle", false), ("working", true)] {
+        let mut motion = super::globe::Motion::default();
+        let drive = super::globe::Drive {
+            variant: working.then_some(2),
+            speed: 1.0,
+            spin: working.then_some(4.5),
+        };
+        let frames = 600;
+        let mut spent = std::time::Duration::ZERO;
+        for n in 0..frames {
+            let now = f64::from(n) / 60.0;
+            motion.step(1.0 / 60.0, now, &drive);
+            let input = egui::RawInput {
+                screen_rect: Some(screen()),
+                time: Some(now),
+                ..Default::default()
+            };
+            let start = std::time::Instant::now();
+            let output = ctx.run_ui(input, |ui| {
+                brushes.backdrop(ui.painter(), ui.max_rect());
+                let _ = super::dropzone::Zone {
+                    palette: &palette,
+                    brushes: &brushes,
+                    motion: &motion,
+                    armed: false,
+                    current: working.then_some(&*item),
+                    parts: crate::settings::DropParts::DEFAULT,
+                    batch: super::dropzone::Batch::default(),
+                    note: None,
+                    maxed: true,
+                    switch: None,
+                    intro: None,
+                }
+                .show(ui);
+            });
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            if n >= 60 {
+                spent += start.elapsed();
+            }
+            if n == frames - 1 {
+                let vertices: usize = primitives
+                    .iter()
+                    .map(|p| match &p.primitive {
+                        egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                        egui::epaint::Primitive::Callback(_) => 0,
+                    })
+                    .sum();
+                println!(
+                    "{name}: {} primitives, {vertices} vertices",
+                    primitives.len()
+                );
+            }
+        }
+        println!(
+            "{name}: {:.3} ms per frame",
+            spent.as_secs_f64() * 1000.0 / f64::from(frames - 60)
+        );
+    }
 }

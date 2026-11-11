@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use stemd_core::{
@@ -17,7 +18,6 @@ use stemd_core::{
 use crate::api::AppState;
 use crate::cache::{self, Cache};
 use crate::cli::Args;
-use crate::discovery::Advertiser;
 use crate::jobs::JobStore;
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
@@ -79,8 +79,13 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
     let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
     log_model(&info, precisions, args.max_track_secs(), max_upload);
 
-    // Built before the app state so every exit path can reach it.
-    let advertiser = advertise(args, &info, addr.port());
+    // Built before the app state so every exit path can reach it. Headless
+    // there is no switch to turn it back on, so it always serves.
+    let serving = crate::serving::Serving::new(
+        args.headless || settings.get().serving,
+        announce(args, addr.port()),
+        &info.model,
+    );
 
     // Both identities, once, at debug. The next time the published one moves
     // when it should not, the question is which field did it, and that is not
@@ -116,7 +121,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
             drops: Arc::default(),
             settings,
             max_track_secs: args.max_track_secs(),
-            advertiser,
+            serving,
         }),
         max_upload,
         cache_summary,
@@ -466,10 +471,7 @@ fn joined(dirs: &[PathBuf]) -> String {
 }
 
 fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
-    let root = match args.cache_dir.clone() {
-        Some(dir) => dir,
-        None => cache::default_dir()?,
-    };
+    let root = cache::root(args)?;
     let max_bytes = args.cache_max_bytes();
     let cache = Cache::new(root.clone(), max_bytes, args.unfetched_ttl())
         .with_context(|| format!("preparing the stem cache in {}", root.display()))?;
@@ -501,62 +503,64 @@ fn open_pieces(args: &Args) -> Result<Arc<crate::pieces::Pieces>> {
     Ok(pieces)
 }
 
-/// Announce over mDNS unless asked not to.
-///
-/// Discovery is a convenience, not a precondition: a client with the address
-/// configured out of band still works, so a failure here is a warning.
-fn advertise(args: &Args, info: &stemd_core::BackendInfo, port: u16) -> Option<Arc<Advertiser>> {
+/// The name and port to announce over mDNS, unless asked not to.
+fn announce(args: &Args, port: u16) -> Option<(String, u16)> {
     if args.no_mdns {
         tracing::info!("mDNS advertisement disabled");
         return None;
     }
-    match Advertiser::start(&args.instance, port, &info.model) {
-        Ok(advertiser) => Some(Arc::new(advertiser)),
-        Err(err) => {
-            tracing::warn!("could not advertise over mDNS: {err:#}");
-            None
-        }
-    }
+    Some((args.instance.clone(), port))
 }
 
 /// Run the cache rules on a timer, drop job handles they invalidate, and hand
-/// MLX's allocator cache back once the server has stopped separating.
+/// MLX's allocator cache back once the server has been idle for [`IDLE_RELEASE`].
 fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
     let interval = cache.sweep_interval();
     std::thread::Builder::new()
         .name("stemd-reaper".into())
         .spawn(move || {
-            let mut idle_sweeps = 0u32;
+            let mut swept = Instant::now();
+            let mut idle_since: Option<Instant> = None;
+            let mut released = false;
             loop {
-                std::thread::sleep(interval);
-                let reaped = cache.reap();
-                let pruned = store.prune();
-                if reaped.any() {
-                    tracing::info!(
-                        "reaped {} uncollected and rotated {} for space ({:.0} MB), \
-                         dropped {pruned} job handles",
-                        reaped.unfetched,
-                        reaped.rotated,
-                        reaped.bytes as f64 / 1e6
-                    );
+                std::thread::sleep(IDLE_TICK);
+                if swept.elapsed() >= interval {
+                    swept = Instant::now();
+                    let reaped = cache.reap();
+                    let pruned = store.prune();
+                    if reaped.any() {
+                        tracing::info!(
+                            "reaped {} uncollected and rotated {} for space ({:.0} MB), \
+                             dropped {pruned} job handles",
+                            reaped.unfetched,
+                            reaped.rotated,
+                            reaped.bytes as f64 / 1e6
+                        );
+                    }
                 }
-                idle_sweeps = if queue.running().is_some()
-                    || queue.depth() > 0
-                    || !queue.sessions().is_empty()
-                {
-                    0
-                } else {
-                    idle_sweeps + 1
-                };
-                // Two sweeps rather than one, so this is a server that has
-                // stopped rather than one between tracks. The gap between two
-                // tracks costs a fifth of the second one if the cache is empty
-                // when it starts, and that is exactly the case worth not
-                // hitting; see `stemd_core::memory`.
-                if idle_sweeps == IDLE_SWEEPS_BEFORE_RELEASE {
+
+                // Writes stop when the disk is low, so eviction has to run
+                // from here too, or the store never gives space back.
+                if let Some(pieces) = queue.sessions().pieces() {
+                    pieces.evict();
+                }
+
+                let busy =
+                    queue.running().is_some() || queue.depth() > 0 || !queue.sessions().is_empty();
+                if busy {
+                    idle_since = None;
+                    released = false;
+                    continue;
+                }
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                // After a minute idle: the gap between two tracks costs a
+                // fifth of the second one if the cache is empty when it starts;
+                // see `stemd_core::memory`. Once per idle spell.
+                if !released && since.elapsed() >= IDLE_RELEASE {
+                    released = true;
                     let freed = stemd_core::memory::release();
                     if freed > 0 {
-                        tracing::debug!(
+                        tracing::info!(
                             "idle, so returned {:.0} MB of MLX allocator cache; \
                              {:.0} MB still live",
                             freed as f64 / 1e6,
@@ -584,12 +588,11 @@ fn spawn_session_reaper(queue: Arc<Queue>) {
         .expect("spawning the session reaper");
 }
 
-/// Consecutive idle sweeps before MLX's cache is handed back.
-///
-/// Counted rather than compared against a deadline so it scales with the sweep
-/// interval, which is itself derived from `--unfetched-ttl`. Released once per
-/// idle spell: the counter keeps climbing past this and only a job resets it.
-const IDLE_SWEEPS_BEFORE_RELEASE: u32 = 2;
+/// Idle time before MLX's allocator cache is handed back.
+const IDLE_RELEASE: Duration = Duration::from_secs(60);
+
+/// How often the reaper looks at the queue.
+const IDLE_TICK: Duration = Duration::from_secs(5);
 
 /// Bytes the longest permitted track can occupy, at the widest sample format the
 /// API accepts. `f32le`, the larger of the two. This bounds what axum buffers

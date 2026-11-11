@@ -47,6 +47,8 @@ pub fn fetch_one(
     on_progress: &mut impl FnMut(&str, u64, u64),
 ) -> Result<()> {
     tracing::info!("fetching {} ({:.0} MB)", file.name, file.bytes as f64 / 1e6);
+    crate::disk::ensure_room_for(dir, file.bytes)
+        .with_context(|| format!("downloading {}", file.name))?;
 
     let response = ureq::get(file.url)
         .call()
@@ -54,9 +56,16 @@ pub fn fetch_one(
     let total = content_length(&response).unwrap_or(file.bytes);
 
     let partial = dir.join(format!("{}.part", file.name));
-    let (digest, written) = stream_to_file(response.into_body().into_reader(), &partial, |done| {
+    let streamed = stream_to_file(response.into_body().into_reader(), &partial, |done| {
         on_progress(file.name, done, total);
-    })?;
+    });
+    let (digest, written) = match streamed {
+        Ok(done) => done,
+        Err(err) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err);
+        }
+    };
     on_progress(file.name, written, total);
 
     if digest != file.sha256 {

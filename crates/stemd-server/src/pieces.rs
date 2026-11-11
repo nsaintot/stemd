@@ -153,14 +153,22 @@ impl Pieces {
         Ok(())
     }
 
+    /// The directory the pieces live in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Write a piece file through a `.part` and a rename, so a reader never
     /// sees half of one.
     fn write_in(&self, dir: &Path, k: usize, extension: &str, bytes: &[u8]) -> Result<()> {
+        crate::disk::ensure_room(&self.root)?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(file(k, extension));
         let partial = path.with_extension(format!("{extension}.part"));
-        std::fs::write(&partial, bytes)
-            .with_context(|| format!("writing {}", partial.display()))?;
+        if let Err(err) = std::fs::write(&partial, bytes) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err).with_context(|| format!("writing {}", partial.display()));
+        }
         std::fs::rename(&partial, &path)
             .with_context(|| format!("publishing {}", path.display()))?;
         self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -175,6 +183,11 @@ impl Pieces {
         let Some(id) = track.verified() else {
             return;
         };
+        // Pieces are a cache, so a nearly full disk skips them and the job goes on.
+        if crate::disk::low(&self.root) {
+            tracing::debug!(track = %id, "disk nearly full, not writing pieces");
+            return;
+        }
         let stride = track.spec.grid.stride().unsigned_abs() as usize;
         let count = track.spec.grid.len();
         let first = touched.start.saturating_sub(RESAMPLE_CONTEXT) / stride;
@@ -210,15 +223,17 @@ impl Pieces {
         }
     }
 
-    /// Delete the least recently used files until the store is under budget.
-    fn evict(&self) {
-        if self.bytes() <= self.max_bytes {
+    /// Delete the least recently used files until the store is under budget:
+    /// its cap, or less when the disk is short of [`crate::disk::FLOOR`].
+    pub fn evict(&self) {
+        let budget = crate::disk::budget(self.max_bytes, self.bytes(), &self.root);
+        if self.bytes() <= budget {
             return;
         }
         let _held = self.lock.lock();
         let mut all = files(&self.root);
         all.sort_by_key(|(_, _, used)| *used);
-        let target = self.max_bytes / 10 * 9;
+        let target = budget / 10 * 9;
         let mut freed = 0u64;
         for (path, size, _) in all {
             if self.bytes().saturating_sub(freed) <= target {
