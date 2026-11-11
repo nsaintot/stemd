@@ -91,6 +91,6 @@ Write-Host ("done, from {0:N1} MB staged:" -f ($staged / 1MB))
 foreach ($f in $installer, $zip) {
     Write-Host ("  {0,-34} {1,7:N1} MB" -f (Split-Path $f -Leaf), ((Get-Item $f).Length / 1MB))
 }
-Write-Host '  the installer is per user, into %LOCALAPPDATA%\Programs\stemd: no'
+Write-Host '  the installer is per user, into %LOCALAPPDATA%\Programs\Stemd: no'
 Write-Host '  administrator, and install-cuda.cmd can write beside the executable'
 Write-Host '  without one either'

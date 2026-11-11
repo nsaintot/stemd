@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=stemd
+Name=Stemd
 GenericName=Stem separation
 Comment=Separate a track into stems on the GPU
 Exec=stemd-server

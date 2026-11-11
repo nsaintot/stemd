@@ -168,6 +168,9 @@ pub struct Entry {
     /// Set when the cache deletes this entry's directory, so a job holding the
     /// last reference can tell that its stems are gone.
     evicted: AtomicBool,
+    /// Set once [`Cache::get`] or a stem download gives the entry to a caller,
+    /// so a drop that made it does not delete it from under them.
+    handed_out: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -190,6 +193,11 @@ impl Entry {
 
     pub fn evicted(&self) -> bool {
         self.evicted.load(Ordering::SeqCst)
+    }
+
+    /// Record that a client outside the window has the entry. See `handed_out`.
+    pub fn hand_out(&self) {
+        self.handed_out.store(true, Ordering::SeqCst);
     }
 
     /// Record that `name` was pulled, and restart the idle clock.
@@ -258,6 +266,8 @@ pub struct Cache {
     /// Makes staging directory names unique. The worker is serialised today, so
     /// two publishes cannot overlap, this keeps that from being load-bearing.
     seq: AtomicU64,
+    /// Whether the cap shrinks to keep [`crate::disk::FLOOR`] free.
+    disk_aware: AtomicBool,
 }
 
 /// Where entries live when no directory is configured.
@@ -284,6 +294,40 @@ pub fn default_dir() -> Result<PathBuf> {
     })
 }
 
+/// The cache root `args` names, or [`default_dir`].
+pub fn root(args: &crate::cli::Args) -> Result<PathBuf> {
+    match args.cache_dir.clone() {
+        Some(dir) => Ok(dir),
+        None => default_dir(),
+    }
+}
+
+/// The lock file in the cache root, which the startup clear keeps.
+const LOCK_FILE: &str = "stemd.lock";
+
+/// Lock `root` for this process, or fail if another stemd holds it, whatever
+/// port that one serves on. The system releases the lock when the process ends.
+pub fn lock(root: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let path = root.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another stemd is already running with its cache in {}",
+            root.display()
+        ),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
 impl Cache {
     /// Prepare `root`, discarding whatever a previous run left behind.
     ///
@@ -300,6 +344,7 @@ impl Cache {
             max_bytes,
             unfetched_ttl,
             seq: AtomicU64::new(0),
+            disk_aware: AtomicBool::new(true),
         }))
     }
 
@@ -316,6 +361,7 @@ impl Cache {
             let entries = self.entries.lock();
             let entry = entries.get(key).cloned()?;
             entry.touch();
+            entry.hand_out();
             entry
         };
 
@@ -354,6 +400,21 @@ impl Cache {
         (tracks, freed)
     }
 
+    /// Delete `entry` and its stems now, unless it was replaced under its key or
+    /// [`Cache::get`] has handed it to anyone. Returns whether it went.
+    pub fn discard_unshared(&self, entry: &Arc<Entry>) -> bool {
+        let mut entries = self.entries.lock();
+        let ours = entries
+            .get(&entry.key)
+            .is_some_and(|held| Arc::ptr_eq(held, entry));
+        if !ours || entry.handed_out.load(Ordering::SeqCst) {
+            return false;
+        }
+        entries.remove(&entry.key);
+        self.delete(entry);
+        true
+    }
+
     /// One consistent snapshot, rather than three locks that can disagree.
     pub fn stats(&self) -> Stats {
         let entries = self.entries.lock();
@@ -387,8 +448,16 @@ impl Cache {
 
         let dir = self.root.join(key);
         let staging = self.staging_dir(key)?;
-        let files = write_stems(&staging, &dir, &shipped, output.format)?;
-        install(&staging, &dir)?;
+        let written = write_stems(&staging, &dir, &shipped, output.format)
+            .and_then(|files| install(&staging, &dir).map(|()| files));
+        let files = match written {
+            Ok(files) => files,
+            Err(err) => {
+                // A half-written entry would hold its bytes until the next start.
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
+            }
+        };
 
         let entry = Arc::new(Entry {
             key: key.to_owned(),
@@ -405,6 +474,7 @@ impl Cache {
             derived: output.parts.derived(),
             separation_secs,
             evicted: AtomicBool::new(false),
+            handed_out: AtomicBool::new(false),
             state: Mutex::new(State {
                 unfetched: shipped.iter().map(|(name, _)| (*name).to_owned()).collect(),
                 last_used: Instant::now(),
@@ -481,13 +551,36 @@ impl Cache {
     /// the store under it, so waiting for the cap would make rule 1 nearly
     /// unreachable.
     fn under_pressure(&self, entries: &HashMap<String, Arc<Entry>>) -> bool {
-        total_bytes(entries) > self.max_bytes / 2
+        let total = total_bytes(entries);
+        total > self.budget(total) / 2
+    }
+
+    /// The cap, or less when the disk is short of [`crate::disk::FLOOR`].
+    fn budget(&self, total: u64) -> u64 {
+        if self.disk_aware.load(Ordering::Relaxed) {
+            crate::disk::budget(self.max_bytes, total, &self.root)
+        } else {
+            self.max_bytes
+        }
+    }
+
+    /// Hold to the cap alone, whatever the disk has free, so tests do not
+    /// depend on the machine running them.
+    #[cfg(test)]
+    pub fn ignore_disk(&self) {
+        self.disk_aware.store(false, Ordering::Relaxed);
+    }
+
+    /// The directory the stems live in.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Drop least-recently-used entries until the store fits.
     fn enforce_cap(&self, entries: &mut HashMap<String, Arc<Entry>>) -> (usize, u64) {
         let mut total = total_bytes(entries);
-        if total <= self.max_bytes {
+        let budget = self.budget(total);
+        if total <= budget {
             return (0, 0);
         }
 
@@ -504,7 +597,7 @@ impl Cache {
         let mut count = 0;
         let mut freed = 0;
         for (_, key) in order {
-            if total <= self.max_bytes {
+            if total <= budget {
                 break;
             }
             if let Some(entry) = entries.remove(&key) {
@@ -534,6 +627,9 @@ impl Cache {
 fn clear_contents(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == LOCK_FILE) {
+            continue;
+        }
         if path.is_dir() {
             std::fs::remove_dir_all(&path)?;
         } else {
@@ -724,6 +820,19 @@ mod tests {
 
     use crate::testkit::{cache, publish};
 
+    #[test]
+    fn a_second_lock_on_the_same_root_fails_and_survives_the_startup_clear() {
+        let root = std::env::temp_dir().join(format!("stemd-lock-test-{}", std::process::id()));
+        let held = lock(&root).unwrap();
+        let err = lock(&root).unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err:#}");
+        clear_contents(&root).unwrap();
+        assert!(root.join(LOCK_FILE).exists());
+        drop(held);
+        lock(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A 200 must be followed by stems the client can actually download.
     ///
     /// The TTL is zero so every published entry is collectable at once; a nonzero one
@@ -816,6 +925,30 @@ mod tests {
         //  staging directory survives, and `Cache::new` clears those at startup.
         assert!(cache.get("diverged").is_none());
         assert_eq!(cache.stats().tracks, 0);
+    }
+
+    /// What a drop does once its stems are copied out: that entry goes, others stay.
+    #[test]
+    fn discarding_takes_one_entry_and_its_stems() {
+        let cache = cache(u64::MAX, Duration::from_secs(60));
+        let dropped = publish(&cache, "dropped", 64, 1.0);
+        let kept = publish(&cache, "kept", 32, 1.0);
+
+        assert!(cache.discard_unshared(&dropped));
+        assert!(!dropped.dir.exists() && dropped.evicted());
+        assert!(cache.get(&dropped.key).is_none());
+        assert!(kept.dir.exists() && cache.get(&kept.key).is_some());
+        assert_eq!(cache.stats().tracks, 1);
+    }
+
+    /// An entry someone was handed by a hit stays, whoever made it.
+    #[test]
+    fn an_entry_handed_out_is_not_discarded() {
+        let cache = cache(u64::MAX, Duration::from_secs(60));
+        let made = publish(&cache, "shared", 64, 1.0);
+        let _hit = cache.get(&made.key).expect("a hit");
+        assert!(!cache.discard_unshared(&made));
+        assert!(made.dir.exists());
     }
 
     #[test]

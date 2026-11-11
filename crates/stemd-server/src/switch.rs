@@ -388,6 +388,7 @@ mod tests {
                         parts: stemd_core::Parts::DEFAULT,
                     },
                     model_id: "test".into(),
+                    from_api: true,
                 })
                 .expect("queue has room");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);

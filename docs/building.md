@@ -16,8 +16,8 @@ the fix for a clone that forgot. It is a fork rather than a version because
 0.25.3 and 0.2.0 are the newest published `mlx-rs` and `mlx-sys`, and neither
 declares a CUDA feature.
 
-Everywhere: `cmake` on `PATH`, and a Rust new enough for edition 2024, so 1.85
-or later. MLX builds from source on the first `cargo build`.
+Everywhere: `cmake` on `PATH`, and Rust 1.89 or later. MLX builds from source on
+the first `cargo build`.
 
 ## Per platform
 
@@ -88,7 +88,7 @@ one compiles and then finds no execution plan for any graph at run time.
 ## Packaging
 
 ```bash
-./scripts/bundle-app.sh          # macOS: dist/stemd.app, about 29 MB
+./scripts/bundle-app.sh          # macOS: dist/Stemd.app, about 29 MB
 ./scripts/bundle.sh              # macOS: a signed, notarized, stapled .dmg
 ./scripts/bundle-windows.ps1     # Windows: dist/stemd-windows
 ./scripts/package-windows.ps1    # Windows: an installer and a zip
@@ -103,10 +103,10 @@ released artefacts use the lists in `packaging/mlx-prebuilt.env`; five
 architectures take about two and a half hours on sixteen cores.
 
 The Windows installer offers both modes. Just for me, into
-`%LOCALAPPDATA%\Programs\stemd`, is the default; for all users goes to Program
-Files. `Programs\stemd` rather than `stemd` because `%LOCALAPPDATA%\stemd` is
-where the program keeps its weights and its cache, and an uninstaller pointed at
-that directory would take a gigabyte of downloads with it.
+`%LOCALAPPDATA%\Programs\Stemd`, is the default; for all users goes to Program
+Files. It is under `Programs` because `%LOCALAPPDATA%\stemd` is where the
+program keeps its weights and its cache, and an uninstaller pointed at that
+directory would take a gigabyte of downloads with it.
 
 CUDA is what the two modes actually differ in. `install-cuda.cmd` writes about
 1.2 GB beside the executable, which a per-user install can do and Program Files

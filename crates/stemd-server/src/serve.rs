@@ -14,18 +14,8 @@ use crate::cli::Args;
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 
-/// Take the port, before anything else is done.
-///
-/// Called ahead of [`crate::startup::prepare`], which is the point of it being
-/// separate from [`headless`] and [`windowed`]. Two things follow.
-///
-/// A second launch fails here, in milliseconds, instead of after the model is
-/// loaded, which was four seconds on a warm CUDA machine and over a minute on a
-/// CPU-only one.
-///
-/// And it fails before [`crate::cache::Cache::new`] clears the cache root. Two
-/// instances share a root by default, so the second used to empty the first's
-/// cache on its way to discovering it was the second.
+/// Take the port before [`crate::startup::prepare`] loads the model, so a port
+/// in use fails in milliseconds.
 ///
 /// Non-blocking because tokio requires it of a listener adopted from std, and
 /// doing it here means [`listen`] cannot forget to.

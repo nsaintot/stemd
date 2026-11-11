@@ -1,7 +1,8 @@
 //! Preferences the window changes and the next launch remembers.
 //!
-//! Three choices are worth persisting: which model loads, and the output format
-//! and sample rate a client gets when it does not ask for one.
+//! Persisted: which model loads, the output format and sample rate a client gets
+//! when it does not ask for one, the parts a drop writes, and whether the server
+//! answers.
 //!
 //! Precedence is flag, then file, then built-in default. A flag is for one run and
 //! is never written back, so a launch script that pins `--output-format f32le`
@@ -33,6 +34,9 @@ pub struct Settings {
     pub rate: OutputRate,
     /// Parts a dropped track writes beside it. Jobs over HTTP name their own.
     pub drop_parts: DropParts,
+    /// Whether the HTTP API answers. The window has a switch; headless always
+    /// serves.
+    pub serving: bool,
 }
 
 /// Which parts a drop writes.
@@ -127,6 +131,7 @@ impl Default for Settings {
             format: StemFormat::Flac,
             rate: OutputRate::default(),
             drop_parts: DropParts::DEFAULT,
+            serving: true,
         }
     }
 }
@@ -148,6 +153,7 @@ struct Stored {
     output_sample_rate: Option<u32>,
     /// Comma-separated, as [`DropParts`] prints it.
     drop_parts: Option<String>,
+    serving: Option<bool>,
 }
 
 impl Stored {
@@ -157,6 +163,7 @@ impl Stored {
             output_format: Some(settings.format.to_string()),
             output_sample_rate: Some(settings.rate.hz()),
             drop_parts: Some(settings.drop_parts.to_string()),
+            serving: Some(settings.serving),
         }
     }
 
@@ -201,6 +208,9 @@ impl Stored {
                 Some(parts) => settings.drop_parts = parts,
                 None => warn_ignored("drop_parts", &list, &settings.drop_parts.to_string()),
             }
+        }
+        if let Some(serving) = self.serving {
+            settings.serving = serving;
         }
         settings.reconcile();
         settings
@@ -309,6 +319,10 @@ impl SettingsStore {
 
     pub fn set_drop_parts(&self, parts: DropParts) {
         self.write(|s| s.drop_parts = parts);
+    }
+
+    pub fn set_serving(&self, serving: bool) {
+        self.write(|s| s.serving = serving);
     }
 
     pub fn set_rate(&self, rate: OutputRate) {

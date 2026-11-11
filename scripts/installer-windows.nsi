@@ -1,10 +1,10 @@
 ; The Windows installer, built from a staged bundle by package-windows.ps1.
 ;
 ; Two modes, chosen on the first page. Just for me, into
-; %LOCALAPPDATA%\Programs\stemd, is the default and needs no administrator. For
+; %LOCALAPPDATA%\Programs\Stemd, is the default and needs no administrator. For
 ; all users goes to Program Files and does.
 ;
-; The per-user directory has to be `Programs\stemd` and not `stemd`, because
+; The per-user directory has to be `Programs\Stemd` and not `Stemd`, because
 ; %LOCALAPPDATA%\stemd is where the program keeps its weights and its cache, and
 ; an uninstaller pointed at that directory would take a gigabyte the user
 ; downloaded with it. MultiUser resolves FOLDERID_UserProgramFiles, so that is
@@ -37,7 +37,7 @@ SetCompressor /SOLID lzma
   !error "ICON is not defined; it names the .ico to brand this with"
 !endif
 
-!define NAME "stemd"
+!define NAME "Stemd"
 !define PUBLISHER "nsaintot"
 !define HOMEPAGE "https://github.com/nsaintot/stemd"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\stemd"
@@ -73,7 +73,7 @@ VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "${NAME}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}.0"
-VIAddVersionKey "FileDescription" "stemd installer"
+VIAddVersionKey "FileDescription" "Stemd installer"
 VIAddVersionKey "CompanyName" "${PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 
@@ -82,7 +82,7 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 !define MUI_ABORTWARNING
 
 !define MUI_FINISHPAGE_RUN
-!define MUI_FINISHPAGE_RUN_TEXT "Start stemd"
+!define MUI_FINISHPAGE_RUN_TEXT "Start Stemd"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchStemd
 !define MUI_FINISHPAGE_LINK "github.com/nsaintot/stemd"
 !define MUI_FINISHPAGE_LINK_LOCATION "${HOMEPAGE}"
@@ -114,7 +114,7 @@ Function WriteElevatingCudaCmd
   FileWrite $0 "@echo off$\r$\n"
   FileWrite $0 "rem Fetch the CUDA runtime beside stemd-server.exe. About 1.2 GB,$\r$\n"
   FileWrite $0 "rem once, and only useful on a machine with an NVIDIA card. This copy$\r$\n"
-  FileWrite $0 "rem of stemd is installed for all users, so the libraries land where$\r$\n"
+  FileWrite $0 "rem of Stemd is installed for all users, so the libraries land where$\r$\n"
   FileWrite $0 "rem writing needs an administrator.$\r$\n"
   FileWrite $0 "net session >nul 2>&1$\r$\n"
   FileWrite $0 "if errorlevel 1 ($\r$\n"
@@ -126,7 +126,7 @@ Function WriteElevatingCudaCmd
   FileClose $0
 FunctionEnd
 
-Section "stemd" SecMain
+Section "Stemd" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   ; Overwritten in place rather than uninstalled first: a previous install may
@@ -140,7 +140,11 @@ Section "stemd" SecMain
   ${EndIf}
 
   ; SHCTX and $SMPROGRAMS both follow the mode, so this is the all-users Start
-  ; menu for an all-users install and this account's for the other.
+  ; menu for an all-users install and this account's for the other. Removed
+  ; first: Windows keeps a name's old case when a file is overwritten, so an
+  ; upgrade would keep the lowercase shortcut.
+  Delete "$SMPROGRAMS\${NAME}\${NAME}.lnk"
+  RMDir  "$SMPROGRAMS\${NAME}"
   CreateDirectory "$SMPROGRAMS\${NAME}"
   CreateShortCut "$SMPROGRAMS\${NAME}\${NAME}.lnk" "$INSTDIR\stemd-server.exe" \
     "" "$INSTDIR\stemd-server.exe" 0
@@ -171,20 +175,20 @@ SectionEnd
 ; difference is a separation in seconds instead of minutes. A failed download
 ; leaves a working program on the CPU and the script to try again.
 Section "GPU support (CUDA runtime, 1.2 GB download)" SecCuda
-  DetailPrint "Fetching the CUDA runtime beside stemd, about 1.2 GB..."
+  DetailPrint "Fetching the CUDA runtime beside Stemd, about 1.2 GB..."
   nsExec::ExecToLog '"$INSTDIR\stemd-server.exe" --install-cuda'
   Pop $0
   ${If} $0 != 0
-    DetailPrint "The CUDA runtime could not be fetched (exit $0); stemd runs on the CPU until install-cuda.cmd is run."
+    DetailPrint "The CUDA runtime could not be fetched (exit $0); Stemd runs on the CPU until install-cuda.cmd is run."
     ${IfNot} ${Silent}
-      MessageBox MB_ICONEXCLAMATION|MB_OK "The CUDA runtime could not be fetched, so stemd will run on the CPU for now.$\r$\n$\r$\nRun install-cuda.cmd in the install folder to try again."
+      MessageBox MB_ICONEXCLAMATION|MB_OK "The CUDA runtime could not be fetched, so Stemd will run on the CPU for now.$\r$\n$\r$\nRun install-cuda.cmd in the install folder to try again."
     ${EndIf}
   ${EndIf}
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "stemd, its command-line client and the runtime they need."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecCuda} "Downloads the CUDA runtime and cuDNN from NVIDIA beside stemd, so separations run on the card rather than the CPU. Needs an NVIDIA driver."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "Stemd, its command-line client and the runtime they need."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecCuda} "Downloads the CUDA runtime and cuDNN from NVIDIA beside Stemd, so separations run on the card rather than the CPU. Needs an NVIDIA driver."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; Below the sections, because .onInit names one of them.
@@ -195,7 +199,7 @@ SectionEnd
 ; install, so both halves have to agree on where that key lives.
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "stemd is built for 64-bit Windows only."
+    MessageBox MB_ICONSTOP "Stemd is built for 64-bit Windows only."
     Abort
   ${EndIf}
   SetRegView 64

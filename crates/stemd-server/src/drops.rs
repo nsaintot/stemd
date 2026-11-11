@@ -12,13 +12,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use stemd_core::{Audio, DspMode, PART_NAMES, PcmFormat, Progress, Stage};
 
 use crate::api::AppState;
 use crate::cache::{Entry, Ingredients, Output};
+use crate::jobs::Job;
 use crate::queue::QueuedWork;
 use crate::settings::DropParts;
 
@@ -79,6 +81,10 @@ pub struct Dropped {
     /// File name without the extension, which is what the window shows.
     pub title: String,
     state: Mutex<State>,
+    /// The job this drop waits on, once claimed. Whoever takes it releases it.
+    job: Mutex<Option<Arc<Job>>>,
+    /// Set by [`Drops::stop`].
+    stopped: AtomicBool,
 }
 
 impl Dropped {
@@ -100,6 +106,20 @@ impl Dropped {
                 secs: 1.0,
                 cached: false,
             })),
+            job: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    /// A drop part way through, for the window's tests.
+    #[cfg(test)]
+    pub fn working(title: &str, progress: Progress) -> Arc<Self> {
+        Arc::new(Self {
+            source: PathBuf::from(format!("/Music/{title}.wav")),
+            title: title.to_owned(),
+            state: Mutex::new(State::Working(progress)),
+            job: Mutex::new(None),
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -110,12 +130,105 @@ impl Dropped {
     pub fn is_running(&self) -> bool {
         matches!(self.state(), State::Reading | State::Working(_))
     }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Let go of the job, and cancel it if nobody else waits on it. Returns
+    /// whether this drop was the last waiter.
+    fn release(&self, state: &AppState) -> bool {
+        let Some(job) = self.job.lock().take() else {
+            return false;
+        };
+        if job.release() > 0 {
+            return false;
+        }
+        if !job.view().progress.stage.is_terminal() {
+            state.queue.cancel(&job.id);
+            state.store.remove(&job.id);
+        }
+        true
+    }
 }
 
 /// The window's list of drops, newest first.
 #[derive(Default)]
 pub struct Drops {
     recent: Mutex<Vec<Arc<Dropped>>>,
+    turns: Turnstile,
+}
+
+/// Queue positions in drop order: a short track decodes faster than a long one
+/// dropped before it, and must still be queued after it.
+#[derive(Default)]
+struct Turnstile {
+    next: Mutex<Line>,
+    moved: Condvar,
+}
+
+#[derive(Default)]
+struct Line {
+    issued: u64,
+    serving: u64,
+}
+
+impl Turnstile {
+    fn ticket(&self) -> u64 {
+        let mut line = self.next.lock();
+        line.issued += 1;
+        line.issued - 1
+    }
+}
+
+/// One drop's place in line. [`Turn::wait`] takes the turn and [`Turn::pass`]
+/// hands it on; dropping a turn that was never passed does both, so a drop
+/// that fails or panics cannot hold up the ones behind it.
+struct Turn<'a> {
+    turns: &'a Turnstile,
+    ticket: u64,
+    waited: bool,
+    passed: bool,
+}
+
+impl<'a> Turn<'a> {
+    const fn new(turns: &'a Turnstile, ticket: u64) -> Self {
+        Self {
+            turns,
+            ticket,
+            waited: false,
+            passed: false,
+        }
+    }
+
+    /// Block until every earlier drop has been queued or has failed.
+    fn wait(&mut self) {
+        if self.waited {
+            return;
+        }
+        let mut line = self.turns.next.lock();
+        while line.serving != self.ticket {
+            self.turns.moved.wait(&mut line);
+        }
+        self.waited = true;
+    }
+
+    /// Let the next drop go.
+    fn pass(&mut self) {
+        if self.passed {
+            return;
+        }
+        self.wait();
+        self.turns.next.lock().serving += 1;
+        self.turns.moved.notify_all();
+        self.passed = true;
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.pass();
+    }
 }
 
 impl Drops {
@@ -133,25 +246,61 @@ impl Drops {
     /// track takes long enough to drop frames, and the window has to keep
     /// painting the progress of the job this creates.
     pub fn accept(self: &Arc<Self>, state: &Arc<AppState>, path: PathBuf) -> Arc<Dropped> {
+        // A second drop of a track still in progress would write the same folder.
+        if let Some(running) = self
+            .recent
+            .lock()
+            .iter()
+            .find(|d| d.source == path && d.is_running())
+        {
+            return Arc::clone(running);
+        }
         let dropped = Arc::new(Dropped {
             title: title_of(&path),
             source: path,
             state: Mutex::new(State::Reading),
+            job: Mutex::new(None),
+            stopped: AtomicBool::new(false),
         });
 
         self.remember(Arc::clone(&dropped));
 
         let state = Arc::clone(state);
+        let drops = Arc::clone(self);
+        let ticket = self.turns.ticket();
         let started = Arc::clone(&dropped);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("stemd-drop".into())
             .spawn(move || {
-                if let Err(err) = run(&state, &started) {
-                    tracing::error!("{}: {err:#}", started.title);
-                    started.set(State::Failed(format!("{err:#}")));
+                let mut turn = Turn::new(&drops.turns, ticket);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(&state, &started, &mut turn)
+                }));
+                let failure = match ran {
+                    Ok(Ok(())) => None,
+                    Ok(Err(err)) => Some(format!("{err:#}")),
+                    Err(payload) => Some(format!(
+                        "the drop panicked: {}",
+                        crate::panics::message(&*payload)
+                    )),
+                };
+                // Marked failed before the turn is handed on, which may wait.
+                if let Some(why) = failure {
+                    if started.stopped() {
+                        tracing::info!("{}: stopped", started.title);
+                    } else {
+                        tracing::error!("{}: {why}", started.title);
+                    }
+                    started.set(State::Failed(why));
                 }
-            })
-            .expect("spawning the drop worker");
+                turn.pass();
+            });
+        if let Err(err) = spawned {
+            // Hand the turn on, or every later drop waits for it.
+            std::mem::drop(Turn::new(&self.turns, ticket));
+            tracing::error!("{}: could not start: {err}", dropped.title);
+            dropped.set(State::Failed(format!("could not start: {err}")));
+        }
 
         dropped
     }
@@ -168,12 +317,18 @@ impl Drops {
         self.recent.lock().retain(|other| !Arc::ptr_eq(other, item));
     }
 
+    /// Stop a drop that is still running and take it out of the list. Its job
+    /// is cancelled unless an API client also waits on it.
+    pub fn stop(&self, state: &AppState, item: &Arc<Dropped>) {
+        item.stopped.store(true, Ordering::SeqCst);
+        item.release(state);
+        self.forget(item);
+    }
+
     /// Forget a drop and delete the stems it wrote.
     ///
-    /// Deleted outright rather than moved to the Trash, which would need Finder
-    /// automation and a permission prompt inside an `.app`. The separation is still in
-    /// the cache, so dropping the same file again writes the folder back without
-    /// running the model.
+    /// The folder is deleted outright. Moving it to the Trash needs Finder
+    /// automation and a permission prompt inside an `.app`.
     pub fn discard(&self, item: &Arc<Dropped>) {
         if let State::Done(finished) = item.state() {
             remove_stems(&finished.dir);
@@ -204,8 +359,11 @@ fn remove_stems(dir: &Path) {
 }
 
 /// Decode, separate, and write the stems out.
-fn run(state: &Arc<AppState>, item: &Arc<Dropped>) -> Result<()> {
+fn run(state: &Arc<AppState>, item: &Arc<Dropped>, turn: &mut Turn) -> Result<()> {
     let mix = read(state, &item.source)?;
+    if item.stopped() {
+        anyhow::bail!("stopped");
+    }
     let settings = state.settings.get();
     let output = Output {
         format: settings.format,
@@ -216,8 +374,20 @@ fn run(state: &Arc<AppState>, item: &Arc<Dropped>) -> Result<()> {
         parts: settings.drop_parts.request(),
     };
 
-    let (entry, cached) = separate(state, item, &mix, output)?;
-    let finished = write_out(&item.source, &entry, cached, settings.drop_parts)?;
+    let (entry, origin) = separate(state, item, mix, output, turn)?;
+    let written = write_out(
+        &item.source,
+        &entry,
+        matches!(origin, Origin::Cached),
+        settings.drop_parts,
+    );
+    // The folder is the drop's only copy. The last drop waiting on the job
+    // deletes the entry, unless an API client holds the job or fetched the
+    // entry. Kept when writing failed, so a second drop needs no separation.
+    if matches!(origin, Origin::Queued) && item.release(state) && written.is_ok() {
+        state.cache.discard_unshared(&entry);
+    }
+    let finished = written?;
     tracing::info!(
         "{}: {} parts written to {}",
         item.title,
@@ -266,13 +436,23 @@ fn read(state: &AppState, path: &Path) -> Result<Audio> {
     stemd_core::resample::to_rate(&audio, wanted).context("resampling the input")
 }
 
+/// Where a drop's cache entry came from.
+enum Origin {
+    /// Already in the cache, made by an earlier request.
+    Cached,
+    /// Separated by a job this drop started or joined, held in `Dropped::job`.
+    /// The job counts every drop and API client waiting on it.
+    Queued,
+}
+
 /// Put the mix through the same queue an upload uses, and wait for the stems.
 fn separate(
     state: &Arc<AppState>,
     item: &Arc<Dropped>,
-    mix: &Audio,
+    mix: Audio,
     output: Output,
-) -> Result<(Arc<Entry>, bool)> {
+    turn: &mut Turn,
+) -> Result<(Arc<Entry>, Origin)> {
     // Hashed from the same bytes an upload would have carried, so a drop and a
     // deck asking for the same track land on the same cache entry.
     let pcm = mix.to_interleaved(PcmFormat::S16le);
@@ -290,40 +470,71 @@ fn separate(
     });
     std::mem::drop(pcm);
 
+    // Ahead of the turn: a cache hit queues nothing, so it need not wait for
+    // the drops before it. It still passes its turn when it ends.
     if let Some(entry) = state.cache.get(&key) {
         // The row in the window already says "already separated"; this is only
         // for reading afterwards.
         tracing::debug!("{}: already separated, reusing it", item.title);
-        return Ok((entry, true));
+        return Ok((entry, Origin::Cached));
+    }
+
+    turn.wait();
+    if item.stopped() {
+        anyhow::bail!("stopped");
     }
 
     // Claim before enqueuing, exactly as the HTTP path does: it is the same
     // store, so a drop can join a separation a deck already started.
     let job = match state.store.claim(&key) {
         Ok(job) => {
-            state.queue.submit(QueuedWork {
-                job: Arc::clone(&job),
-                mix: mix.clone(),
-                output,
-                model_id: state.switcher.published_identity(),
-            })?;
+            // The stems pass through the cache first. The folder beside the
+            // track is checked for the stems' own size once they exist.
+            let queued = crate::disk::ensure_room(state.cache.root())
+                .map_err(anyhow::Error::from)
+                .and_then(|()| {
+                    state
+                        .queue
+                        .submit(QueuedWork {
+                            job: Arc::clone(&job),
+                            mix,
+                            output,
+                            model_id: state.switcher.published_identity(),
+                            from_api: false,
+                        })
+                        .map_err(anyhow::Error::from)
+                });
+            // A job left at Queued would hold its key, and later requests for
+            // the track would join it and wait forever.
+            if let Err(err) = queued {
+                job.fail(format!("{err:#}"));
+                return Err(err);
+            }
             job
         }
+        // `claim` counted this drop as a waiter.
         Err(existing) => {
             tracing::debug!("{}: joining {}, already under way", item.title, existing.id);
-            existing.join();
             existing
         }
     };
+    turn.pass();
+    *item.job.lock() = Some(Arc::clone(&job));
+    let origin = Origin::Queued;
 
     loop {
+        // `stop` releases the job itself unless it came before the job was stored.
+        if item.stopped() {
+            item.release(state);
+            anyhow::bail!("stopped");
+        }
         let view = job.view();
         match view.progress.stage {
             Stage::Done => {
                 let entry = job.entry.lock().clone();
                 return Ok((
                     entry.context("the job finished with no stems attached")?,
-                    false,
+                    origin,
                 ));
             }
             Stage::Failed => {
@@ -342,11 +553,15 @@ fn separate(
 }
 
 /// Copy the stems out of the cache into a folder beside the source file.
-///
-/// Copied rather than moved: the entry stays in the cache, so a deck asking for
-/// the same track over the network still gets it without separating again.
 fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> Result<Finished> {
     let dir = output_dir(source);
+    let needed = entry
+        .stems
+        .iter()
+        .filter(|stem| wanted.has(&stem.name))
+        .map(|stem| stem.bytes)
+        .sum();
+    crate::disk::ensure_room_for(&dir, needed)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     clear_parts(&dir)?;
 
@@ -362,8 +577,11 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
             .path
             .file_name()
             .map_or_else(|| stem.name.clone(), |n| n.to_string_lossy().into_owned());
-        std::fs::copy(&stem.path, dir.join(&name))
-            .with_context(|| format!("copying {} into {}", name, dir.display()))?;
+        if let Err(err) = std::fs::copy(&stem.path, dir.join(&name)) {
+            // Half a set of stems reads as a finished one.
+            let _ = clear_parts(&dir);
+            return Err(err).with_context(|| format!("copying {} into {}", name, dir.display()));
+        }
         // Tells the cache this entry was collected, so the rule that reaps
         // separations nobody pulled leaves it alone.
         entry.mark_fetched(&stem.name);
@@ -444,6 +662,44 @@ fn title_of(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drops reach the queue in the order they were dropped, whichever
+    /// finishes decoding first.
+    #[test]
+    fn drops_take_their_turn_in_drop_order() {
+        let turns = Arc::new(Turnstile::default());
+        let tickets: Vec<u64> = (0..4).map(|_| turns.ticket()).collect();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        // Started last ticket first, as if the later drops decoded faster.
+        let threads: Vec<_> = tickets
+            .into_iter()
+            .rev()
+            .map(|ticket| {
+                let turns = Arc::clone(&turns);
+                let order = Arc::clone(&order);
+                std::thread::spawn(move || {
+                    let mut turn = Turn::new(&turns, ticket);
+                    turn.wait();
+                    order.lock().push(ticket);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*order.lock(), vec![0, 1, 2, 3]);
+    }
+
+    /// A drop that fails before reaching the queue still hands on its turn.
+    #[test]
+    fn a_failed_drop_does_not_hold_up_the_next() {
+        let turns = Turnstile::default();
+        let (first, second) = (turns.ticket(), turns.ticket());
+        std::mem::drop(Turn::new(&turns, first));
+        let mut next = Turn::new(&turns, second);
+        next.wait();
+        next.pass();
+    }
 
     #[test]
     fn only_audio_is_worth_decoding() {

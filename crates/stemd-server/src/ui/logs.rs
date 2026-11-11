@@ -5,22 +5,24 @@
 //! path. Collapsed by default: it is where you go when something looks wrong,
 //! not what the window is for.
 
-use eframe::egui;
+use eframe::egui::{self, Color32, Sense, Stroke, pos2, vec2};
 
 use crate::logbuf::LogLine;
 
-use super::header::MENU_CAP;
-use super::theme::Palette;
+use super::icons;
+use super::theme::{self, Brushes, Palette, Weight, white};
+use super::widgets::{self, Pill};
 
 /// How tall the log area gets before it scrolls.
 pub const VISIBLE_HEIGHT: f32 = 168.0;
 
-/// Log rows are set much tighter than the rest of the window on purpose. This is
-/// a tail you scan rather than read, and the useful thing is how many lines fit
-/// at once; the window's ordinary spacing turns twenty lines into six.
+/// Log rows are set tight: this is a tail you scan, and the useful thing is how
+/// many lines fit at once.
 const ROW: f32 = 8.0;
-const ROW_SPACING: f32 = 0.0;
-const CONTROL_TEXT: f32 = 11.0;
+const CONTROL_TEXT: f32 = 12.0;
+const CONTROL_HEIGHT: f32 = 26.0;
+/// Most recent matching lines drawn. Older ones stay in the buffer and the API.
+const SHOWN: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LevelFilter {
@@ -51,17 +53,18 @@ impl LevelFilter {
 
 /// What the window remembers about how the log is being read.
 pub struct View {
-    pub follow: bool,
     pub min_level: LevelFilter,
     pub filter: String,
+    /// Layout pass the pane was last drawn in, to tell when it has just opened.
+    drawn_at: u64,
 }
 
 impl Default for View {
     fn default() -> Self {
         Self {
-            follow: true,
             min_level: LevelFilter::Info,
             filter: String::new(),
+            drawn_at: 0,
         }
     }
 }
@@ -69,88 +72,136 @@ impl Default for View {
 /// Draw the log section. Returns true if the buffer should be emptied: the
 /// caller owns it, so the button reports rather than acts.
 #[must_use]
-pub fn show(ui: &mut egui::Ui, palette: &Palette, view: &mut View, lines: &[LogLine]) -> bool {
+pub fn show(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    brushes: &Brushes,
+    view: &mut View,
+    lines: &[LogLine],
+) -> bool {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let opened = view.drawn_at + 1 != pass;
+    view.drawn_at = pass;
+
     let mut clear = false;
-
     ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("log-level")
-            .selected_text(egui::RichText::new(view.min_level.label()).size(CONTROL_TEXT))
-            .width(104.0)
-            // Far above what three items need, so the list cannot scroll.
-            .height(MENU_CAP)
-            .show_ui(ui, |ui| {
-                super::header::borderless_rows(ui);
-                for level in LevelFilter::ALL {
-                    ui.selectable_value(&mut view.min_level, level, level.label());
-                }
-            });
-
+        level_menu(ui, palette, view);
         ui.add(
             egui::TextEdit::singleline(&mut view.filter)
                 .hint_text("filter")
-                .font(egui::FontId::proportional(CONTROL_TEXT))
-                .desired_width(ui.available_width() - 96.0),
+                .font(theme::font(CONTROL_TEXT, Weight::Regular))
+                .margin(vec2(10.0, 5.0))
+                .desired_width(ui.available_width() - 70.0),
         );
-
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            clear = ui
-                .add_enabled(
-                    !lines.is_empty(),
-                    egui::Button::new(egui::RichText::new("Clear").size(CONTROL_TEXT)),
-                )
-                .on_hover_text("Clears the logs")
-                .clicked();
-            ui.checkbox(
-                &mut view.follow,
-                egui::RichText::new("follow").size(CONTROL_TEXT),
-            );
+            let (rect, _) = ui.allocate_exact_size(vec2(56.0, CONTROL_HEIGHT), Sense::hover());
+            clear = widgets::pill(
+                ui,
+                rect,
+                ui.id().with("clear-logs"),
+                "Clear",
+                Pill::Ghost,
+                !lines.is_empty(),
+                palette,
+                brushes,
+            )
+            .on_hover_text("Clears the logs")
+            .clicked();
         });
     });
     ui.add_space(4.0);
 
     let visible = visible_lines(view, lines);
-    // Measured from the font, not assumed from the point size. `show_rows` uses
-    // this both to decide which rows are on screen and to tell the scroll area
-    // how tall its contents are, so a guess that is a point or two under leaves
-    // the area sized for less than it draws, which is the gap that appears
-    // under a short log.
     let font = egui::FontId::monospace(ROW);
-    let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font));
-    //  Scoped, because the row spacing has to be set on the ui `show_rows` is called
-    //  on, not on the one it hands back. `show_rows` adds `item_spacing.y` to the row
-    //  height given here and from that decides how tall the contents are and which
-    //  rows are on screen, so setting it inside the closure is too late.
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(6.0, ROW_SPACING);
-        // Without this every line is at least `interact_size.y` tall: 24
-        // points, set for buttons, and a 9.5-point line sits in the middle of
-        // it. That is where the density went.
-        ui.spacing_mut().interact_size.y = 0.0;
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(view.follow)
-            .max_height(VISIBLE_HEIGHT)
-            // Shrinks to the lines it has, up to the cap. A fixed height leaves
-            // an empty box under a short log, which reads as broken.
-            .auto_shrink([false, true])
-            .show_rows(ui, row_height, visible.len(), |ui, range| {
-                for line in &visible[range] {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:<5}", line.level))
-                                .font(font.clone())
-                                .color(level_colour(palette, &line.level)),
-                        );
-                        ui.label(
+    egui::ScrollArea::vertical()
+        // Follows new lines while scrolled to the bottom, and stops while
+        // scrolled up.
+        .stick_to_bottom(true)
+        .max_height(VISIBLE_HEIGHT)
+        // Shrinks to the lines it has, up to the cap.
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
+            ui.spacing_mut().interact_size.y = 0.0;
+            let skip = visible.len().saturating_sub(SHOWN);
+            for line in &visible[skip..] {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:<5}", line.level))
+                            .font(font.clone())
+                            .color(level_colour(palette, &line.level)),
+                    );
+                    ui.add(
+                        egui::Label::new(
                             egui::RichText::new(&line.message)
                                 .font(font.clone())
                                 .color(palette.text),
-                        );
-                    });
-                }
-            });
-    });
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+            if opened {
+                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+            }
+        });
 
     clear
+}
+
+/// The level floor as a pill button with a frosted menu.
+fn level_menu(ui: &mut egui::Ui, palette: &Palette, view: &mut View) {
+    let font = theme::font(CONTROL_TEXT, Weight::Medium);
+    let label = view.min_level.label();
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), palette.text)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(12.0 + text + 6.0 + 8.0 + 10.0, CONTROL_HEIGHT),
+        Sense::click(),
+    );
+    let open = widgets::menu(
+        &response,
+        egui::RectAlign::BOTTOM_START,
+        egui::PopupCloseBehavior::CloseOnClick,
+        palette,
+        |ui| {
+            let labels: Vec<_> = LevelFilter::ALL
+                .iter()
+                .map(|l| (l.label().to_owned(), *l == view.min_level, ""))
+                .collect();
+            if let Some(n) = widgets::pick_menu(ui, 150.0, &labels, palette) {
+                view.min_level = LevelFilter::ALL[n];
+            }
+        },
+    );
+    let hover = widgets::fade(ui, response.id, response.hovered() || open);
+    let painter = ui.painter();
+    let r = CONTROL_HEIGHT / 2.0;
+    painter.rect_filled(rect, r, white(0.06 + 0.06 * hover));
+    painter.rect_stroke(
+        rect,
+        r,
+        Stroke::new(1.0, white(0.12)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        palette.text,
+    );
+    icons::chevron(
+        painter,
+        icons::square(pos2(rect.right() - 10.0 - 4.0, rect.center().y), 8.0),
+        palette.muted,
+        1.6,
+        if open { std::f32::consts::PI } else { 0.0 },
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
 /// Buffered lines passing the level and text filters.
@@ -168,11 +219,11 @@ fn visible_lines(view: &View, lines: &[LogLine]) -> Vec<LogLine> {
         .collect()
 }
 
-fn level_colour(palette: &Palette, level: &str) -> egui::Color32 {
+fn level_colour(palette: &Palette, level: &str) -> Color32 {
     match level {
-        "ERROR" => palette.bad,
-        "WARN" => palette.warn,
-        "INFO" => palette.accent,
+        "ERROR" => Color32::from_rgb(0xFF, 0x45, 0x3A),
+        "WARN" => Color32::from_rgb(0xFF, 0x9F, 0x0A),
+        "INFO" => Color32::from_rgb(0x0A, 0x84, 0xFF),
         _ => palette.muted,
     }
 }
@@ -226,7 +277,7 @@ mod tests {
         let view = View {
             min_level: LevelFilter::Warn,
             filter: "queued".to_owned(),
-            follow: true,
+            ..Default::default()
         };
         assert_eq!(visible_lines(&view, &lines).len(), 1);
     }

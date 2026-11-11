@@ -126,7 +126,7 @@ by the audio and by everything else that changes the output.
 
 ## Build from source
 
-Needs `cmake`, Rust 1.85 or later, and a recursive clone. Per-platform
+Needs `cmake`, Rust 1.89 or later, and a recursive clone. Per-platform
 toolchains, packaging and every flag are in
 [docs/building.md](docs/building.md).
 

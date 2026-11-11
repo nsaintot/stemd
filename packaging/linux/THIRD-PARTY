@@ -29,6 +29,10 @@ libopenblas*, libgfortran*, libquadmath*)
 Avahi compatibility library (lib/libdns_sd*, libavahi-*)
   LGPL-2.1-or-later. Taken from Ubuntu 22.04.
 
+Instrument Sans, compiled into bin/stemd-server
+  Copyright 2022 The Instrument Sans Project Authors. SIL Open Font License 1.1:
+  https://openfontlicense.org
+
 LAME 3.100, statically linked into bin/stemd-server
   LGPL-2.0 (GNU Library General Public License version 2).
   Source: https://lame.sourceforge.io/

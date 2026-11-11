@@ -48,6 +48,10 @@ pub struct QueuedWork {
     pub output: Output,
     /// The `model_id` the job was submitted under, for the pieces it writes.
     pub model_id: String,
+    /// Submitted over the API. Its stems are kept as session pieces too, and
+    /// turning the server off cancels it. Off for a drop, whose stems end up
+    /// only in its folder.
+    pub from_api: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +67,7 @@ pub struct QueueFull {
 /// flag on a `Running` the worker has already dropped.
 struct Running {
     id: String,
+    from_api: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -96,6 +101,10 @@ struct Inner {
     /// Whether the loaded separator needs the whole mix's normalisation.
     normalises: AtomicBool,
     sessions: Arc<Sessions>,
+    /// Set when the worker has left its loop and dropped its separator. The
+    /// thread then parks and never exits: MLX's per-thread CUDA state throws
+    /// from its destructor when a thread exits on Windows.
+    left: AtomicBool,
 }
 
 pub struct Queue {
@@ -136,6 +145,7 @@ impl Queue {
             segmenting: Mutex::new(None),
             normalises: AtomicBool::new(false),
             sessions: Arc::new(Sessions::default()),
+            left: AtomicBool::new(false),
         });
 
         let (reply, built) = mpsc::sync_channel(1);
@@ -145,10 +155,13 @@ impl Queue {
             .spawn(move || {
                 // The first thing this thread does, and the reason it is handed
                 // a recipe rather than a model.
-                let Some(separator) = worker_inner.build_here(build, &reply) else {
-                    return;
-                };
-                worker_loop(&worker_inner, separator, &cache);
+                if let Some(separator) = worker_inner.build_here(build, &reply) {
+                    worker_loop(&worker_inner, separator, &cache);
+                }
+                worker_inner.left.store(true, Ordering::SeqCst);
+                loop {
+                    thread::park();
+                }
             })
             .expect("spawning the separation worker");
 
@@ -160,12 +173,8 @@ impl Queue {
                 },
                 info,
             )),
-            // The worker returns the moment the build fails, so joining costs
-            // nothing and keeps a refused launch from leaving a thread behind.
-            Ok(Err(err)) => {
-                let _ = worker.join();
-                Err(err)
-            }
+            // The worker parks the moment the build fails; see `Inner::left`.
+            Ok(Err(err)) => Err(err),
             Err(_) => {
                 let _ = worker.join();
                 anyhow::bail!("the separation worker died before it could load the model")
@@ -244,14 +253,15 @@ impl Queue {
         // must not happen here: a worker wedged in the model would hang the quit
         // instead of crashing it, which is not an improvement.
         let deadline = std::time::Instant::now() + grace;
-        while !worker.is_finished() {
+        // The thread only finishes if it panicked.
+        while !self.inner.left.load(Ordering::SeqCst) && !worker.is_finished() {
             if std::time::Instant::now() >= deadline {
                 tracing::warn!("the separation worker did not stop within {:.0?}", grace);
                 return false;
             }
             thread::sleep(POLL_INTERVAL);
         }
-        worker.join().is_ok()
+        self.inner.left.load(Ordering::SeqCst)
     }
 
     /// Enqueue a job, returning its position (0 = next up).
@@ -294,6 +304,30 @@ impl Queue {
             }
             _ => false,
         }
+    }
+
+    /// Cancel every job submitted over the API, waiting or running, and return
+    /// how many. Drops keep their place.
+    pub fn cancel_api_jobs(&self) -> usize {
+        let dropped = {
+            let mut pending = self.inner.pending.lock();
+            let (api, kept): (VecDeque<_>, VecDeque<_>) =
+                pending.drain(..).partition(|w| w.from_api);
+            *pending = kept;
+            api
+        };
+        for work in &dropped {
+            work.job.cancelled();
+        }
+        // `pending` released first, as in `cancel`.
+        let stopped = match self.inner.running.lock().as_ref() {
+            Some(job) if job.from_api => {
+                job.cancel.store(true, Ordering::Relaxed);
+                1
+            }
+            _ => 0,
+        };
+        dropped.len() + stopped
     }
 
     pub fn depth(&self) -> usize {
@@ -415,6 +449,7 @@ impl Inner {
                 let cancel = Arc::new(AtomicBool::new(false));
                 *self.running.lock() = Some(Running {
                     id: work.job.id.clone(),
+                    from_api: work.from_api,
                     cancel: Arc::clone(&cancel),
                 });
                 return Some(Next::Job(Claimed { work, cancel }));
@@ -524,6 +559,7 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                         .fail(format!("the separation panicked: {what}"));
                 }
                 *inner.running.lock() = None;
+                trim_after_job(cache);
             }
             Next::Segment(track, k) => {
                 run_segment(separator.as_mut(), &inner.sessions, &track, k, &mut passes);
@@ -591,6 +627,41 @@ fn run_segment(
     tracing::warn!(track = track.uid, "{failure}");
     track.close(failure);
     passes.remove(&track.uid);
+}
+
+/// Whether there is room to write a finished job's pieces: they hold a copy of
+/// the mix and stems in memory while they encode, and land on disk.
+fn pieces_affordable(pieces: &Pieces) -> bool {
+    if crate::disk::low(pieces.root()) {
+        tracing::info!("disk nearly full, not writing this job's pieces");
+        return false;
+    }
+    if crate::disk::memory_pressure() {
+        tracing::info!("memory is short, not writing this job's pieces");
+        return false;
+    }
+    true
+}
+
+/// Hand back MLX's allocator cache after a job if keeping it is a risk: when
+/// memory or disk is short, or it holds over half the machine's memory. Kept
+/// otherwise, so the next track in a queue starts warm.
+fn trim_after_job(cache: &Cache) {
+    let held = stemd_core::memory::cached();
+    let ceiling = crate::disk::physical_memory().map_or(8 << 30, |ram| ram / 2);
+    let short = crate::disk::memory_pressure() || crate::disk::low(cache.root());
+    if held as u64 > ceiling || (short && held > 0) {
+        let freed = stemd_core::memory::release();
+        tracing::info!(
+            "returned {:.0} MB of MLX allocator cache after the job{}",
+            freed as f64 / 1e6,
+            if short {
+                ", memory or disk is short"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 /// Write a finished job's stems as pieces, so a later session on the same track
@@ -694,7 +765,9 @@ fn separate_one(
             // Off the worker: the job is done for its client, and the next one
             // should not wait on encoding.
             if let (Some(pieces), Some(segmenting)) = (pieces, segmenting)
+                && work.from_api
                 && work.output.format != stemd_core::StemFormat::Mp3
+                && pieces_affordable(&pieces)
                 && let Ok(grid) = segmenting.grid(work.mix.frames())
             {
                 let (mix, output, model_id) =
@@ -1128,6 +1201,7 @@ mod tests {
                     parts: stemd_core::Parts::DEFAULT,
                 },
                 model_id: "test".into(),
+                from_api: true,
             })
             .expect("queue has room");
     }
@@ -1809,6 +1883,7 @@ mod session_tests {
                 mix: track(80 * 3307, 4),
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
+                from_api: true,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(100));
@@ -1829,6 +1904,46 @@ mod session_tests {
     }
 
     #[test]
+    fn turning_the_server_off_cancels_api_jobs_and_keeps_drops() {
+        let _gpu = GPU.lock();
+        let mut toy = Toy::new(SEGMENT, 0.25);
+        toy.delay = Duration::from_millis(20);
+        let queue = start(toy);
+
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let submit = |key: &str, from_api: bool| {
+            let job = store.create(key.into());
+            queue
+                .submit(QueuedWork {
+                    job: Arc::clone(&job),
+                    mix: track(40 * 3307, 8),
+                    output: output(StemFormat::Pcm32),
+                    model_id: "toy-00000000".into(),
+                    from_api,
+                })
+                .expect("room");
+            job
+        };
+        let running = submit("running", true);
+        thread::sleep(Duration::from_millis(100));
+        let waiting = submit("waiting", true);
+        let dropped = submit("dropped", false);
+
+        assert_eq!(queue.cancel_api_jobs(), 2);
+        assert_eq!(waiting.view().progress.stage, Stage::Cancelled);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while running.view().progress.stage != Stage::Cancelled {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the running job kept going"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(dropped.view().progress.stage, Stage::Cancelled);
+        queue.cancel(&dropped.id);
+    }
+
+    #[test]
     fn bonus_segments_wait_for_waiting_jobs() {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
@@ -1843,6 +1958,7 @@ mod session_tests {
                 mix: track(40 * 3307, 6),
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
+                from_api: true,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(50));
@@ -1972,6 +2088,7 @@ mod session_tests {
                 mix: mix.clone(),
                 output: output(StemFormat::Flac),
                 model_id: "toy-00000000".into(),
+                from_api: true,
             })
             .expect("room");
         let grid = queue

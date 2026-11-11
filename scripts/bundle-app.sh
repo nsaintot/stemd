@@ -1,5 +1,5 @@
 #!/bin/bash
-# Assemble stemd.app.
+# Assemble Stemd.app.
 #
 # One thing makes this more than a copy: weights are fetched on first run into
 # Application Support, so the bundle stays small. STEMD_EMBED_MODELS puts them
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP="${1:-$ROOT/dist/stemd.app}"
+APP="${1:-$ROOT/dist/Stemd.app}"
 MODELS="$ROOT/models"
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 
@@ -172,8 +172,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>            <string>stemd</string>
 $ICON_PLIST
     <key>CFBundleIdentifier</key>            <string>io.nasper.stemd</string>
-    <key>CFBundleName</key>                  <string>stemd</string>
-    <key>CFBundleDisplayName</key>           <string>stemd</string>
+    <key>CFBundleName</key>                  <string>Stemd</string>
+    <key>CFBundleDisplayName</key>           <string>Stemd</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
     <key>CFBundleVersion</key>               <string>$VERSION</string>
@@ -181,7 +181,7 @@ $ICON_PLIST
     <key>NSHighResolutionCapable</key>       <true/>
     <!-- Advertises _stemd._tcp and serves on the LAN. -->
     <key>NSLocalNetworkUsageDescription</key>
-    <string>stemd advertises itself so players on this network can find it.</string>
+    <string>Stemd advertises itself so players on this network can find it.</string>
 </dict>
 </plist>
 PLIST

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrap stemd.app into a signed, notarized, stapled .dmg.
+# Wrap Stemd.app into a signed, notarized, stapled .dmg.
 #
 # Needs a keychain profile, made once:
 #   xcrun notarytool store-credentials stemd-notary \
@@ -10,10 +10,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
-APP="$DIST/stemd.app"
+APP="$DIST/Stemd.app"
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 DMG="$DIST/stemd-$VERSION-macos-arm64.dmg"
-VOLNAME="stemd $VERSION"
+VOLNAME="Stemd $VERSION"
 
 # The image's window is the artwork's. resources/stemd-dmg.png is the 2x
 # rendition of a 640 by 400 window with two placeholder squares drawn on it,
@@ -157,7 +157,7 @@ on run argv
       set text size of opts to 12
       set label position of opts to bottom
       set background picture of opts to file ".background:stemd.tiff"
-      set position of item "stemd.app" of container window to {appX, appY}
+      set position of item "Stemd.app" of container window to {appX, appY}
       set position of item "Applications" of container window to {appsX, appsY}
       close
       open

@@ -17,7 +17,8 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::api::AppState;
-use crate::ui::theme::Palette;
+use crate::ui::theme::{self, Brushes, Palette, Weight};
+use crate::ui::widgets::{self, Pill};
 
 /// What the person chose, once they choose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,31 +81,43 @@ impl Guard {
 /// The question itself.
 ///
 /// Takes the track's name rather than any state, so a probe can draw it.
-pub fn dialog(ui: &mut egui::Ui, palette: &Palette, track: &str) -> Option<Choice> {
+pub fn dialog(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    brushes: &Brushes,
+    track: &str,
+) -> Option<Choice> {
     ui.set_max_width(320.0);
-    ui.heading("Still separating");
+    ui.label(
+        egui::RichText::new("Still separating")
+            .font(theme::font(17.0, Weight::Semibold))
+            .color(palette.text),
+    );
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(format!(
             "{track} is not finished. Quitting now will cancel the current separation."
         ))
+        .font(theme::font(13.0, Weight::Regular))
         .color(palette.muted),
     );
-    ui.add_space(14.0);
+    ui.add_space(16.0);
 
     let mut choice = None;
     ui.horizontal(|ui| {
-        // The safe option first and focused, because this dialog appears when
-        // someone is already leaving and the destructive answer is the one
-        // muscle memory will hit.
-        if ui.button("Keep separating").clicked() {
-            choice = Some(Choice::Stay);
-        }
-        if ui
-            .button(egui::RichText::new("Quit anyway").color(palette.bad))
-            .clicked()
-        {
-            choice = Some(Choice::Quit);
+        // The safe option first, because this dialog appears when someone is
+        // already leaving and the destructive answer is the one muscle memory
+        // will hit.
+        for (label, kind, answer) in [
+            ("Keep separating", Pill::Light, Choice::Stay),
+            ("Quit anyway", Pill::Danger, Choice::Quit),
+        ] {
+            let width = widgets::pill_width(ui, label, 30.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::hover());
+            let id = ui.id().with(("quit-answer", label));
+            if widgets::pill(ui, rect, id, label, kind, true, palette, brushes).clicked() {
+                choice = Some(answer);
+            }
         }
     });
     choice
@@ -113,7 +126,13 @@ pub fn dialog(ui: &mut egui::Ui, palette: &Palette, track: &str) -> Option<Choic
 /// Hold the close, ask, and act on the answer.
 ///
 /// Everything the window does about quitting, in one call.
-pub fn guard(guard: &mut Guard, state: &Arc<AppState>, ctx: &egui::Context, palette: &Palette) {
+pub fn guard(
+    guard: &mut Guard,
+    state: &Arc<AppState>,
+    ctx: &egui::Context,
+    palette: &Palette,
+    brushes: &Brushes,
+) {
     let closing = ctx.input(|i| i.viewport().close_requested());
     if closing && !guard.intercept(state.queue.running(), true) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -123,9 +142,13 @@ pub fn guard(guard: &mut Guard, state: &Arc<AppState>, ctx: &egui::Context, pale
         return;
     };
     let mut answered = None;
-    egui::Modal::new(egui::Id::new("stemd-quit")).show(ctx, |ui| {
-        answered = dialog(ui, palette, &track);
-    });
+    egui::Modal::new(egui::Id::new("stemd-quit"))
+        .frame(egui::Frame::NONE)
+        .show(ctx, |ui| {
+            super::blur::frosted(ui, &widgets::dialog_look(palette), |ui| {
+                answered = dialog(ui, palette, brushes, &track);
+            });
+        });
     if let Some(choice) = answered {
         guard.answer(choice);
         if choice == Choice::Quit {

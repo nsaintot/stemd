@@ -59,9 +59,7 @@ pub fn now(state: &AppState, reason: &str) -> ! {
     // A withdrawal a client can act on, rather than one it waits out. Costs a
     // few milliseconds and saves every client on the network a TTL of chasing a
     // server that is gone.
-    if let Some(advertiser) = &state.advertiser {
-        advertiser.withdraw();
-    }
+    state.serving.withdraw();
     let withdrawn = began.elapsed();
 
     // Quitting is meant to look instant. It is the last thing anyone sees the

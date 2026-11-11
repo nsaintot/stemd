@@ -131,9 +131,9 @@ impl StemFormat {
         match self {
             Self::Flac => "FLAC",
             Self::Wav => "WAV",
-            Self::Mp3 => "MP3 320",
-            Self::Pcm16 => "PCM 16",
-            Self::Pcm32 => "PCM 32",
+            Self::Mp3 => "MP3",
+            Self::Pcm16 => "PCM 16-bit",
+            Self::Pcm32 => "PCM 32-bit float",
         }
     }
 }
