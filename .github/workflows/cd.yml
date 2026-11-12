@@ -21,8 +21,9 @@
 # NOTARY_ISSUER for a team key. Without them the app is signed ad hoc and no .dmg is made; a
 # release tag fails.
 #
-# A release also gets appcast.xml, the Sparkle feed of the macOS app. The
-# secret UPDATE_SIGNING_KEY signs the .dmg in it; its public half is
+# A release also gets appcast.xml, the Sparkle feed of the macOS app, and
+# SHA256SUMS.txt (.github/scripts/release-draft.sh). The secret
+# UPDATE_SIGNING_KEY signs the .dmg in the feed; its public half is
 # packaging/update-ed25519.pub, which the bundle carries as SUPublicEDKey.
 name: CD
 
@@ -314,22 +315,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Update feed
+      # A draft, so nothing is public until published by hand. The annotated
+      # tag's message holds the release notes, which go into the release text
+      # and appcast.xml; GitHub's generated notes stand in for an empty one.
+      # A rerun replaces the draft's text and files.
+      - name: Draft release
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-        run: .github/scripts/appcast.sh "$VERSION" "$GITHUB_REF_NAME" dist
-      # A draft, so nothing is public until published by hand. A rerun
-      # replaces the files.
-      - name: Draft release
         run: |
-          tag="$GITHUB_REF_NAME"
-          draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)
-          if [[ "$draft" == false ]]; then
-              echo "::error::$tag is published; its files are no longer changed"
-              exit 1
-          fi
-          if [[ -z "$draft" ]]; then
-              gh release create "$tag" --draft --verify-tag --title "stemd ${tag#v}" --notes ""
-          fi
-          gh release upload "$tag" --clobber dist/*
-          (cd dist && sha256sum -- *) | tee -a "$GITHUB_STEP_SUMMARY"
+          .github/scripts/tag-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          .github/scripts/release-draft.sh "$VERSION" "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/notes.md"
+          cat dist/SHA256SUMS.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "Draft: $(gh release view "$GITHUB_REF_NAME" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
