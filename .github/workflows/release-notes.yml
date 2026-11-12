@@ -1,0 +1,53 @@
+# Replace the release notes of a draft release: its text and appcast.xml,
+# signed again. CD takes the notes from the tag's message; this workflow
+# corrects them without a new build:
+#
+#   gh workflow run release-notes.yml -f tag=v0.2.0 -F notes=@notes.md
+#
+# Empty notes give GitHub's generated notes, as in CD.
+name: Release notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The draft release's tag, such as v0.2.0
+        required: true
+        type: string
+      notes:
+        description: The release notes, in Markdown
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notes:
+    name: Release notes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      NOTES: ${{ inputs.notes }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            .github/scripts
+            packaging/update-ed25519.pub
+          sparse-checkout-cone-mode: false
+      - name: Update the draft
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          NOTES_ONLY: 1
+        run: |
+          version="${TAG#v}"
+          gh release download "$TAG" --dir dist \
+              --pattern "stemd-$version-macos-arm64.dmg" --pattern SHA256SUMS.txt
+          printf '%s\n' "$NOTES" | tr -d '\r' > "$RUNNER_TEMP/notes.md"
+          .github/scripts/release-draft.sh "$version" "$TAG" dist "$RUNNER_TEMP/notes.md"
+          echo "Draft: $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"

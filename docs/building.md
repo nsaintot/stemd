@@ -146,10 +146,35 @@ macOS signing reads these repository secrets:
 Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
 release tag fails.
 
-A release also gets `appcast.xml`, the macOS app's Sparkle feed, written by
-`.github/scripts/appcast.sh`. Its release notes are the annotated tag's message.
-The app finds the feed under GitHub's "latest" release, so publish model
-releases (`models-v*`) with `gh release create --latest=false`.
+A release is an annotated tag whose message holds the release notes for users,
+in Markdown, with `## Added`, `## Modified` and `## Fixed` sections:
+
+```bash
+git tag -a --cleanup=whitespace -F notes.md v0.2.0 origin/main
+git push origin v0.2.0
+```
+
+`--cleanup=whitespace` keeps the Markdown headings: the default cleanup drops
+every line that starts with `#`.
+
+`.github/scripts/release-draft.sh` fills the draft:
+
+| part of the draft | content |
+| --- | --- |
+| text | the notes, a Downloads table with a link per package, and GitHub's generated list of pull requests in a collapsed block |
+| `appcast.xml` | the macOS app's Sparkle feed, with the notes as HTML |
+| `SHA256SUMS.txt` | one line per package |
+
+A lightweight tag or an empty message gives GitHub's generated list as the
+notes. To correct the notes of a draft without a new build:
+
+```bash
+gh workflow run release-notes.yml -f tag=v0.2.0 -F notes=@notes.md
+```
+
+Neither CD nor `release-notes.yml` changes a published release. The app finds
+the feed under GitHub's "latest" release, so publish model releases
+(`models-v*`) with `gh release create --latest=false`.
 
 | secret | |
 | --- | --- |
