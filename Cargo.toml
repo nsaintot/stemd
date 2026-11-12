@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 # 1.89 for `File::try_lock`, which keeps a second server off a cache in use.
 rust-version = "1.89"

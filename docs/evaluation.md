@@ -674,6 +674,29 @@ decimal: Metal runs the RoFormer at float16, CUDA at float32.
 The weights come from `tools/export/convert_stemd_roformer.py`, then
 `tools/export/convert_roformer.py`.
 
+## Every preset, per part
+
+Global SDR over the first 12 MUSDB18-HQ test tracks, full length, through
+`stemd-server` and `stemd-cli` 0.1.4 on the RTX 3090 Ti (separation code is
+unchanged in 0.2.0). `tools/eval/presets.py` reproduces it.
+
+| preset | drums | bass | other | harmonics | vocals | realtime, 3090 Ti |
+|---|---|---|---|---|---|---|
+| Fast | 8.27 | 8.17 | 5.14 | 8.62 | 8.92 | 99x |
+| Balanced | 8.49 | **8.40** | 5.20 | 8.78 | 9.28 | 56x |
+| Quality | **11.07** | 7.97 | **6.52** | **11.54** | **11.34** | 18x |
+
+- `drums`, `harmonics` and `vocals` come from the default request, with `drums`
+  rebuilt from the mix. `bass` and `other` come from `parts=bass,other,vocals`.
+- Quality's three default parts match the table in the previous section.
+- Fast and Balanced score lower here than on the 25 clips above, which are
+  6.8 s each and include MUSDB train tracks.
+- Some tracks pull every preset down. On "AM Contra - Heart Peripheral" all
+  three put synths in `bass` (-1.33 to -0.68 dB). On "Arise - Run Run Run"
+  stemd's htdemucs scores `other` at 0.88 dB, the same as the reference
+  PyTorch htdemucs.
+- Realtime is the mean over the full tracks, cold start included.
+
 ## Tuning levers
 
 | lever | quality | cost | verdict |
