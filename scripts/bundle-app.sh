@@ -7,10 +7,9 @@
 # resolves relative to the exe.
 #
 # Almost nothing to vendor. MLX links statically, so the executable depends on
-# system frameworks alone: no Frameworks directory, no rpath surgery, no venv.
-# It used to carry 223 MB of libtorch dylibs that had to be signed inside-out
-# before the bundle could be. The one thing that does travel is mlx.metallib,
-# the compiled Metal kernels, see below.
+# system frameworks alone: no rpath surgery, no venv. Two things travel with
+# it: mlx.metallib, the compiled Metal kernels, and Sparkle.framework, the
+# updater, which the app loads at run time. See below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -140,6 +139,33 @@ else
   echo "  models: fetched on first run"
 fi
 
+# Sparkle, the updater. The app loads it from Contents/Frameworks; without it
+# the app runs with no updater. Its XPC services are for sandboxed apps and are
+# removed.
+SPARKLE_VERSION="2.10.0"
+SPARKLE_SHA256="c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c"
+SPARKLE_DIR="$ROOT/target/sparkle-$SPARKLE_VERSION"
+if [ ! -d "$SPARKLE_DIR/Sparkle.framework" ]; then
+  mkdir -p "$SPARKLE_DIR"
+  archive="$SPARKLE_DIR/Sparkle.tar.xz"
+  curl -fsSL -o "$archive" \
+    "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
+  got="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+  if [ "$got" != "$SPARKLE_SHA256" ]; then
+    echo "Sparkle-$SPARKLE_VERSION.tar.xz has SHA-256 $got, expected $SPARKLE_SHA256" >&2
+    rm -rf "$SPARKLE_DIR"
+    exit 1
+  fi
+  tar -xf "$archive" -C "$SPARKLE_DIR" Sparkle.framework
+  rm "$archive"
+fi
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+mkdir -p "$APP/Contents/Frameworks"
+ditto "$SPARKLE_DIR/Sparkle.framework" "$SPARKLE"
+rm -rf "$SPARKLE/Versions/B/XPCServices" "$SPARKLE/XPCServices"
+SPARKLE_PUBLIC_KEY="$(tr -d '[:space:]' < "$ROOT/packaging/update-ed25519.pub")"
+echo "  updater: Sparkle $SPARKLE_VERSION"
+
 # The icon. `sips` and `iconutil` ship with macOS, so this needs nothing
 # installed: the arithmetic that is not obvious (Apple's 824-of-1024 inset)
 # was done once by scripts/make-icons.sh and lives in the committed master.
@@ -179,6 +205,10 @@ $ICON_PLIST
     <key>CFBundleVersion</key>               <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>        <string>$MACOS_MIN</string>
     <key>NSHighResolutionCapable</key>       <true/>
+    <!-- Sparkle: the feed of the latest release, the key its .dmg is signed with. -->
+    <key>SUFeedURL</key>                     <string>https://github.com/nsaintot/stemd/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>                 <string>$SPARKLE_PUBLIC_KEY</string>
+    <key>SUEnableAutomaticChecks</key>       <true/>
     <!-- Advertises _stemd._tcp and serves on the LAN. -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>Stemd advertises itself so players on this network can find it.</string>
@@ -186,8 +216,8 @@ $ICON_PLIST
 </plist>
 PLIST
 
-# Nothing nested to sign inside-out: one executable, no dylibs, and the
-# metallib is sealed as a resource.
+# Sparkle is signed inside-out, helpers first, before the bundle that seals
+# it. The metallib is sealed as a resource.
 #
 # A Developer ID where the machine has one, ad-hoc otherwise. The difference is
 # not cosmetic: an ad-hoc signature is trusted by the machine that made it and
@@ -204,9 +234,15 @@ if [ -z "$IDENTITY" ]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
 fi
 if [ -n "$IDENTITY" ]; then
+  for code in "$SPARKLE/Versions/B/Autoupdate" "$SPARKLE/Versions/B/Updater.app" "$SPARKLE"; do
+    codesign --force --sign "$IDENTITY" --options runtime --timestamp "$code"
+  done
   codesign --force --sign "$IDENTITY" --options runtime --timestamp "$APP"
   echo "  signed: $IDENTITY"
 else
+  for code in "$SPARKLE/Versions/B/Autoupdate" "$SPARKLE/Versions/B/Updater.app" "$SPARKLE"; do
+    codesign --force --sign - "$code"
+  done
   codesign --force --sign - "$APP" 2>/dev/null \
     && echo "  signed: ad-hoc, so this opens on this machine and nowhere else" \
     || echo "  signed: FAILED (may still run locally)"

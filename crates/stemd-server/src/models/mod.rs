@@ -38,6 +38,9 @@ pub use preset::{DEFAULT_PRESET, ModelSource, Preset, RETIRED, WEIGHTS_EXTENSION
 // names nothing there can use.
 #[cfg(windows)]
 pub use download::fetch_one as fetch_file;
+/// Used by the updater to download Setup.
+#[cfg(windows)]
+pub use download::stream_to_file;
 #[cfg(windows)]
 pub use preset::RemoteFile;
 

@@ -56,6 +56,10 @@ SetCompressor /SOLID lzma
 !define MULTIUSER_INSTALLMODE_INSTDIR "${NAME}"
 !define MULTIUSER_INSTALLMODE_INSTDIR_REGISTRY_KEY "${UNINST_KEY}"
 !define MULTIUSER_INSTALLMODE_INSTDIR_REGISTRY_VALUENAME "InstallLocation"
+; An update keeps the mode of the copy it replaces: the hive holding its
+; uninstall key, this account's first.
+!define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_KEY "${UNINST_KEY}"
+!define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_VALUENAME "InstallLocation"
 
 !include "MultiUser.nsh"
 !include "MUI2.nsh"
@@ -88,6 +92,7 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 !define MUI_FINISHPAGE_LINK_LOCATION "${HOMEPAGE}"
 
 !insertmacro MULTIUSER_PAGE_INSTALLMODE
+!define MUI_PAGE_CUSTOMFUNCTION_PRE ComponentsPre
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -128,6 +133,7 @@ FunctionEnd
 
 Section "Stemd" SecMain
   SectionIn RO
+  Call WaitForStemdToExit
   SetOutPath "$INSTDIR"
   ; Overwritten in place rather than uninstalled first: a previous install may
   ; hold the CUDA runtime, and removing it would mean downloading it again for
@@ -162,6 +168,9 @@ Section "Stemd" SecMain
     '"$INSTDIR\Uninstall.exe" /$MultiUser.InstallMode'
   WriteRegStr   SHCTX "${UNINST_KEY}" "QuietUninstallString" \
     '"$INSTDIR\Uninstall.exe" /$MultiUser.InstallMode /S'
+  ; Set again by the GPU section when it runs, so the next install offers the
+  ; same choice.
+  WriteRegDWORD SHCTX "${UNINST_KEY}" "GpuSupport" 0
   WriteRegDWORD SHCTX "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD SHCTX "${UNINST_KEY}" "NoRepair" 1
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
@@ -175,6 +184,7 @@ SectionEnd
 ; difference is a separation in seconds instead of minutes. A failed download
 ; leaves a working program on the CPU and the script to try again.
 Section "GPU support (CUDA runtime, 1.2 GB download)" SecCuda
+  WriteRegDWORD SHCTX "${UNINST_KEY}" "GpuSupport" 1
   DetailPrint "Fetching the CUDA runtime beside Stemd, about 1.2 GB..."
   nsExec::ExecToLog '"$INSTDIR\stemd-server.exe" --install-cuda'
   Pop $0
@@ -208,6 +218,77 @@ Function .onInit
   ; left unticked and greyed out rather than downloading 1.2 GB for nothing.
   ${IfNot} ${FileExists} "$SYSDIR\nvcuda.dll"
     SectionSetFlags ${SecCuda} ${SF_RO}
+  ${Else}
+    Call RememberGpuChoice
+  ${EndIf}
+FunctionEnd
+
+; The install mode whose GPU choice RememberGpuChoice last applied.
+Var GpuMode
+
+; Tick GPU support as the copy being replaced had it, in the hive of the
+; current install mode. A copy installed before `GpuSupport` existed counts as
+; having it when cudart64_13.dll is beside it. With the runtime in place the
+; section downloads nothing.
+Function RememberGpuChoice
+  StrCpy $GpuMode $MultiUser.InstallMode
+  !insertmacro SelectSection ${SecCuda}
+  ClearErrors
+  ReadRegDWORD $0 SHCTX "${UNINST_KEY}" "GpuSupport"
+  ${If} ${Errors}
+    ${If} ${FileExists} "$INSTDIR\Uninstall.exe"
+    ${AndIfNot} ${FileExists} "$INSTDIR\cudart64_13.dll"
+      !insertmacro UnselectSection ${SecCuda}
+    ${EndIf}
+  ${ElseIf} $0 == 0
+    !insertmacro UnselectSection ${SecCuda}
+  ${EndIf}
+FunctionEnd
+
+; The mode page may have switched to the other install: read its choice.
+Function ComponentsPre
+  ${If} ${FileExists} "$SYSDIR\nvcuda.dll"
+  ${AndIf} $GpuMode != $MultiUser.InstallMode
+    Call RememberGpuChoice
+  ${EndIf}
+FunctionEnd
+
+; The updater starts Setup just before Stemd quits. Overwriting a running
+; executable fails, and silent mode ignores the failure, so wait up to 60 s
+; for it to be released.
+Function WaitForStemdToExit
+  StrCpy $1 0
+  ${Do}
+    ${IfNot} ${FileExists} "$INSTDIR\stemd-server.exe"
+      ${Break}
+    ${EndIf}
+    ClearErrors
+    FileOpen $0 "$INSTDIR\stemd-server.exe" a
+    ${IfNot} ${Errors}
+      FileClose $0
+      ${Break}
+    ${EndIf}
+    ${If} $1 >= 120
+      DetailPrint "Stemd is still running; close it and run Setup again."
+      ${IfNot} ${Silent}
+        MessageBox MB_ICONSTOP|MB_OK "Stemd is still running. Close it and run Setup again."
+      ${EndIf}
+      Abort
+    ${EndIf}
+    Sleep 500
+    IntOp $1 $1 + 1
+  ${Loop}
+FunctionEnd
+
+; `/S /relaunch`, as the app's updater runs it: start Stemd once installed.
+Function .onInstSuccess
+  ${If} ${Silent}
+    ${GetParameters} $0
+    ClearErrors
+    ${GetOptions} $0 "/relaunch" $1
+    ${IfNot} ${Errors}
+      Call LaunchStemd
+    ${EndIf}
   ${EndIf}
 FunctionEnd
 

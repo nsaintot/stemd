@@ -20,6 +20,10 @@
 # NOTARY_KEY_P8 (base64 of an App Store Connect API key), NOTARY_KEY_ID, and
 # NOTARY_ISSUER for a team key. Without them the app is signed ad hoc and no .dmg is made; a
 # release tag fails.
+#
+# A release also gets appcast.xml, the Sparkle feed of the macOS app. The
+# secret UPDATE_SIGNING_KEY signs the .dmg in it; its public half is
+# packaging/update-ed25519.pub, which the bundle carries as SUPublicEDKey.
 name: CD
 
 on:
@@ -298,11 +302,22 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            .github/scripts
+            packaging/update-ed25519.pub
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Update feed
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: .github/scripts/appcast.sh "$VERSION" "$GITHUB_REF_NAME" dist
       # A draft, so nothing is public until published by hand. A rerun
       # replaces the files.
       - name: Draft release

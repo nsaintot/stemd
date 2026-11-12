@@ -146,6 +146,15 @@ macOS signing reads these repository secrets:
 Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
 release tag fails.
 
+A release also gets `appcast.xml`, the macOS app's Sparkle feed, written by
+`.github/scripts/appcast.sh`. Its release notes are the annotated tag's message.
+The app finds the feed under GitHub's "latest" release, so publish model
+releases (`models-v*`) with `gh release create --latest=false`.
+
+| secret | |
+| --- | --- |
+| `UPDATE_SIGNING_KEY` | base64 of the 32-byte Ed25519 seed that signs the `.dmg` in the feed; the public half is `packaging/update-ed25519.pub` |
+
 Windows installs CUDA 13.3.1 and cuDNN 9.14 from NVIDIA's redistributable
 archives with `.github/scripts/windows-cuda.ps1`, the versions stemd fetches
 at run time.
