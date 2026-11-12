@@ -3415,7 +3415,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stemd-audio"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "symphonia",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "stemd-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "stemd-core"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "claxon",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "stemd-mlx"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "mlx-rs",
@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "stemd-server"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",

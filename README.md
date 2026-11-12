@@ -1,125 +1,145 @@
 <div align="center">
 
-<img src="resources/stemd-icon-mac-256.png" width="120" alt="Stemd">
+<img src="resources/banner.png" width="100%" alt="Split any track into stems, on your own machine.">
 
 # Stemd
 
 **Split any track into stems, on your own machine.**
 
-Drop a file on the window. Get `harmonics`, `vocals` and `drums` in a folder
-beside it.
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+![GPU](https://img.shields.io/badge/GPU-Metal%20%7C%20CUDA-76b900)
 
-<img src="resources/screenshot.png" width="440" alt="The Stemd window: a drop zone reading Drop a track, and the Separated list below it">
-
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#install)
-[![GPU](https://img.shields.io/badge/GPU-Metal%20%7C%20CUDA-76b900)](#install)
+[Download for macOS](https://github.com/nsaintot/stemd/releases/latest) ·
+[Windows](https://github.com/nsaintot/stemd/releases/latest) ·
+[Linux](https://github.com/nsaintot/stemd/releases/latest)
 
 </div>
 
 ---
 
-## What you get
+## Introduction
 
-Three stems. In any lossless format the three files sum back to the original
-track bit for bit.
+Stemd separates a mixed track into its parts: vocals, drums, bass and the
+rest of the music. It runs the models on your own GPU, Metal on Apple silicon
+or CUDA on NVIDIA.
 
-| stem | contents |
-| --- | --- |
-| `vocals` | the voice |
-| `drums` | the kit |
-| `harmonics` | bass, keys, guitars, pads |
+Stemd is two things in one program:
 
-## Requirements
+- **A desktop app.** Drop a file on the window and the stems appear in a
+folder beside it.
+- **A separation server.** Other machines on the network find it by mDNS and
+send it audio over HTTP. A DJ player or a script on a small board can use
+the GPU of the Mac or PC next to it.
 
-| | |
-| --- | --- |
-| macOS | 14 or later, Apple silicon |
-| Windows | NVIDIA card and driver 580 or later, else CPU |
-| Linux | x86_64 or aarch64, glibc 2.35 or later, NVIDIA card, driver 580 or later |
-| disk | 168 MB to 942 MB of model weights, downloaded on first run |
+<div align="center">
+
+<img src="resources/screenshot.png" width="320" alt="The Stemd window: a drop zone reading Drop a track, and the Separated list below it">
+
+</div>
+
+## Features
+
+**In the window**
+
+- Drop a track, or click to choose one. Stems land besides the track in `<track>-stems/`.
+- Choose the parts: `harmonics`, `vocals` and `drums` by default, or split
+`harmonics` into `bass` and `other`.
+- FLAC, WAV, MP3 or raw PCM output, at 24, 44.1, 48 or 96 kHz.
+- In any lossless format the stems sum back to the original track bit for bit.
+- Three presets: Fast, Balanced and Quality. See [Presets](#presets).
+- A running or queued drop can be stopped from its row.
+- Built-in updates: Sparkle on macOS, a silent Setup on Windows, a notice on
+Linux.
+
+**As a server**
+
+- Plain HTTP on port `8420`: raw PCM in, stems out. The contract is in
+[docs/api.md](docs/api.md).
+- Announces itself over mDNS as `_stemd._tcp`, so a client needs no address.
+- `--headless` runs it without a window, on a desktop or a server.
+- Sessions separate a track piece by piece around a playhead. A player can
+start on the part under the needle before the whole track is done.
+- One job queue and one cache for drops and clients. A track separated once is
+a cache hit the next time, from a drop or a client.
+- `model_id` in `/v1/health` names the exact weights and settings behind the
+stems, so a client can key its own stem cache on it.
+- The server switch in the status bar turns the API off without closing the
+app.
+- `stemd-cli` is the reference client:
+  ```bash
+  stemd-cli path/to/track.wav
+  ```
 
 ## Install
 
-**macOS.** Open the `macos-arm64` disk image from the
-[latest release](https://github.com/nsaintot/stemd/releases/latest) and drag
-Stemd to Applications. Signed and notarized, and the ticket is stapled to the
-app as well as to the image, so it opens without argument and the first launch
-does not need a network.
 
-**Windows.** Run the `setup.exe` from the same page. It installs for you
-alone by default and asks for no administrator; the first page offers all users
-instead. There is a zip beside it for anyone who would rather not run an
-installer.
+| platform | download                                                                                               | needs                                           |
+| -------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| macOS    | [`stemd-<version>-macos-arm64.dmg`](https://github.com/nsaintot/stemd/releases/latest)                 | macOS 14 or later, Apple silicon                |
+| Windows  | [`stemd-<version>-setup.exe`](https://github.com/nsaintot/stemd/releases/latest) or `-windows-x64.zip` | NVIDIA driver 580 or later, else CPU            |
+| Linux    | [`.deb`, `.rpm`, `.AppImage`](https://github.com/nsaintot/stemd/releases/latest), x86\_64 or aarch64   | glibc 2.35 or later, NVIDIA driver 580 or later |
 
-On a machine with an NVIDIA card, tick the box at the end of the installer or run
-`install-cuda.cmd` once afterwards: about 1.2 GB of NVIDIA's own runtime, fetched
-once and pinned by digest. No toolkit and no repository. Without it Stemd runs on
-the CPU, correctly and far slower.
 
-**Linux.** Take the package for your distribution and architecture
-(`x86_64` or `aarch64`) from the
-[latest release](https://github.com/nsaintot/stemd/releases/latest). Each one
-carries the CUDA runtime and cuDNN, so the NVIDIA driver is the only thing the
-machine needs.
+Every link opens the latest release. The first run downloads the model
+weights, 168 MB to 942 MB depending on the preset.
 
-| | |
-| --- | --- |
-| Debian, Ubuntu | `sudo apt install ./stemd-*-linux-x86_64.deb` |
-| Fedora, RHEL 10 | `sudo dnf install ./stemd-*-linux-x86_64.rpm` |
-| anything else | `chmod +x stemd-*.AppImage && ./stemd-*.AppImage` |
+**macOS.** Open the disk image and drag Stemd to Applications. The app is
+signed and notarized, and the ticket is stapled, so the first launch needs no
+network.
 
-Built on Ubuntu 22.04, so any distribution with glibc 2.35 or later: Ubuntu
-22.04, Debian 12, Fedora 36, RHEL 10 and later. The aarch64 build is for
-NVIDIA's Arm servers and workstations, such as DGX Spark and Grace Hopper;
-on aarch64 without an NVIDIA card it has nothing to run on.
+**Windows.** Run `setup.exe`. It installs for the current user without
+administrator rights; the first page offers an install for all users. The zip
+is for running without an installer.
 
-## Use it
+For GPU separation, tick the CUDA box on the last page of the installer, or
+run `install-cuda.cmd` later. It fetches about 1.2 GB of NVIDIA's runtime,
+pinned by digest. Without it Stemd runs on the CPU, much slower.
 
-Drop a track on the window, or click to choose one. The stems appear in
-`<track>-stems/` next to the original.
+**Linux.** Each package carries the CUDA runtime and cuDNN; the NVIDIA driver
+is the only other requirement.
 
-### From another machine
 
-Stemd is also a server. It announces itself over mDNS, so a client does not need
-to be told an address, and it speaks plain HTTP:
+|                 |                                                   |
+| --------------- | ------------------------------------------------- |
+| Debian, Ubuntu  | `sudo apt install ./stemd-*-linux-x86_64.deb`     |
+| Fedora, RHEL 10 | `sudo dnf install ./stemd-*-linux-x86_64.rpm`     |
+| anything else   | `chmod +x stemd-*.AppImage && ./stemd-*.AppImage` |
 
-```bash
-stemd-cli path/to/track.wav
-```
 
-`--headless` runs it without a window. The HTTP contract is in
-[docs/api.md](docs/api.md).
+Supported: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 10 and later. The aarch64
+build targets NVIDIA Arm machines such as DGX Spark and Grace Hopper, and
+needs an NVIDIA GPU.
 
 ## Presets
 
-| preset | model | download |
-| --- | --- | --- |
-| **Fast** | `htdemucs` v4 | 168 MB |
-| Balanced | `htdemucs_ft` | 672 MB |
-| Quality | stemd RoFormer | 251 MB |
 
-Measured on a 64 s clip, warm, against a 6:38 track on an M1 Pro:
+| preset   | model          | download | drums     | bass     | other    | harmonics | vocals    | RTX 3090 Ti | M1 Pro |
+| -------- | -------------- | -------- | --------- | -------- | -------- | --------- | --------- | ----------- | ------ |
+| **Fast** | `htdemucs` v4  | 168 MB   | 8.27      | 8.17     | 5.14     | 8.62      | 8.92      | 106x        | 18x    |
+| Balanced | `htdemucs_ft`  | 672 MB   | 8.49      | **8.40** | 5.20     | 8.78      | 9.28      | 55x         | 8x     |
+| Quality  | stemd RoFormer | 251 MB   | **11.07** | 7.97     | **6.52** | **11.54** | **11.34** | 18x         | 3.6x   |
 
-| preset | RTX 3090 Ti | M1 Pro |
-| --- | --- | --- |
-| **Fast** | 106x realtime | 18x realtime |
-| Balanced | 55x | 8x |
-| Quality | 18x | 3.6x |
 
-The first separation after launch costs about twice the warm figure: the GPU
-kernels are compiled on first use.
+- Parts: SDR in dB, higher is better. Global SDR over the first 12 MUSDB18-HQ
+test tracks, full length, from the shipped server. `drums` is rebuilt from the
+mix, as the window writes it.
+- Speed: times realtime on a warm 64 s clip. The first separation after launch
+takes about twice as long while the GPU kernels compile.
+- Fast is the default. It won a listening test on real material against the
+other two.
 
-Fast is the default. It won a listening test on real material against the other
-two; see [docs/evaluation.md](docs/evaluation.md).
+Method and notes: [docs/evaluation.md](docs/evaluation.md#every-preset-per-part).
 
 ## Where things go
 
-| | |
-| --- | --- |
-| stems | `<track>-stems/`, beside the track |
-| models | the user data directory, downloaded once |
-| cache | recent results, capped at 4 GB, emptied at every start |
+
+|        |                                                        |
+| ------ | ------------------------------------------------------ |
+| stems  | `<track>-stems/`, beside the track                     |
+| models | the user data directory, downloaded once               |
+| cache  | recent results, capped at 4 GB, emptied at every start |
+
 
 Repeating a track already separated returns the cached result: entries are keyed
 by the audio and by everything else that changes the output.
@@ -137,13 +157,15 @@ cargo build --release
 
 ## Documentation
 
-| | |
-| --- | --- |
-| [docs/building.md](docs/building.md) | building, packaging and every flag |
-| [docs/api.md](docs/api.md) | the HTTP contract for writing a client |
-| [docs/internals.md](docs/internals.md) | cache, queue, discovery, model loading |
-| [docs/evaluation.md](docs/evaluation.md) | how the models were chosen and measured |
-| [docs/models.md](docs/models.md) | where the weights come from, and their licence |
+
+|                                          |                                                |
+| ---------------------------------------- | ---------------------------------------------- |
+| [docs/building.md](docs/building.md)     | building, packaging and every flag             |
+| [docs/api.md](docs/api.md)               | the HTTP contract for writing a client         |
+| [docs/internals.md](docs/internals.md)   | cache, queue, discovery, model loading         |
+| [docs/evaluation.md](docs/evaluation.md) | how the models were chosen and measured        |
+| [docs/models.md](docs/models.md)         | where the weights come from, and their licence |
+
 
 ## License
 
