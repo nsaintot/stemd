@@ -1,5 +1,5 @@
 //! The bottom bar: the server switch and port, what is stored, and the way to
-//! the log.
+//! the log. On Linux, also a newer release.
 //!
 //! The same state `/v1/health` reports: a second view, never a second source.
 
@@ -207,7 +207,7 @@ pub fn bar(
         tracing::info!("cache reset: {tracks} tracks, {:.0} MB", freed as f64 / 1e6);
     }
 
-    ui.painter().text(
+    let _stats = ui.painter().text(
         pos2(empty_rect.left() - GAP, y),
         egui::Align2::RIGHT_CENTER,
         format!(
@@ -219,6 +219,19 @@ pub fn bar(
         font,
         palette.muted,
     );
+
+    // Linux has no title bar of its own to carry the version, so a newer
+    // release shows here, between the two groups, where it fits.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = crate::update::status();
+        if status.opens()
+            && let Some(x) = super::update::fits(ui, &status, hit.right(), _stats.left())
+        {
+            let anchor = pos2(x, y);
+            super::update::slot(ui, anchor, egui::Align2::LEFT_CENTER, palette, 1.0);
+        }
+    }
 
     if logs_response
         .on_hover_cursor(egui::CursorIcon::PointingHand)

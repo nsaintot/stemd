@@ -340,15 +340,61 @@ Two things a bundle needs that a `cargo run` does not:
 - **`-psn_*` in argv is discarded.** Finder can pass a process serial number when
   launching a bundle, and clap would reject it as an unknown flag.
 
-`bundle-app.sh` copies one executable in. There is nothing to vendor: MLX links
-statically and embeds its Metal shaders, so the binary depends on system
-frameworks alone: no `Contents/Frameworks`, no `install_name_tool`, no rpath.
-The bundle is 29 MB where it used to be 223, and the 194 MB difference was five
-libtorch dylibs that had to be signed inside-out before the bundle itself could
-be. It is ad-hoc signed, which launches on the machine that built it and nowhere
-else; distribution needs a Developer ID, the hardened runtime and notarization.
+`bundle-app.sh` copies one executable in, with `mlx.metallib` and
+`Sparkle.framework`. MLX links statically, so the binary depends on system
+frameworks alone: no `install_name_tool`, no rpath. Sparkle is loaded at run
+time and signed before the bundle. Without a Developer ID the bundle is ad-hoc
+signed, which launches on the machine that built it and nowhere else;
+distribution needs a Developer ID, the hardened runtime and notarization.
 `Info.plist` carries `NSLocalNetworkUsageDescription` because the app advertises
-over mDNS and serves on the LAN.
+over mDNS and serves on the LAN, and Sparkle's `SUFeedURL` and `SUPublicEDKey`.
+
+## Updates
+
+`update/` checks for a newer release. The title bar has two parts:
+
+- the version, centred beside the title: a click checks for updates, and its
+  icon spins while it checks;
+- the update slot, in the corner away from the window buttons (right on
+  macOS, left on Windows): "Checking…", "Up to date" or "Check failed" for
+  2.6 s after a check, and "New update available!" once one is found. Its
+  gradient moves for 21 s, then only under the pointer.
+
+| host | check | slot click | install |
+| --- | --- | --- | --- |
+| macOS | Sparkle, daily, from `releases/latest/download/appcast.xml`; a probe on a click on the version; "Check for Updates…" in the app menu | Sparkle's window | Sparkle replaces the bundle and relaunches |
+| Windows | the newest `v*` release, at launch, daily and on a click | asks, then downloads Setup ("Downloading N%") | Setup, silently, once nothing is running; it restarts Stemd |
+| Linux | the newest `v*` release, at launch and daily | opens the release page | the package manager |
+
+Linux has no title bar of its own, so "New update available!" shows in the
+status bar, when it fits. On Windows:
+
+- Setup is checked against the SHA-256 GitHub records for the asset, and
+  again before it starts. A download with no data for 60 s fails.
+- The install mode is the uninstall key, per user then all users, whose
+  `InstallLocation` is the executable's folder. With no match (the zip), or
+  an all-users copy on a standard account, the slot opens the release page.
+- If Setup cannot start (consent declined), the app stays open and offers
+  the update again.
+- While a separation runs, queues or a model downloads, the slot says
+  "Update ready". Once idle, the app starts Setup with `/S /relaunch` and
+  the install mode, then quits; Setup waits for the executable to be free.
+- Quitting while the slot says "Update ready" starts Setup without
+  `/relaunch`.
+
+macOS reads `releases/latest/download/appcast.xml`, so a model release
+(`models-v*`) must be published with `--latest=false`; Windows and Linux pick
+the newest `v*` tag themselves.
+
+Setup reuses the choices of the copy it replaces, silently or not:
+
+| choice | remembered by |
+| --- | --- |
+| install mode | the hive holding the uninstall key, this account's first |
+| location | `InstallLocation` in that key |
+| GPU support | `GpuSupport` in that key; for an older copy, `cudart64_13.dll` beside it |
+
+With the CUDA runtime already usable, the GPU section downloads nothing.
 
 ## Tools
 

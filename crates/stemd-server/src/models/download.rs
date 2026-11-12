@@ -85,7 +85,7 @@ pub fn fetch_one(
 }
 
 /// Copy `reader` into `path`, returning the digest and length of what landed.
-fn stream_to_file(
+pub fn stream_to_file(
     reader: impl Read,
     path: &Path,
     on_bytes: impl FnMut(u64),

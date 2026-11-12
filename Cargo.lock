@@ -3475,6 +3475,8 @@ dependencies = [
  "eframe",
  "if-addrs",
  "libc",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
  "parking_lot",
  "serde",
  "serde_json",

@@ -1,10 +1,12 @@
-//! The window's own title bar on macOS and Windows: the name and version centred
-//! and, on Windows, the window buttons on the right. macOS keeps its traffic
+//! The window's own title bar on macOS and Windows: the name and version
+//! centred, the update slot in the corner away from the window buttons and,
+//! on Windows, the window buttons on the right. macOS keeps its traffic
 //! lights. Linux keeps the system's title bar.
 
-use eframe::egui::{self, Rect, pos2, vec2};
+use eframe::egui::{self, Align2, Rect, pos2, vec2};
 
 use super::theme::{self, Palette, Weight};
+use super::update;
 
 /// Height of the bar. The content starts under it.
 pub const HEIGHT: f32 = if cfg!(target_os = "macos") {
@@ -40,30 +42,36 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette) {
         theme::font(12.0, Weight::Semibold),
         palette.text.gamma_multiply(dim),
     );
-    let version = painter.layout_no_wrap(
-        format!("v{}", env!("CARGO_PKG_VERSION")),
-        theme::font(12.0, Weight::Regular),
-        palette.muted.gamma_multiply(dim),
-    );
+    let status = crate::update::status();
     let y = bar.top() + TEXT_Y;
-    let width = name.size().x + 6.0 + version.size().x;
+    let width = name.size().x + GAP + update::version_width(ui);
     // Centred, as macOS draws window titles.
     let x = bar.center().x - width / 2.0;
-    let version_x = x + name.size().x + 6.0;
+    let version_x = x + name.size().x + GAP;
     painter.galley(
         pos2(x, y - name.size().y / 2.0),
         name,
         palette.text.gamma_multiply(dim),
     );
-    painter.galley(
-        pos2(version_x, y - version.size().y / 2.0),
-        version,
-        palette.muted.gamma_multiply(dim),
-    );
 
     #[cfg(windows)]
     windows::controls(ui, &ctx, bar, screen, palette, dim);
+
+    // After the controls, so they take clicks over the drag area.
+    update::version(ui, version_x, y, &status, palette, dim);
+    let (anchor, align) = if cfg!(windows) {
+        (pos2(bar.left() + CORNER, y), Align2::LEFT_CENTER)
+    } else {
+        (pos2(bar.right() - CORNER, y), Align2::RIGHT_CENTER)
+    };
+    update::slot(ui, anchor, align, palette, dim);
 }
+
+/// Space between the name and the version button.
+const GAP: f32 = 4.0;
+
+/// Inset of the update slot from the window's side.
+const CORNER: f32 = 14.0;
 
 #[cfg(windows)]
 mod windows {

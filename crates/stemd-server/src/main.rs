@@ -39,6 +39,7 @@ mod switch;
 #[cfg(test)]
 mod testkit;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use tracing_subscriber::Layer;

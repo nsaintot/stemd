@@ -26,6 +26,7 @@ mod starting;
 mod status;
 mod theme;
 mod titlebar;
+mod update;
 mod widgets;
 
 use std::net::SocketAddr;
@@ -147,6 +148,7 @@ pub fn run(launch: Arc<Launch>, bind: SocketAddr) -> Result<(), eframe::Error> {
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
+            crate::update::start(&cc.egui_ctx);
             Ok(Box::new(App {
                 launch,
                 bind,
@@ -198,7 +200,19 @@ impl eframe::App for App {
             }
             None => starting::show(ui, &self.launch, &mut self.first_run, &self.brushes),
         }
-        titlebar::show(ui, &Palette::of(ui.ctx()));
+        let palette = Palette::of(ui.ctx());
+        // Idle: nothing running, queued or downloading, so Setup may close the
+        // window. Never while starting, which may be fetching the weights.
+        let idle = self.window.as_ref().is_some_and(|w| {
+            w.state.queue.running().is_none()
+                && w.state.queue.depth() == 0
+                && matches!(
+                    w.state.switcher.state(),
+                    SwitchState::Idle | SwitchState::Failed { .. }
+                )
+        });
+        update::dialog(ui.ctx(), idle, &palette, &self.brushes);
+        titlebar::show(ui, &palette);
     }
 
     /// eframe saves only the window's position and size.
@@ -212,6 +226,7 @@ impl eframe::App for App {
     /// `LoopExiting` to here, and AppKit calls `exit()` as soon as that returns. It is
     /// the last point at which the worker can be taken out of the model.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::update::run_installer();
         crate::shutdown::quit(&self.launch, "window closed")
     }
 }
