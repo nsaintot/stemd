@@ -96,7 +96,9 @@ pub const COMPONENTS: &[RemoteFile] = &[
 /// Point MLX's run-time kernel compiler at the CUDA headers shipped beside
 /// the executable, so a machine without the toolkit can compile them.
 pub fn point_at_bundled_headers() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
     let cuda = dir.join("cuda");
     if cuda.join("include").join("cuda_runtime.h").is_file() {

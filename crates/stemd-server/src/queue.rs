@@ -677,9 +677,9 @@ fn write_job_pieces(
     let id = track_id(mix);
     let gain = gain(&output, mix.peak().ok());
     let name = type_dir(&output, gain);
-    let mut all = output;
+    let mut all = output.clone();
     all.derived = true;
-    let converted = crate::cache::to_output_rate(mix, stems, all)?;
+    let converted = crate::cache::to_output_rate(mix, stems, &all)?;
     let (model, out) = (u64::from(mix.sample_rate), u64::from(output.rate.hz()));
     let frames = mix.frames();
     let count = frames.div_ceil(stride);
@@ -771,7 +771,7 @@ fn separate_one(
                 && let Ok(grid) = segmenting.grid(work.mix.frames())
             {
                 let (mix, output, model_id) =
-                    (work.mix.clone(), work.output, work.model_id.clone());
+                    (work.mix.clone(), work.output.clone(), work.model_id.clone());
                 let stride = grid.stride().unsigned_abs() as usize;
                 std::thread::spawn(move || {
                     if let Err(err) =
@@ -804,7 +804,7 @@ fn publish(job: &Job, work: &QueuedWork, stems: &Stems, cache: &Cache, elapsed: 
     //  `separation_secs` is the model's cost by definition. Writing can cost more than
     //  separating, and used to appear in no total anyone saw.
     let writing = std::time::Instant::now();
-    match cache.publish(&job.key, &work.mix, stems, work.output, elapsed) {
+    match cache.publish(&job.key, &work.mix, stems, work.output.clone(), elapsed) {
         Ok(entry) => {
             tracing::info!(
                 job = %job.id,
@@ -1197,7 +1197,7 @@ mod tests {
                     format: StemFormat::Pcm32,
                     rate: OutputRate::default(),
                     derived: false,
-                    dsp: DspMode::default(),
+                    dsp: DspMode::default().into(),
                     parts: stemd_core::Parts::DEFAULT,
                 },
                 model_id: "test".into(),
@@ -1678,7 +1678,7 @@ mod session_tests {
             format,
             rate: OutputRate::default(),
             derived: true,
-            dsp: DspMode::default(),
+            dsp: DspMode::default().into(),
             parts: Parts::DEFAULT,
         }
     }

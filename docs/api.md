@@ -109,7 +109,8 @@ POST /v1/jobs?sample_rate=44100&channels=2&format=f32le
 | `output_sample_rate` | `default_output_sample_rate` | `24000`, `44100`, `48000` or `96000` |
 | `include_derived` | `false` | ship the derived part too, rather than leaving the client to rebuild it |
 | `parts` | `harmonics,vocals` | comma-separated parts to ship; see below |
-| `dsp_mode` | `0` | filter the output conversion runs through; see below |
+| `dsp_mode` | `0` | filter the output conversion runs through; numbered modes are deprecated, see below |
+| `dsp_filter` | none | id of an uploaded filter to use instead; see below |
 
 The two defaults are set in the server's window and persist across its launches,
 so read them from `/v1/health` rather than assuming, they are not constants.
@@ -158,6 +159,11 @@ Every model separates four sources: `drums`, `bass`, `other` and `vocals`.
 Mode `0` is a general resampler and handles any rate pair. It is the default and
 almost certainly what you want.
 
+The numbered modes are deprecated. Mode 1 stays for clients that already send
+it; a new client uploads its converter's taps and sends
+[`dsp_filter`](#dsp_filter). Mode 1 and its taps uploaded as a filter give the
+same samples.
+
 A numbered mode is a copy of one particular client's own converter, and exists
 for one case: a client that rebuilds `drums = mix - harmonics - vocals` has to
 resample its mix to the stems' rate, and that subtraction only cancels if both
@@ -180,6 +186,56 @@ client subtracts from went through the same taps.
 curl -X POST --data-binary @track.pcm \
   "http://host:8420/v1/jobs?format=s16le&output_sample_rate=96000&dsp_mode=1"
 ```
+
+#### `dsp_filter`
+
+A client can upload its own converter and name it on a job. Servers that support
+this list `dsp-filters` in `features`. The server keeps up to `max_dsp_filters`
+(in `/v1/health`) across restarts, and evicts the least recently used past
+that. Uploading or naming a filter counts as a use.
+
+```
+PUT /v1/filters/<id>     body: the filter file; 201 when new, 200 when already stored
+GET /v1/filters/<id>     200 with the summary, or 404
+```
+
+`<id>` is the lowercase hex SHA-256 of the file. The file, little-endian:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | magic `SFIR` |
+| 4 | 4 | version, `u32`, `1` |
+| 8 | 4 | input rate, `u32`: the model's rate, `sample_rate` in `/v1/health` |
+| 12 | 4 | output rate, `u32`: one of `output_sample_rates` |
+| 16 | 4 × n | prototype taps, `f32` |
+
+The filter is a stateless polyphase FIR. With `L / M = out / in` in lowest terms
+and `n = L × B` taps `p`, output frame `m` is
+
+```
+y[m] = sum over k of x[k] * p[m*M - k*L]
+```
+
+with `p` and `x` zero outside their range. The output has `ceil(frames * L / M)`
+frames. Taps are applied as given (unity passband gain means they sum to `L`) and
+no delay is compensated. `B` is at most 1024 and `n` at most 1,048,576.
+
+Both answers carry `{"id", "in_rate", "out_rate", "taps", "branch_taps"}`. A
+malformed file, or one whose hash is not `<id>`, is a `400` naming the problem.
+
+A job naming a filter must convert exactly its pair, like a numbered mode, and
+may not also set a non-zero `dsp_mode`. A filter the server does not hold is a
+`404` with `"code": "unknown_filter"`: upload it and resend the job.
+
+```bash
+id=$(shasum -a 256 player.fir | cut -d' ' -f1)
+curl -X PUT --data-binary @player.fir "http://host:8420/v1/filters/$id"
+curl -X POST --data-binary @track.pcm \
+  "http://host:8420/v1/jobs?format=s16le&output_sample_rate=96000&dsp_filter=$id"
+```
+
+A server without the `dsp-filters` feature ignores `dsp_filter` and uses mode 0,
+so check `features` before relying on it.
 
 ### 2. Poll the returned job id
 
@@ -335,7 +391,7 @@ POST /v1/sessions?frames=<track length>&format=f32le&output_format=f32le&mean=<m
 | --- | --- |
 | `frames` | Required. Track length. |
 | `sample_rate`, `channels`, `format` | The upload. `sample_rate` must be the model's rate. |
-| `output_format`, `output_sample_rate`, `parts`, `include_derived`, `dsp_mode` | As for `/v1/jobs`. `mp3` is refused. |
+| `output_format`, `output_sample_rate`, `parts`, `include_derived`, `dsp_mode`, `dsp_filter` | As for `/v1/jobs`. `mp3` is refused. |
 | `mean`, `std` | Optional. Mean and standard deviation of the mono mixdown `(L + R) / 2` over the whole track, in f64, sent as f32. |
 | `peak` | Optional. Largest absolute sample of the mix, both channels. Sets the gain, and so the piece directory: send it to share pieces with whole-track jobs, which use the true peak. |
 
@@ -439,7 +495,7 @@ On disk, under `--pieces-dir` (default `stemd-pieces` in the platform's cache
 directory, capped by `--pieces-max-gb`, least recently used first):
 
 ```
-<model_id>/<format>-<rate>[-dsp<N>]-<parts>-g<gain>/<track id>/<stem>/<k>.<ext>
+<model_id>/<format>-<rate>[-dsp<N>|-fir<id>]-<parts>-g<gain>/<track id>/<stem>/<k>.<ext>
 htdemucs-22c7f2c9/flac-44100-harmonics.vocals-g1/f9c29cbfe3466b674f9903d9/vocals/0003.flac
 ```
 
@@ -496,8 +552,15 @@ The server advertises `_stemd._tcp`. TXT records carry enough to decide
 compatibility without a round trip:
 
 ```
-model=htdemucs  path=/v1  v=1  version=0.1.0
+features=dsp-filters  model=htdemucs  path=/v1  v=1  version=0.2.1
 ```
+
+`features` lists behaviors added since protocol 1, comma-separated. `/v1/health`
+has the same list as `features`.
+
+| Feature | Since | Meaning |
+| --- | --- | --- |
+| `dsp-filters` | 0.2.1 | `PUT /v1/filters/{id}` and the `dsp_filter` parameter. |
 
 **`v=1` is the whole contract.** It means a job that names no `parts` gets two
 stems (`harmonics` and `vocals`) and a third the client rebuilds from the mix
@@ -545,8 +608,10 @@ that the model separated badly.
 
 All three files are written as FLAC at one shared scale, so they can be auditioned
 against each other. `--wav-f32` writes unscaled float wavs for a DAW instead;
-`--f32` uploads and receives float; `--dsp-mode` asks for a numbered filter and
-is refused locally if this server does not offer it.
+`--f32` uploads and receives float; `--dsp-filter <file>` uploads a filter file
+if the server does not hold it and converts the stems through it; `--dsp-mode`
+asks for a deprecated numbered filter. Both are refused locally if this server
+does not offer them.
 
 A file at any other rate is uploaded as it is and converted server-side, with a
 note saying so. `mix - stems` needs both sides at one rate to line up, so `drums`

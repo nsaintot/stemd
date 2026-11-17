@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::client::{Formats, Health, JobResult, Server};
@@ -80,10 +80,17 @@ struct Args {
     /// Filter the server converts the stems with. 0, the default, converts any
     /// rate pair; a numbered mode covers one pair and is refused on any other.
     ///
-    /// Only ask for one if you are subtracting the stems from a mix converted by
-    /// that same filter. `/v1/health` lists what a server offers.
-    #[arg(long)]
+    /// Deprecated: use --dsp-filter. Only ask for one if you are subtracting the
+    /// stems from a mix converted by that same filter. `/v1/health` lists what a
+    /// server offers.
+    #[arg(long, conflicts_with = "dsp_filter")]
     dsp_mode: Option<u8>,
+
+    /// Filter file (`.fir`) the server converts the stems with. Uploaded first
+    /// if the server does not hold it. Needs --output-sample-rate set to the
+    /// filter's output rate; see `dsp_filter` in docs/api.md for the format.
+    #[arg(long)]
+    dsp_filter: Option<PathBuf>,
 
     /// Seconds to wait for mDNS discovery.
     #[arg(long, default_value_t = 5)]
@@ -115,12 +122,14 @@ fn main() -> Result<()> {
     report_server(&health);
 
     check_rate(&args, &health)?;
+    let filter = upload_filter(&args, &health, &server)?;
     let audio = load_input(&args, &health)?;
     let formats = Formats::new(args.f32)
         .at_rate(args.output_sample_rate)
         .with_derived(args.include_derived)
         .with_parts(args.parts.as_deref())
-        .with_dsp_mode(args.dsp_mode);
+        .with_dsp_mode(args.dsp_mode)
+        .with_dsp_filter(filter.as_deref());
 
     let started = Instant::now();
     let result = separate(&server, &audio, formats)?;
@@ -173,6 +182,39 @@ fn check_rate(args: &Args, health: &Health) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Make sure the server holds the `--dsp-filter` file, and return its id.
+fn upload_filter(args: &Args, health: &Health, server: &Server) -> Result<Option<String>> {
+    let Some(path) = &args.dsp_filter else {
+        return Ok(None);
+    };
+    if !health.has("dsp-filters") {
+        bail!("this server does not take uploaded filters; it has no `dsp-filters` feature");
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let (filter, uploaded) = server.ensure_filter(&bytes)?;
+    if args.output_sample_rate != Some(filter.out_rate) {
+        bail!(
+            "{} converts to {} Hz; pass --output-sample-rate {}",
+            path.display(),
+            filter.out_rate,
+            filter.out_rate
+        );
+    }
+    println!(
+        "filter       : {} ({} to {} Hz, {} taps), {}",
+        &filter.id[..12],
+        filter.in_rate,
+        filter.out_rate,
+        filter.taps,
+        if uploaded {
+            "uploaded"
+        } else {
+            "already on the server"
+        }
+    );
+    Ok(Some(filter.id))
 }
 
 fn report_server(health: &Health) {

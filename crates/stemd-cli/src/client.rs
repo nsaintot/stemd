@@ -32,6 +32,24 @@ pub struct Health {
     /// DSP modes this server offers. Empty when it is too old to say.
     #[serde(default)]
     pub dsp_modes: Vec<u8>,
+    /// Behaviors added after protocol 1, such as `dsp-filters`.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl Health {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+/// A conversion filter as the server describes it.
+#[derive(Debug, Deserialize)]
+pub struct FilterSummary {
+    pub id: String,
+    pub in_rate: u32,
+    pub out_rate: u32,
+    pub taps: usize,
 }
 
 const fn default_rate() -> u32 {
@@ -115,8 +133,10 @@ pub struct Formats<'a> {
     pub derived: bool,
     /// Comma-separated parts to ship, when not the server's default.
     pub parts: Option<&'a str>,
-    /// Filter the server converts the stems with, when not its default.
+    /// Numbered filter the server converts the stems with, when not its default.
     pub dsp: Option<u8>,
+    /// Id of an uploaded filter the server converts the stems with.
+    pub dsp_filter: Option<&'a str>,
 }
 
 impl<'a> Formats<'a> {
@@ -131,6 +151,7 @@ impl<'a> Formats<'a> {
                 derived: false,
                 parts: None,
                 dsp: None,
+                dsp_filter: None,
             }
         } else {
             Self {
@@ -140,6 +161,7 @@ impl<'a> Formats<'a> {
                 derived: false,
                 parts: None,
                 dsp: None,
+                dsp_filter: None,
             }
         }
     }
@@ -165,6 +187,12 @@ impl<'a> Formats<'a> {
     #[must_use]
     pub const fn with_dsp_mode(mut self, dsp: Option<u8>) -> Self {
         self.dsp = dsp;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_dsp_filter(mut self, id: Option<&'a str>) -> Self {
+        self.dsp_filter = id;
         self
     }
 }
@@ -211,12 +239,42 @@ impl Server {
         if let Some(mode) = formats.dsp {
             url.push_str(&format!("&dsp_mode={mode}"));
         }
+        if let Some(id) = formats.dsp_filter {
+            url.push_str(&format!("&dsp_filter={id}"));
+        }
         let response = ureq::post(&url)
             .header("content-type", "application/octet-stream")
             .send(body)
             .map_err(|e| anyhow::anyhow!("submitting job: {e}"))?;
         let created: Created = serde_json::from_str(&read_body(response)?)?;
         Ok(created.id)
+    }
+
+    /// Make sure the server holds the filter file `bytes`, uploading it if not.
+    /// `true` in the second field when it was uploaded.
+    pub fn ensure_filter(&self, bytes: &[u8]) -> Result<(FilterSummary, bool)> {
+        use sha2::{Digest, Sha256};
+        let id = format!("{:x}", Sha256::digest(bytes));
+        let url = format!("{}/v1/filters/{id}", self.base);
+        match ureq::get(&url).call() {
+            Ok(response) => Ok((serde_json::from_str(&read_body(response)?)?, false)),
+            Err(ureq::Error::StatusCode(404)) => {
+                let response = ureq::put(&url)
+                    .header("content-type", "application/octet-stream")
+                    .config()
+                    .http_status_as_error(false)
+                    .build()
+                    .send(bytes)
+                    .map_err(|e| anyhow::anyhow!("PUT {url}: {e}"))?;
+                let status = response.status();
+                let body = read_body(response)?;
+                if !status.is_success() {
+                    bail!("the server refused the filter ({status}): {body}");
+                }
+                Ok((serde_json::from_str(&body)?, true))
+            }
+            Err(e) => bail!("GET {url}: {e}"),
+        }
     }
 
     /// Poll until the job reaches a terminal stage, reporting progress changes

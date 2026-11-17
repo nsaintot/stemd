@@ -45,133 +45,44 @@
 
 use std::sync::OnceLock;
 
+use super::polyphase::Polyphase;
 use crate::pcm::Audio;
 
 pub const IN_RATE: u32 = 44_100;
 pub const OUT_RATE: u32 = 96_000;
 
-/// `96000/44100` reduced. The interpolation and decimation factors.
-const L: usize = 320;
-const M: usize = 147;
-
-/// Taps per polyphase branch: 18880 / 320.
-const BRANCH: usize = 59;
-
 /// The prototype at its native 320 × 44100 = 14.112 MHz grid, little-endian f32,
-/// normalised so a unit impulse in gives the prototype out.
+/// normalised so a unit impulse in gives the prototype out. 18880 taps: 320
+/// branches of 59.
 static PROTO_LE: &[u8] = include_bytes!("../../data/mode1_proto_f32.bin");
 
-/// The prototype split into its 320 branches and each one reversed, so
-/// `branch[r][i] = p[r + 320*(58 - i)]`.
-///
-/// Reversed because tap `j` reaches back `j` input samples: laid this way the
-/// window and its taps are both walked forward over contiguous memory, which lets
-/// the dot product vectorise.
-fn branches() -> &'static [[f32; BRANCH]] {
-    static B: OnceLock<Vec<[f32; BRANCH]>> = OnceLock::new();
-    B.get_or_init(|| {
-        let p: Vec<f32> = PROTO_LE
+fn filter() -> &'static Polyphase {
+    static F: OnceLock<Polyphase> = OnceLock::new();
+    F.get_or_init(|| {
+        let taps: Vec<f32> = PROTO_LE
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_eq!(p.len(), L * BRANCH, "prototype is not 320 x 59 taps");
-        (0..L)
-            .map(|r| std::array::from_fn(|i| p[r + L * (BRANCH - 1 - i)]))
-            .collect()
+        let filter = Polyphase::new(IN_RATE, OUT_RATE, &taps).expect("mode 1 prototype");
+        assert_eq!(filter.branch_taps(), 59, "prototype is not 320 x 59 taps");
+        filter
     })
 }
 
-/// Output frames `m0 .. m0 + dst.len()` of one channel.
-///
-/// A range rather than a whole channel because every output frame is an
-/// independent dot product: the work splits anywhere, and `m0` is all a worker
-/// needs to place itself.
-fn fill(src: &[f32], m0: usize, dst: &mut [f32], b: &[[f32; BRANCH]]) {
-    // `newest` is the newest input sample an output frame reaches and `r` the
-    // phase it lands on -- together `m*147/320` and `m*147 % 320`. Computed once
-    // here and then carried forward: a division and a modulo per output frame is
-    // a real cost at 38 million of them, and the recurrence is exact.
-    let start = m0 * M;
-    let mut newest = start / L;
-    let mut r = start % L;
-
-    for o in dst.iter_mut() {
-        let taps = &b[r];
-
-        // Accumulated wide, then rounded once. Summing 59 products in f32
-        // tracks the device to -127 dB; in f64 it tracks to -142, which says the
-        // device carries more than f32 across the sum. Both are far below the 16
-        // bits a stem is encoded at -- this just declines to spend the margin.
-        let acc: f64 = if newest >= BRANCH - 1 && newest < src.len() {
-            // Interior: the whole window is in range, so no bounds test per tap
-            // and both slices run forward.
-            src[newest + 1 - BRANCH..=newest]
-                .iter()
-                .zip(taps)
-                .map(|(x, t)| f64::from(*x) * f64::from(*t))
-                .sum()
-        } else {
-            // Head and tail, where the window hangs off the signal. The device
-            // sees zeros there and so do we -- that is the whole of its edge
-            // behaviour, and it is why the captured reference nulls at its
-            // first and last samples as well as its middle.
-            (0..BRANCH)
-                .filter_map(|j| {
-                    let k = newest.checked_sub(j)?;
-                    Some(f64::from(*src.get(k)?) * f64::from(taps[BRANCH - 1 - j]))
-                })
-                .sum()
-        };
-        #[expect(clippy::cast_possible_truncation, reason = "f32 output by design")]
-        {
-            *o = acc as f32;
-        }
-
-        r += M;
-        if r >= L {
-            r -= L;
-            newest += 1;
-        }
-    }
-}
-
-/// How many output frames `frames` input frames become.
-///
-/// The ratio, truncated. The device allocates more than this and zero-fills the
-/// slack, so matching its buffer would copy an artefact of its block size;
-/// matching its samples is what alignment needs.
+/// How many output frames `frames` input frames become: `ceil(frames * 320 / 147)`.
 #[must_use]
 pub fn out_frames(frames: usize) -> usize {
-    frames * L / M
+    filter().out_frames(frames)
 }
 
 /// Resample 44.1 kHz `audio` to 96 kHz exactly as the target player does.
 ///
-/// The caller has already established the rate; this does not check it, because
-/// the coefficients describe one conversion and nothing else.
+/// Panics unless `audio` is at [`IN_RATE`]; the caller checks the rate first.
 #[must_use]
 pub fn resample(audio: &Audio) -> Audio {
-    let b = branches();
-    let n_out = out_frames(audio.frames());
-
-    //  Spread over the machine. Every output frame is an independent dot product
-    //  reading a shared immutable input, so this splits by output range with no seams,
-    //  and it runs at the end of a job the caller is already blocked on. Two channels
-    //  alone left most of the machine unused.
-    let mut planes: Vec<Vec<f32>> = audio.data.iter().map(|_| vec![0.0f32; n_out]).collect();
-    let par = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let slices = par.div_ceil(planes.len().max(1)).max(1);
-    let chunk = n_out.div_ceil(slices).max(1);
-
-    std::thread::scope(|s| {
-        for (src, out) in audio.data.iter().zip(planes.iter_mut()) {
-            for (i, dst) in out.chunks_mut(chunk).enumerate() {
-                s.spawn(move || fill(src, i * chunk, dst, b));
-            }
-        }
-    });
-
-    Audio::new(planes, OUT_RATE)
+    filter()
+        .resample(audio)
+        .expect("the caller checked the input rate")
 }
 
 #[cfg(test)]
@@ -258,6 +169,8 @@ mod tests {
         assert_eq!(out_frames(2205), 4800);
         assert_eq!(out_frames(44_100), 96_000);
         assert_eq!(out_frames(0), 0);
+        assert_eq!(out_frames(1), 3);
+        assert_eq!(out_frames(100_000), 217_688);
     }
 
     /// Silence in, silence out, and no panic on an empty plane.

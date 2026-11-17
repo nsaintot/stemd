@@ -7,7 +7,7 @@
 //! | Level   | Example                                        |
 //! |---------|------------------------------------------------|
 //! | `model_id` | `htdemucs-22c7f2c9`, as in `/v1/health`     |
-//! | `type`  | `flac-44100-harmonics.vocals-g0.70710677`, plus `-dsp1` when not 0 |
+//! | `type`  | `flac-96000-dsp1-harmonics.vocals-g1`; `-dsp1` or `-fir<id>` names the filter |
 //! | `track` | the 24-hex track id, see [`crate::sessions::track_id`] |
 //! | `k`     | piece index, four digits                       |
 //!
@@ -23,18 +23,13 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use stemd_core::DspMode;
 
 use crate::cache::Output;
 use crate::sessions::{RESAMPLE_CONTEXT, Sessions, Track};
 
 /// The directory name for one output at one gain.
 pub fn type_dir(output: &Output, gain: f32) -> String {
-    let dsp = if output.dsp == DspMode::General {
-        String::new()
-    } else {
-        format!("-dsp{}", output.dsp)
-    };
+    let dsp = output.dsp.dir_suffix();
     let parts: Vec<&str> = output.parts.names().collect();
     format!(
         "{}-{}{dsp}-{}-g{gain}",
@@ -197,7 +192,7 @@ impl Pieces {
         for session in sessions.of_track(track) {
             let name = type_dir(&session.output, session.gain);
             if !outputs.iter().any(|(n, _, _)| *n == name) {
-                let mut output = session.output;
+                let mut output = session.output.clone();
                 output.derived = true;
                 outputs.push((name, output, session.gain));
             }
@@ -290,14 +285,14 @@ mod tests {
             format: StemFormat::Flac,
             rate: OutputRate::default(),
             derived: false,
-            dsp: DspMode::General,
+            dsp: stemd_core::DspMode::General.into(),
             parts: Parts::DEFAULT,
         };
         assert_eq!(
             type_dir(&output, std::f32::consts::FRAC_1_SQRT_2),
             "flac-44100-harmonics.vocals-g0.70710677"
         );
-        output.dsp = DspMode::Mode1;
+        output.dsp = stemd_core::DspMode::Mode1.into();
         output.rate = OutputRate::Hz96000;
         assert_eq!(
             type_dir(&output, 1.0),
@@ -308,6 +303,17 @@ mod tests {
             type_dir(&output, 1.0),
             "flac-96000-dsp1-harmonics.vocals-g1",
             "the derived part is one more file, not another type"
+        );
+
+        let body = crate::filters::encode(44_100, 96_000, &[1.0; 320]);
+        let id = crate::filters::id_of(&body);
+        output.dsp = crate::filters::Dsp::Fir(std::sync::Arc::new(crate::filters::Fir {
+            id: id.clone(),
+            poly: crate::filters::parse(&body).unwrap(),
+        }));
+        assert_eq!(
+            type_dir(&output, 1.0),
+            format!("flac-96000-fir{id}-harmonics.vocals-g1")
         );
     }
 

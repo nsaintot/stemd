@@ -28,6 +28,7 @@
 //! unless a job names it.
 
 pub mod mode1;
+pub mod polyphase;
 
 use std::fmt;
 use std::str::FromStr;
