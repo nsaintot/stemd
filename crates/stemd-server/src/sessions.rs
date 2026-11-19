@@ -148,6 +148,11 @@ impl Spans {
     pub fn as_pairs(&self) -> Vec<[usize; 2]> {
         self.0.iter().map(|r| [r.start, r.end]).collect()
     }
+
+    /// Samples in all spans together.
+    pub fn total(&self) -> usize {
+        self.0.iter().map(|r| r.end - r.start).sum()
+    }
 }
 
 /// The segments a window asks for, in the order to run them.
@@ -532,6 +537,19 @@ impl Track {
         stemd_core::stems::remainder(&excerpt(&state.mix, from, to), parts.iter())
     }
 
+    /// Pieces ready in memory or `stored`, samples uploaded, and samples ready or stored.
+    fn counts(&self, stored: &HashSet<usize>) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        let mut covered = state.ready.clone();
+        for &k in stored {
+            covered.insert(self.piece(k));
+        }
+        let ready = (0..self.spec.grid.len())
+            .filter(|&k| covered.covers(&self.piece(k)))
+            .count();
+        (ready, state.arrived.total(), covered.total())
+    }
+
     fn summary(&self) -> TrackSummary {
         let state = self.state.lock();
         TrackSummary {
@@ -609,6 +627,40 @@ pub struct StemView {
     pub gain: f32,
 }
 
+/// What the window shows of a session. It carries no track id or name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Activity {
+    /// Counts sessions from 1 since the server started.
+    pub number: u64,
+    pub frames: usize,
+    pub sample_rate: u32,
+    /// Pieces in the track.
+    pub pieces: usize,
+    /// Pieces ready in memory or in the piece store.
+    pub ready: usize,
+    /// Samples uploaded.
+    pub arrived: usize,
+    /// Samples ready in memory or in a stored piece.
+    pub covered: usize,
+    /// Planned segments not run yet at critical priority.
+    pub critical: usize,
+    /// Planned segments not run yet at bonus priority.
+    pub bonus: usize,
+    /// True when a planned segment can run now.
+    pub runnable: bool,
+}
+
+/// A session that ended, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub number: u64,
+    pub reason: String,
+    pub at: Instant,
+}
+
+/// Ended sessions kept for the window.
+const ENDED_KEPT: usize = 8;
+
 /// A range read back from a track, at the output rate.
 pub struct Excerpt {
     pub audio: Audio,
@@ -625,6 +677,8 @@ struct SessionState {
 
 pub struct Session {
     pub id: String,
+    /// Counts sessions from 1 since the server started.
+    pub number: u64,
     pub output: Output,
     pub in_format: PcmFormat,
     pub gain: f32,
@@ -639,6 +693,7 @@ pub struct Session {
 impl Session {
     fn new(
         id: String,
+        number: u64,
         output: Output,
         in_format: PcmFormat,
         peak: Option<f32>,
@@ -647,6 +702,7 @@ impl Session {
         let now = Instant::now();
         Self {
             id,
+            number,
             gain: gain(&output, peak),
             output,
             in_format,
@@ -759,6 +815,38 @@ impl Session {
         self.track().read(&self.output, name, from, to)
     }
 
+    /// What the window shows of this session. Takes only short locks.
+    pub fn activity(&self) -> Activity {
+        let track = self.track();
+        let stored = self.cached.lock().clone();
+        let (ready, arrived, covered) = track.counts(&stored);
+        let (critical, bonus, runnable) = {
+            let state = self.state.lock();
+            let held = track.state.lock();
+            let mut counts = (0, 0, false);
+            for &(k, priority) in state.plan.iter().filter(|(k, _)| !held.done[*k]) {
+                match priority {
+                    Priority::Critical => counts.0 += 1,
+                    Priority::Bonus => counts.1 += 1,
+                }
+                counts.2 |= track.runnable(&held, k);
+            }
+            counts
+        };
+        Activity {
+            number: self.number,
+            frames: track.spec.frames,
+            sample_rate: track.spec.sample_rate,
+            pieces: track.spec.grid.len(),
+            ready,
+            arrived,
+            covered,
+            critical,
+            bonus,
+            runnable,
+        }
+    }
+
     pub fn view(&self, idle: Duration, pieces: Vec<usize>) -> View {
         let track = self.track();
         let summary = track.summary();
@@ -839,6 +927,8 @@ pub struct Sessions {
     by_id: Mutex<BTreeMap<String, u64>>,
     limits: Mutex<(Duration, usize)>,
     pieces: Mutex<Option<Arc<Pieces>>>,
+    /// The last [`ENDED_KEPT`] sessions to end, oldest first.
+    ended: Mutex<VecDeque<Ended>>,
     seq: AtomicU64,
 }
 
@@ -856,6 +946,7 @@ impl Sessions {
             by_id: Mutex::new(BTreeMap::new()),
             limits: Mutex::new((idle, max)),
             pieces: Mutex::new(None),
+            ended: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
         }
     }
@@ -896,6 +987,7 @@ impl Sessions {
         self.tracks.lock().insert(seq, Arc::clone(&track));
         let session = Arc::new(Session::new(
             format!("s{seq}-{nanos:08x}"),
+            seq + 1,
             request.output,
             request.in_format,
             request.peak,
@@ -982,14 +1074,42 @@ impl Sessions {
         existing
     }
 
+    /// Every open session, as the window shows it, in the order they opened.
+    pub fn activity(&self) -> Vec<Activity> {
+        let open: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let mut rows: Vec<Activity> = open.iter().map(|s| s.activity()).collect();
+        rows.sort_by_key(|a| a.number);
+        rows
+    }
+
+    /// The sessions that ended last, oldest first.
+    pub fn ended(&self) -> Vec<Ended> {
+        self.ended.lock().iter().cloned().collect()
+    }
+
+    fn record_end(&self, number: u64, reason: String) {
+        let mut ended = self.ended.lock();
+        if ended.len() == ENDED_KEPT {
+            ended.pop_front();
+        }
+        ended.push_back(Ended {
+            number,
+            reason,
+            at: Instant::now(),
+        });
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().get(id).cloned()
     }
 
-    pub fn remove(&self, id: &str) -> bool {
+    /// End session `id`, saying why, such as "ended by the client". Returns
+    /// false when there is no such session.
+    pub fn remove(&self, id: &str, reason: &str) -> bool {
         let removed = self.sessions.lock().remove(id);
         if let Some(session) = &removed {
-            session.close("ended by the client");
+            session.close(reason);
+            self.record_end(session.number, reason.to_owned());
         }
         self.drop_orphans();
         removed.is_some()
@@ -1023,6 +1143,7 @@ impl Sessions {
         let closed = std::mem::take(&mut *self.sessions.lock());
         for session in closed.values() {
             session.close(reason);
+            self.record_end(session.number, reason.to_owned());
         }
         for track in std::mem::take(&mut *self.tracks.lock()).values() {
             track.close(reason);
@@ -1047,21 +1168,23 @@ impl Sessions {
     pub fn reap(&self) -> usize {
         let timeout = self.idle_timeout();
         let now = Instant::now();
-        let reaped = {
-            let mut sessions = self.sessions.lock();
-            let before = sessions.len();
-            sessions.retain(|id, session| {
-                let keep = session.closed().is_none() && !session.idle(now, timeout);
-                if !keep {
-                    session.close("idle");
-                    tracing::info!(session = %id, "ended after {:.0?} idle", timeout);
-                }
-                keep
-            });
-            before - sessions.len()
-        };
+        let mut reaped = Vec::new();
+        self.sessions.lock().retain(|id, session| {
+            let closed = session.closed();
+            let keep = closed.is_none() && !session.idle(now, timeout);
+            if !keep {
+                session.close("idle");
+                tracing::info!(session = %id, "ended after {:.0?} idle", timeout);
+                reaped.push((session.number, closed.unwrap_or_else(|| "idle".to_owned())));
+            }
+            keep
+        });
+        let count = reaped.len();
+        for (number, reason) in reaped {
+            self.record_end(number, reason);
+        }
         self.drop_orphans();
-        reaped
+        count
     }
 
     /// Drop the tracks no session plays.
@@ -1256,9 +1379,9 @@ mod tests {
         let other = settled(&sessions, &c, &audio(100_000, 0.02));
         assert!(!Arc::ptr_eq(&other, &first), "different audio was merged");
 
-        sessions.remove(&a.id);
+        sessions.remove(&a.id, "ended by the client");
         assert!(sessions.has_track(first.uid), "b still plays it");
-        sessions.remove(&b.id);
+        sessions.remove(&b.id, "ended by the client");
         assert!(!sessions.has_track(first.uid));
     }
 
@@ -1343,6 +1466,72 @@ mod tests {
                 "from {from}"
             );
         }
+    }
+
+    #[test]
+    fn the_activity_counts_uploads_plans_and_stored_pieces() {
+        let sessions = Sessions::new(Duration::from_secs(30), 4);
+        let session = sessions.open(request()).expect("open");
+        let track = session.track();
+        track
+            .upload(0, &audio(40_000, 0.01))
+            .expect("upload the first part");
+        session
+            .set_window(&window(
+                0,
+                (100_000, Priority::Critical),
+                (0, Priority::Bonus),
+            ))
+            .expect("window");
+        track.done(0);
+        session.set_cached([1]);
+
+        let [activity] = sessions.activity().try_into().expect("one session");
+        assert_eq!(activity.number, 1);
+        assert_eq!(activity.pieces, track.spec.grid.len());
+        assert_eq!(activity.ready, 1, "the stored piece");
+        assert_eq!(activity.arrived, 40_000);
+        assert_eq!(activity.covered, track.piece(1).len(), "the stored piece");
+        assert_eq!(activity.bonus, 0);
+        assert!(activity.critical > 0, "{activity:?}");
+        assert!(!activity.runnable, "runnable without the mix statistics");
+
+        let mix = audio(100_000, 0.01);
+        track
+            .upload(40_000, &excerpt(&mix, 40_000, 100_000))
+            .expect("upload the rest");
+        let [activity] = sessions.activity().try_into().expect("one session");
+        assert_eq!(activity.arrived, 100_000);
+        assert!(activity.runnable, "{activity:?}");
+    }
+
+    #[test]
+    fn an_ended_session_is_kept_with_its_reason() {
+        let sessions = Sessions::new(Duration::from_millis(20), 4);
+        let first = sessions.open(request()).expect("open");
+        let second = sessions.open(request()).expect("open");
+        let third = sessions.open(request()).expect("open");
+        third.track().close("segment 3: out of memory");
+        sessions.remove(&first.id, "ended by the client");
+        std::thread::sleep(Duration::from_millis(40));
+        sessions.reap();
+        let fourth = sessions.open(request()).expect("open");
+        sessions.close_all("the server switched models");
+        let ended: Vec<(u64, String)> = sessions
+            .ended()
+            .into_iter()
+            .map(|e| (e.number, e.reason))
+            .collect();
+        assert_eq!(
+            ended,
+            [
+                (first.number, "ended by the client".to_owned()),
+                (second.number, "idle".to_owned()),
+                (third.number, "segment 3: out of memory".to_owned()),
+                (fourth.number, "the server switched models".to_owned()),
+            ]
+        );
+        assert!(sessions.activity().is_empty());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! ```text
 //! header    the model, and what the stems come out as
 //! dropzone  the globe, the drop target, and progress while it works
+//! activity  client jobs and sessions, and the session segments waiting
 //! recents   what has been separated, and where the stems went
 //! logs      the same lines GET /v1/logs serves
 //! status    server state and the cache, along the bottom
@@ -11,8 +12,11 @@
 //! A drop and a `POST /v1/jobs` become the same job in the same queue; see
 //! [`crate::drops`]. The server runs headless without any of this.
 
+mod activity;
 mod blur;
 mod dropzone;
+mod eta;
+mod fit;
 mod globe;
 mod header;
 mod icons;
@@ -48,9 +52,10 @@ const MIN_WINDOW_SIZE: [f32; 2] = [480.0, 520.0 + titlebar::HEIGHT];
 /// Height the drop zone keeps; the Separated list and the log take the rest.
 const ZONE_HEIGHT: f32 = 320.0;
 
-/// The zone's height in a window `content` points tall: [`ZONE_HEIGHT`], less
-/// when the window is too short to also show one row of the list.
-fn zone_height(content: f32) -> f32 {
+/// The zone's height in a window `content` points tall with `clients` points of
+/// Clients list: [`ZONE_HEIGHT`], less when the window is too short to also show
+/// one row of the Separated list.
+fn zone_height(content: f32, clients: f32) -> f32 {
     // Header, status bar and their margins; the zone's and the sections' gaps;
     // the "Separated" heading and one row.
     let around = f32::from(TOP)
@@ -60,8 +65,20 @@ fn zone_height(content: f32) -> f32 {
         + 3.0 * f32::from(GAP)
         + section::HEIGHT
         + 6.0
-        + recents::ROW_HEIGHT;
+        + recents::ROW_HEIGHT
+        + clients;
     (content - around).clamp(dropzone::MIN_HEIGHT, ZONE_HEIGHT)
+}
+
+/// Rows the Separated list takes: three sample rows while it is empty, two
+/// while the Clients list shows, else one per track up to
+/// [`recents::MAX_VISIBLE`].
+fn separated_rows(tracks: usize, clients: bool) -> f32 {
+    match tracks {
+        0 if clients => 2.0,
+        0 => 3.0,
+        n => (n as f32).min(recents::MAX_VISIBLE),
+    }
 }
 
 /// Space around the window's contents, and between its regions.
@@ -237,9 +254,13 @@ struct Window {
     logs: logs::View,
     /// Whether the log pane is open.
     show_logs: bool,
-    /// Height the log pane took last frame, 0 when closed. Opening it grows
-    /// the window by that much instead of squeezing the list.
+    /// Height the log pane took last frame, 0 when closed.
     logs_height: Option<f32>,
+    /// The window's height, following what the Clients list, the Separated
+    /// list and the log pane want, so they are not squeezed.
+    fit: fit::Fit,
+    /// Height the sections had to lay out in.
+    sections_room: f32,
     /// The drop the zone is currently showing. Held so the zone keeps showing
     /// one track while a second is queued behind it.
     current: Option<Arc<Dropped>>,
@@ -261,6 +282,11 @@ struct Window {
     intro: Option<Intro>,
     /// Its eased progress this frame.
     reveal: Option<f32>,
+    /// What the Clients list shows, and the time it was read.
+    clients: (f64, activity::Snapshot),
+    /// Time left on the running client job, and on the drop the zone shows.
+    job_eta: eta::Eta,
+    drop_eta: eta::Eta,
 }
 
 /// Where the startup screen's globe was, and when the hand-over began.
@@ -286,6 +312,8 @@ impl Window {
             logs: logs::View::default(),
             show_logs: false,
             logs_height: None,
+            fit: fit::Fit::default(),
+            sections_room: 0.0,
             current: None,
             batch: Vec::new(),
             batch_running: false,
@@ -300,6 +328,9 @@ impl Window {
                 start: None,
             }),
             reveal: None,
+            clients: (f64::NEG_INFINITY, activity::Snapshot::default()),
+            job_eta: eta::Eta::default(),
+            drop_eta: eta::Eta::default(),
         }
     }
 }
@@ -334,6 +365,12 @@ impl Window {
 
         self.take_drops(&ctx);
         self.follow_batch(now);
+        if now - self.clients.0 >= REPAINT_INTERVAL.as_secs_f64() {
+            self.clients = (
+                now,
+                activity::Snapshot::read(&self.state, &mut self.job_eta, now),
+            );
+        }
 
         // Before the rest of the frame: a held close should put its question up
         // now rather than a frame later, and the answer can end the process.
@@ -353,7 +390,8 @@ impl Window {
         }
         let switch_state = self.state.switcher.state();
         let running = self.state.queue.running();
-        theme::set_processing(&ctx, running.is_some());
+        let serving_session = self.clients.1.sessions.iter().any(|s| s.runnable);
+        theme::set_processing(&ctx, running.is_some() || serving_session);
         let working = self.current.as_ref().is_some_and(|d| d.is_running());
         let switching = match &switch_state {
             SwitchState::Downloading { .. } | SwitchState::Verifying(_) => true,
@@ -428,7 +466,36 @@ impl Window {
 
         // The drop zone keeps a fixed height and the sections take the rest,
         // so the ratio between them holds whatever the list holds.
-        let zone = zone_height(ctx.content_rect().height());
+        let working_on = self
+            .current
+            .as_ref()
+            .and_then(|current| match current.state() {
+                State::Working(progress) => Some((Arc::as_ptr(current) as usize as u64, progress)),
+                _ => None,
+            });
+        let drop_left = match working_on {
+            Some((key, progress)) => self.drop_eta.update(key, now, &progress),
+            // A later drop can reuse the address that keys this one.
+            None => {
+                self.drop_eta = eta::Eta::default();
+                None
+            }
+        };
+        let drop_left = drop_left.map(eta::left_text);
+        let clients = activity::height(&self.clients.1);
+        let height = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
+            .unwrap_or_else(|| ctx.content_rect().height());
+        let (target, grow) = self.fit.step(height, self.sections_wanted());
+        if let Some(target) = target {
+            set_height(&ctx, target);
+        }
+        if self.fit.waiting() {
+            ctx.request_repaint();
+        }
+        // Laid out at the height asked for, so the zone does not shrink while
+        // the window grows.
+        let zone = zone_height(ctx.content_rect().height() + grow, clients);
         egui::Panel::top("zone")
             .frame(egui::Frame::NONE.inner_margin(margin(GAP, 0)))
             .exact_size(zone + f32::from(GAP))
@@ -478,6 +545,7 @@ impl Window {
                         }),
                     },
                     note,
+                    left: drop_left.as_deref(),
                     maxed: shown == Some(Preset::Quality),
                     switch,
                     intro: self
@@ -507,7 +575,32 @@ impl Window {
                 self.sections(ui, &palette, brushes)
             })
             .inner;
-        self.match_window_to(&ctx, logs_height);
+        self.logs_height = Some(logs_height);
+        // The first frame fits the window to its contents, whatever size it
+        // was saved at; later frames follow changes in what the sections want.
+        if !self.fit.started() {
+            // A short saved window also squeezed the zone; give that back too.
+            let wanted = self.sections_wanted();
+            let lacking = wanted - self.sections_room + (ZONE_HEIGHT - zone);
+            if let Some(target) = self.fit.start(height, wanted, lacking) {
+                set_height(&ctx, target);
+            }
+        }
+    }
+
+    /// Height the sections take at their natural size: the Clients list, the
+    /// Separated heading and list, and the log pane when open.
+    fn sections_wanted(&self) -> f32 {
+        let rows = separated_rows(self.state.drops.recent().len(), self.clients.1.any());
+        let logs = match self.logs_height {
+            Some(height) if self.show_logs && height > 0.0 => 6.0 + 4.0 + height,
+            _ => 0.0,
+        };
+        activity::height(&self.clients.1)
+            + section::HEIGHT
+            + 6.0
+            + recents::ROW_HEIGHT * rows
+            + logs
     }
 
     /// Step the hand-over from the startup screen. Returns its eased progress
@@ -550,6 +643,10 @@ impl Window {
         // The glass's drop shadow reaches past the panel; let it.
         ui.set_clip_rect(ui.ctx().content_rect());
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
+        self.sections_room = ui.available_height();
+        if self.clients.1.any() {
+            activity::show(ui, palette, brushes, &self.clients.1);
+        }
         let recent = self.state.drops.recent();
         let count = (!recent.is_empty()).then(|| recent.len().to_string());
         section::heading(ui, palette, "Separated", count);
@@ -560,7 +657,10 @@ impl Window {
             0.0
         };
         let room = ui.available_height() - logs;
-        if let Some(item) = recents::list(ui, palette, brushes, &self.state.drops, &recent, room) {
+        let rows = separated_rows(recent.len(), self.clients.1.any()) as usize;
+        if let Some(item) =
+            recents::list(ui, palette, brushes, &self.state.drops, &recent, room, rows)
+        {
             self.state.drops.stop(&self.state, &item);
         }
 
@@ -584,27 +684,6 @@ impl Window {
             self.state.logs.clear();
         }
         frame.response.rect.height()
-    }
-
-    /// Grow or shrink the window by however much the log pane changed, so
-    /// opening it does not squeeze the list. The first frame only records it.
-    fn match_window_to(&mut self, ctx: &egui::Context, logs: f32) {
-        let Some(previous) = self.logs_height.replace(logs) else {
-            return;
-        };
-        let delta = logs - previous;
-        // Heights wobble by a fraction of a point as text is laid out, and a window
-        // that resizes by half a pixel every frame never settles.
-        if delta.abs() < 1.0 {
-            return;
-        }
-        let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) else {
-            return;
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            size.x,
-            size.y + delta,
-        )));
     }
 
     /// Hand anything dropped on the window to [`crate::drops`].
@@ -707,6 +786,14 @@ impl Window {
             })
             .expect("spawning the file picker");
     }
+}
+
+/// Ask for the window's inner height to be `height`, keeping its width.
+fn set_height(ctx: &egui::Context, height: f32) {
+    let width = ctx
+        .input(|i| i.viewport().inner_rect.map(|r| r.width()))
+        .unwrap_or_else(|| ctx.content_rect().width());
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
 }
 
 /// Ask the system for one or more files, blocking the thread it is called on.
@@ -852,6 +939,20 @@ fn which(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_separated_list_gives_way_only_while_empty() {
+        assert_eq!(separated_rows(0, false), 3.0);
+        assert_eq!(
+            separated_rows(0, true),
+            2.0,
+            "the sample rows kept their room"
+        );
+        assert_eq!(separated_rows(1, true), 1.0);
+        assert_eq!(separated_rows(2, false), 2.0);
+        assert_eq!(separated_rows(4, false), 4.0);
+        assert_eq!(separated_rows(30, false), recents::MAX_VISIBLE);
+    }
 
     #[test]
     fn a_picker_answer_is_one_path_per_line() {

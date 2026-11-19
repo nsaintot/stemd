@@ -155,6 +155,7 @@ fn a_model_download_shows_in_the_drop_zone() {
             parts: crate::settings::DropParts::DEFAULT,
             batch: super::dropzone::Batch::default(),
             note: None,
+            left: None,
             maxed: false,
             switch: Some(super::dropzone::Switch::Downloading {
                 preset: crate::models::Preset::Quality,
@@ -398,6 +399,7 @@ fn the_drop_zone_progress_bar_is_centred() {
             parts: crate::settings::DropParts::DEFAULT,
             batch: super::dropzone::Batch::default(),
             note: None,
+            left: None,
             maxed: false,
             switch: None,
             intro: None,
@@ -497,7 +499,16 @@ fn recents_height(rows: usize) -> f32 {
     let mut build = |ui: &mut egui::Ui| {
         height = ui
             .scope(|ui| {
-                super::recents::list(ui, &palette, &brushes, &drops, &items, visible_cap());
+                let min_rows = super::separated_rows(rows, false) as usize;
+                super::recents::list(
+                    ui,
+                    &palette,
+                    &brushes,
+                    &drops,
+                    &items,
+                    visible_cap(),
+                    min_rows,
+                );
             })
             .response
             .rect
@@ -520,14 +531,129 @@ fn a_long_separated_list_stops_at_the_cap() {
     );
 }
 
-/// And two rows are not stretched to fill it.
+/// A short list is as tall as its rows, short of the cap.
 #[test]
-fn a_short_separated_list_stays_short() {
-    let drawn = recents_height(2);
+fn a_short_separated_list_is_as_tall_as_its_rows() {
+    for rows in [1, 2, 3] {
+        let drawn = recents_height(rows);
+        assert_eq!(
+            drawn,
+            rows as f32 * super::recents::ROW_HEIGHT,
+            "{rows} rows took {drawn:.1} points"
+        );
+    }
+}
+
+/// The Clients list at the narrowest window: the visible rows drawn, no text past the
+/// panel or over another, and the height [`super::activity::height`] promised.
+#[test]
+fn the_clients_list_fits_the_narrowest_window() {
+    use std::time::Instant;
+
+    let ctx = themed();
+    let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let session = |number, runnable| crate::sessions::Activity {
+        number,
+        frames: 441_000 * 22,
+        sample_rate: 44_100,
+        pieces: 30,
+        ready: 12,
+        arrived: 441_000 * 22,
+        covered: 441_000 * 9,
+        critical: 6,
+        bonus: 30,
+        runnable,
+    };
+    let snapshot = super::activity::Snapshot {
+        jobs: vec![
+            super::activity::JobRow {
+                number: 1,
+                progress: stemd_core::Progress::counted(stemd_core::Stage::Separating, 3, 8),
+                left: Some(37.0),
+            },
+            super::activity::JobRow {
+                number: 2,
+                progress: stemd_core::Progress::new(stemd_core::Stage::Queued),
+                left: None,
+            },
+        ],
+        sessions: vec![session(1, true), session(2, false)],
+        ended: vec![crate::sessions::Ended {
+            number: 3,
+            reason: "idle".to_owned(),
+            at: Instant::now(),
+        }],
+    };
+    let width = super::MIN_WINDOW_SIZE[0] - 2.0 * f32::from(super::PAD);
+    let mut height = 0.0;
+    let mut build = |ui: &mut egui::Ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
+        ui.set_max_width(width);
+        height = ui
+            .scope(|ui| super::activity::show(ui, &palette, &brushes, &snapshot))
+            .response
+            .rect
+            .height();
+    };
+    frame(&ctx, None, false, &mut build);
+    let shapes = frame(&ctx, None, false, &mut build);
+
+    // The cut row fades out one point at a time, each a copy of the row clipped
+    // to that strip; the bottom strip, at zero opacity, draws nothing.
+    let strip = 1.0;
+    for c in &shapes {
+        if let egui::epaint::Shape::Text(t) = &c.shape {
+            let drawn = t
+                .galley
+                .rect
+                .translate(t.pos.to_vec2())
+                .intersect(c.clip_rect);
+            assert!(
+                drawn.height() <= 0.0 || drawn.bottom() <= height - strip + 0.5,
+                "{:?} is drawn at the bottom edge",
+                t.galley.text()
+            );
+        }
+    }
+    let drawn: Vec<(String, egui::Rect)> = shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t) => Some((
+                t.galley.text().to_owned(),
+                t.galley.rect.translate(t.pos.to_vec2()),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut texts: Vec<(String, egui::Rect)> = Vec::new();
+    for text in drawn {
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    // Two rows and part of the third; the rest scroll.
+    for want in ["Clients", "Job 1", "Job 2", "Session 1"] {
+        assert!(
+            texts.iter().any(|(t, _)| t.starts_with(want)),
+            "{want:?} is not drawn: {texts:?}"
+        );
+    }
+    for (text, rect) in &texts {
+        assert!(rect.right() <= width + 1.0, "{text:?} runs past the panel");
+    }
+    for (i, (a, ra)) in texts.iter().enumerate() {
+        for (b, rb) in &texts[i + 1..] {
+            assert!(
+                !ra.shrink(1.0).intersects(rb.shrink(1.0)),
+                "{a:?} is drawn over {b:?}"
+            );
+        }
+    }
+    let promised = super::activity::height(&snapshot) - 6.0;
     assert!(
-        drawn < visible_cap(),
-        "two rows took up {drawn:.1} points, the whole {:.1}-point box",
-        visible_cap()
+        (height - promised).abs() < 1.0,
+        "drew {height:.1} points, promised {promised:.1}"
     );
 }
 
@@ -603,6 +729,7 @@ fn frame_cost() {
                     parts: crate::settings::DropParts::DEFAULT,
                     batch: super::dropzone::Batch::default(),
                     note: None,
+                    left: None,
                     maxed: true,
                     switch: None,
                     intro: None,
