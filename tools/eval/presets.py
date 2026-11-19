@@ -55,14 +55,14 @@ def wait_ready(proc, host, timeout=900):
         if proc.poll() is not None:
             raise RuntimeError(f"stemd-server exited with {proc.returncode}")
         try:
-            with urllib.request.urlopen(f"http://{host}/v1/health", timeout=5) as r:
+            with urllib.request.urlopen(f"http://{host}/v2/health", timeout=5) as r:
                 health = json.load(r)
             if health.get("model_id"):
                 return health
         except OSError:
             pass
         time.sleep(3)
-    raise RuntimeError("stemd-server did not answer /v1/health")
+    raise RuntimeError("stemd-server did not answer /v2/health")
 
 
 def separate(cli, host, mix, out, parts=None):

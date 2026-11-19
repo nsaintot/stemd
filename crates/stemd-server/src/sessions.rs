@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -31,7 +32,8 @@ use sha2::{Digest, Sha256};
 use stemd_core::{Audio, Grid, Normalisation, Parts, PcmFormat, Stems};
 
 use crate::cache::Output;
-use crate::pieces::{Pieces, type_dir};
+use crate::pieces::{Consolidation, Pieces, TrackInfo, stems_of, type_dir};
+use crate::whole::Whole;
 
 /// Samples of context resampled either side of a range read at another rate.
 pub const RESAMPLE_CONTEXT: usize = 8192;
@@ -73,30 +75,74 @@ pub fn track_id(audio: &Audio) -> String {
     id
 }
 
-/// How soon a client needs a segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Priority {
-    /// Ahead of whole-track jobs.
-    Critical,
-    /// When nothing else is waiting.
-    Bonus,
+/// Priorities below this run before whole-track jobs, the rest when no job waits.
+pub const BEFORE_JOBS: u8 = 50;
+
+/// The highest priority a region may ask for.
+pub const MAX_PRIORITY: u8 = 99;
+
+/// The most regions one window may hold.
+pub const MAX_REGIONS: usize = 32;
+
+/// Which planned segments the worker takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Priorities below [`BEFORE_JOBS`]: ahead of whole-track jobs.
+    BeforeJobs,
+    /// The rest: when no job is waiting.
+    WhenIdle,
 }
 
-/// One side of a window around the needle.
+/// Samples around `at` a client wants separated, and how urgently: `0` first.
 #[derive(Debug, Clone, Copy, Deserialize)]
-pub struct Margin {
-    pub frames: usize,
-    pub priority: Priority,
+pub struct Region {
+    /// Track sample the region is centred on, such as the needle or a cue.
+    pub at: usize,
+    #[serde(default)]
+    pub ahead: usize,
+    #[serde(default)]
+    pub behind: usize,
+    pub priority: u8,
 }
 
-/// What a client wants separated next.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// What a client wants separated next. Replaces the session's last window.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct WindowRequest {
-    /// Playhead, in track samples.
-    pub needle: usize,
-    pub ahead: Margin,
-    pub behind: Margin,
+    pub regions: Vec<Region>,
+}
+
+impl WindowRequest {
+    /// Fail on too many regions or a priority past [`MAX_PRIORITY`].
+    pub fn check(&self) -> Result<()> {
+        if self.regions.len() > MAX_REGIONS {
+            bail!(
+                "{} regions; a window holds up to {MAX_REGIONS}",
+                self.regions.len()
+            );
+        }
+        if let Some(region) = self.regions.iter().find(|r| r.priority > MAX_PRIORITY) {
+            bail!("priority {} is past {MAX_PRIORITY}", region.priority);
+        }
+        Ok(())
+    }
+}
+
+/// Where a planned segment stands: the lower runs first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Rank {
+    pub priority: u8,
+    /// Samples from `at`: `0` under it, `2d + 1` for `d` samples behind, so ahead wins a tie.
+    pub distance: usize,
+}
+
+impl Rank {
+    pub const fn class(self) -> Class {
+        if self.priority < BEFORE_JOBS {
+            Class::BeforeJobs
+        } else {
+            Class::WhenIdle
+        }
+    }
 }
 
 /// Sorted, disjoint, half-open sample ranges.
@@ -155,66 +201,40 @@ impl Spans {
     }
 }
 
-/// The segments a window asks for, in the order to run them.
-///
-/// The segments under the needle come first, at the higher of the two margins'
-/// priorities. Then both sides outward by distance, two from the side with the
-/// higher priority for each one from the other; ahead wins a tie.
-pub fn plan(grid: &Grid, request: &WindowRequest) -> Vec<(usize, Priority)> {
+/// The segments a window asks for, each at its best rank, in the order to run them.
+pub fn plan(grid: &Grid, request: &WindowRequest) -> Vec<(usize, Rank)> {
     let frames = grid.length().unsigned_abs() as usize;
     if frames == 0 {
         return Vec::new();
     }
-    let needle = request.needle.min(frames - 1);
     let as_i32 = |v: usize| i32::try_from(v.min(frames)).unwrap_or(i32::MAX);
-
-    let under: Vec<usize> = grid.covering(as_i32(needle), as_i32(needle + 1)).collect();
-    let ahead: Vec<usize> = grid
-        .covering(
-            as_i32(needle),
-            as_i32(needle.saturating_add(request.ahead.frames)),
-        )
-        .filter(|k| !under.contains(k))
-        .collect();
-    let behind: Vec<usize> = grid
-        .covering(
-            as_i32(needle.saturating_sub(request.behind.frames)),
-            as_i32(needle),
-        )
-        .rev()
-        .filter(|k| !under.contains(k))
-        .collect();
-
-    let first = request.ahead.priority.min(request.behind.priority);
-    let mut order: Vec<(usize, Priority)> = under.into_iter().map(|k| (k, first)).collect();
-
-    let ahead_leads = request.ahead.priority <= request.behind.priority;
-    let (lead, lead_priority, follow, follow_priority) = if ahead_leads {
-        (
-            ahead,
-            request.ahead.priority,
-            behind,
-            request.behind.priority,
-        )
-    } else {
-        (
-            behind,
-            request.behind.priority,
-            ahead,
-            request.ahead.priority,
-        )
-    };
-    let (mut lead, mut follow) = (lead.into_iter(), follow.into_iter());
-    loop {
-        let a = lead.next();
-        let b = lead.next();
-        let c = follow.next();
-        if a.is_none() && c.is_none() {
-            break;
+    let mut best: BTreeMap<usize, Rank> = BTreeMap::new();
+    for region in &request.regions {
+        let at = region.at.min(frames - 1);
+        let from = at.saturating_sub(region.behind);
+        let to = at.saturating_add(region.ahead).max(at + 1);
+        for k in grid.covering(as_i32(from), as_i32(to)) {
+            let placement = grid.placement(k);
+            let start = placement.offset.unsigned_abs() as usize;
+            let end = placement.end().unsigned_abs() as usize;
+            let distance = if start > at {
+                start - at
+            } else if end <= at {
+                2 * (at - end) + 1
+            } else {
+                0
+            };
+            let rank = Rank {
+                priority: region.priority,
+                distance,
+            };
+            best.entry(k)
+                .and_modify(|r| *r = (*r).min(rank))
+                .or_insert(rank);
         }
-        order.extend([a, b].into_iter().flatten().map(|k| (k, lead_priority)));
-        order.extend(c.map(|k| (k, follow_priority)));
     }
+    let mut order: Vec<(usize, Rank)> = best.into_iter().collect();
+    order.sort_by_key(|&(k, rank)| (rank, k));
     order
 }
 
@@ -251,6 +271,18 @@ pub struct TrackSpec {
     pub normalises: bool,
     /// The parts separated, which decide what the models run.
     pub parts: Parts,
+}
+
+impl From<&TrackSpec> for TrackInfo {
+    fn from(spec: &TrackSpec) -> Self {
+        Self {
+            frames: spec.frames,
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            stride: spec.grid.stride().unsigned_abs() as usize,
+            pieces: spec.grid.len(),
+        }
+    }
 }
 
 /// What became of the whole upload once it arrived.
@@ -477,6 +509,20 @@ impl Track {
         state.ready.covers(&needed)
     }
 
+    /// True when every sample of `range` is ready in memory.
+    pub fn ready_covers(&self, range: &Range<usize>) -> bool {
+        self.state.lock().ready.covers(range)
+    }
+
+    /// True when every sample of the track is ready or in one of the `stored` pieces.
+    pub fn complete_with(&self, stored: &[usize]) -> bool {
+        let mut spans = self.state.lock().ready.clone();
+        for &k in stored {
+            spans.insert(self.piece(k));
+        }
+        spans.covers(&(0..self.spec.frames))
+    }
+
     pub fn mark_written(&self, k: usize, type_dir: &str) {
         self.state.lock().written.insert((type_dir.to_owned(), k));
     }
@@ -556,7 +602,6 @@ impl Track {
             arrived: state.arrived.as_pairs(),
             ready: state.ready.as_pairs(),
             needs_stats: self.spec.normalises && state.norm.is_none(),
-            verified: matches!(state.verdict, Some(Verdict::Verified(_))),
             closed: state.closed.clone(),
         }
     }
@@ -566,7 +611,6 @@ struct TrackSummary {
     arrived: Vec<[usize; 2]>,
     ready: Vec<[usize; 2]>,
     needs_stats: bool,
-    verified: bool,
     closed: Option<String>,
 }
 
@@ -595,23 +639,17 @@ pub struct View {
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub track: Option<String>,
-    /// True once the whole upload has hashed to `track`.
-    pub verified: bool,
-    pub frames: usize,
-    pub sample_rate: u32,
-    pub output_sample_rate: u32,
-    pub channels: usize,
-    pub format: String,
-    pub segment_frames: i32,
-    pub stride_frames: i32,
-    pub segments: usize,
-    pub stems: Vec<StemView>,
+    /// Changes whenever another field does.
+    pub rev: u64,
+    pub track: TrackView,
+    pub output: crate::separations::OutputView,
+    pub grid: GridView,
     pub arrived: Vec<[usize; 2]>,
+    /// Samples separated in memory.
     pub ready: Vec<[usize; 2]>,
-    /// Pieces on disk for this output, ready to fetch whole.
-    pub pieces: Vec<usize>,
+    pub stems: Vec<StemView>,
+    /// True when every sample is ready or stored, so any range reads.
+    pub complete: bool,
     /// Segments asked for and not run yet.
     pub planned: usize,
     /// Set while segments wait on something other than the worker.
@@ -621,10 +659,48 @@ pub struct View {
 }
 
 #[derive(Debug, Serialize)]
+pub struct TrackView {
+    /// The track id, `null` until the whole upload has been hashed.
+    pub id: Option<String>,
+    pub frames: usize,
+    /// The model's rate.
+    pub sample_rate: u32,
+    pub channels: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GridView {
+    pub segment_frames: i32,
+    pub stride_frames: i32,
+    pub segments: usize,
+    /// Median seconds of the last [`crate::queue::SPEED_KEPT`] segments, `null` until one ran.
+    pub segment_run_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StemView {
     pub name: &'static str,
-    /// Multiply by `1.0 / gain` to restore the level.
-    pub gain: f32,
+    /// See [`crate::separations::sources`].
+    pub sources: u16,
+    pub stored: crate::separations::Storage,
+    /// The whole file's size, when stored whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Stored pieces as half-open spans of piece indices, when stored as pieces.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<[usize; 2]>,
+}
+
+/// Sorted piece indices as half-open spans.
+fn spans_of(pieces: &[usize]) -> Vec<[usize; 2]> {
+    let mut out: Vec<[usize; 2]> = Vec::new();
+    for &k in pieces {
+        match out.last_mut() {
+            Some(last) if last[1] == k => last[1] = k + 1,
+            _ => out.push([k, k + 1]),
+        }
+    }
+    out
 }
 
 /// What the window shows of a session. It carries no track id or name.
@@ -642,10 +718,10 @@ pub struct Activity {
     pub arrived: usize,
     /// Samples ready in memory or in a stored piece.
     pub covered: usize,
-    /// Planned segments not run yet at critical priority.
-    pub critical: usize,
-    /// Planned segments not run yet at bonus priority.
-    pub bonus: usize,
+    /// Planned segments not run yet that run before jobs: priority below [`BEFORE_JOBS`].
+    pub high: usize,
+    /// Planned segments not run yet that wait for jobs.
+    pub normal: usize,
     /// True when a planned segment can run now.
     pub runnable: bool,
 }
@@ -661,6 +737,13 @@ pub struct Ended {
 /// Ended sessions kept for the window.
 const ENDED_KEPT: usize = 8;
 
+/// Where [`Sessions::read_stored`] takes a run of samples from.
+enum Source {
+    Memory,
+    Piece(std::path::PathBuf),
+    Whole,
+}
+
 /// A range read back from a track, at the output rate.
 pub struct Excerpt {
     pub audio: Audio,
@@ -669,8 +752,9 @@ pub struct Excerpt {
 }
 
 struct SessionState {
-    plan: VecDeque<(usize, Priority)>,
-    planned_at: Instant,
+    plan: VecDeque<(usize, Rank)>,
+    /// When the worker last took one of this session's segments.
+    last_served: Option<Instant>,
     last_seen: Instant,
     closed: Option<String>,
 }
@@ -687,6 +771,8 @@ pub struct Session {
     track: Mutex<Arc<Track>>,
     /// Pieces of this output already on disk, which no segment needs to remake.
     cached: Mutex<HashSet<usize>>,
+    /// The client's file key, recorded against the track id once the upload is hashed.
+    file: Mutex<Option<String>>,
     state: Mutex<SessionState>,
 }
 
@@ -708,9 +794,10 @@ impl Session {
             in_format,
             track: Mutex::new(track),
             cached: Mutex::new(HashSet::new()),
+            file: Mutex::new(None),
             state: Mutex::new(SessionState {
                 plan: VecDeque::new(),
-                planned_at: now,
+                last_served: None,
                 last_seen: now,
                 closed: None,
             }),
@@ -721,10 +808,14 @@ impl Session {
         Arc::clone(&self.track.lock())
     }
 
-    /// Record the pieces of this output already on disk, and drop the planned
+    pub fn set_file(&self, key: Option<String>) {
+        *self.file.lock() = key;
+    }
+
+    /// Record the pieces of this output on disk now, and drop the planned
     /// segments they make unnecessary.
     pub fn set_cached(&self, pieces: impl IntoIterator<Item = usize>) {
-        self.cached.lock().extend(pieces);
+        *self.cached.lock() = pieces.into_iter().collect();
         let mut state = self.state.lock();
         let plan = std::mem::take(&mut state.plan);
         state.plan = plan
@@ -733,11 +824,29 @@ impl Session {
             .collect();
     }
 
-    /// True when every piece segment `k` feeds is on disk already.
+    /// True when every piece segment `k` feeds is on disk. At another output rate,
+    /// a piece also needs the segments within [`RESAMPLE_CONTEXT`] of it.
     fn covered(&self, k: usize) -> bool {
         let cached = self.cached.lock();
-        let pieces = self.track().spec.grid.len();
-        cached.contains(&k) && (k + 1 >= pieces || cached.contains(&(k + 1)))
+        let track = self.track();
+        let margin = if self.output.rate.hz() == track.spec.sample_rate {
+            0
+        } else {
+            RESAMPLE_CONTEXT
+        };
+        let as_i32 = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
+        (0..track.spec.grid.len()).all(|j| {
+            let piece = track.piece(j);
+            cached.contains(&j)
+                || !track
+                    .spec
+                    .grid
+                    .covering(
+                        as_i32(piece.start.saturating_sub(margin)),
+                        as_i32(piece.end + margin),
+                    )
+                    .contains(&k)
+        })
     }
 
     /// Why the session or its track is closed.
@@ -760,20 +869,19 @@ impl Session {
             bail!("this session is closed: {reason}");
         }
         let track = self.track();
-        let planned: VecDeque<(usize, Priority)> = plan(&track.spec.grid, request)
+        let planned: VecDeque<(usize, Rank)> = plan(&track.spec.grid, request)
             .into_iter()
             .filter(|(k, _)| !track.is_done(*k) && !self.covered(*k))
             .collect();
         let mut state = self.state.lock();
         let now = Instant::now();
         state.last_seen = now;
-        state.planned_at = now;
         state.plan = planned;
         Ok(())
     }
 
-    /// The first planned segment at `priority` that can run, and when the plan was set.
-    fn next(&self, priority: Priority) -> Option<(Arc<Track>, usize, Instant)> {
+    /// The best runnable segment of `class`, its rank, and when this session was last served.
+    fn next(&self, class: Class) -> Option<(Arc<Track>, usize, Rank, Option<Instant>)> {
         let track = self.track();
         let mut state = self.state.lock();
         if state.closed.is_some() {
@@ -781,13 +889,13 @@ impl Session {
         }
         let held = track.state.lock();
         state.plan.retain(|(k, _)| !held.done[*k]);
-        let k = state
+        let (k, rank) = state
             .plan
             .iter()
-            .find(|(k, p)| *p == priority && track.runnable(&held, *k))
-            .map(|(k, _)| *k)?;
+            .find(|(k, rank)| rank.class() == class && track.runnable(&held, *k))
+            .copied()?;
         drop(held);
-        Some((track, k, state.planned_at))
+        Some((track, k, rank, state.last_served))
     }
 
     pub fn close(&self, reason: impl Into<String>) {
@@ -798,13 +906,17 @@ impl Session {
         state.plan.clear();
     }
 
-    /// True when nothing can run and the client has been quiet for `timeout`.
-    fn idle(&self, now: Instant, timeout: Duration) -> bool {
+    /// True when a planned segment can run now.
+    fn has_runnable(&self) -> bool {
         let track = self.track();
         let state = self.state.lock();
         let held = track.state.lock();
-        let waiting = state.plan.iter().any(|(k, _)| track.runnable(&held, *k));
-        !waiting && now.duration_since(state.last_seen) > timeout
+        state.plan.iter().any(|(k, _)| track.runnable(&held, *k))
+    }
+
+    /// True when nothing can run and the client has been quiet for `timeout`.
+    fn idle(&self, now: Instant, timeout: Duration) -> bool {
+        !self.has_runnable() && now.duration_since(self.state.lock().last_seen) > timeout
     }
 
     /// Part `name` over `from..to`, at the output rate.
@@ -820,14 +932,14 @@ impl Session {
         let track = self.track();
         let stored = self.cached.lock().clone();
         let (ready, arrived, covered) = track.counts(&stored);
-        let (critical, bonus, runnable) = {
+        let (high, normal, runnable) = {
             let state = self.state.lock();
             let held = track.state.lock();
             let mut counts = (0, 0, false);
-            for &(k, priority) in state.plan.iter().filter(|(k, _)| !held.done[*k]) {
-                match priority {
-                    Priority::Critical => counts.0 += 1,
-                    Priority::Bonus => counts.1 += 1,
+            for &(k, rank) in state.plan.iter().filter(|(k, _)| !held.done[*k]) {
+                match rank.class() {
+                    Class::BeforeJobs => counts.0 += 1,
+                    Class::WhenIdle => counts.1 += 1,
                 }
                 counts.2 |= track.runnable(&held, k);
             }
@@ -841,20 +953,34 @@ impl Session {
             ready,
             arrived,
             covered,
-            critical,
-            bonus,
+            high,
+            normal,
             runnable,
         }
     }
 
-    pub fn view(&self, idle: Duration, pieces: Vec<usize>) -> View {
+    /// The view, with `rev` left at 0.
+    fn view(
+        &self,
+        idle: Duration,
+        pieces: &[usize],
+        stems: Vec<StemView>,
+        segment_run_seconds: Option<f64>,
+    ) -> View {
         let track = self.track();
         let summary = track.summary();
         let (planned, waiting) = {
             let state = self.state.lock();
             let held = track.state.lock();
-            let waiting = state.plan.iter().any(|(k, _)| !track.runnable(&held, *k));
-            (state.plan.len(), waiting)
+            // A finished segment stays in the plan until the worker next takes from it.
+            let left: Vec<usize> = state
+                .plan
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|&k| !held.done[k])
+                .collect();
+            let waiting = left.iter().any(|&k| !track.runnable(&held, k));
+            (left.len(), waiting)
         };
         let closed = self.state.lock().closed.clone().or(summary.closed);
         let spec = &track.spec;
@@ -862,26 +988,24 @@ impl Session {
             id: self.id.clone(),
             state: if closed.is_some() { "closed" } else { "open" },
             error: closed,
-            track: track.verified(),
-            verified: summary.verified,
-            frames: spec.frames,
-            sample_rate: spec.sample_rate,
-            output_sample_rate: self.output.rate.hz(),
-            channels: spec.channels,
-            format: self.output.format.to_string(),
-            segment_frames: spec.grid.segment(),
-            stride_frames: spec.grid.stride(),
-            segments: spec.grid.len(),
-            stems: served(&self.output)
-                .into_iter()
-                .map(|name| StemView {
-                    name,
-                    gain: self.gain,
-                })
-                .collect(),
+            rev: 0,
+            track: TrackView {
+                id: track.verified(),
+                frames: spec.frames,
+                sample_rate: spec.sample_rate,
+                channels: spec.channels,
+            },
+            output: crate::separations::OutputView::of(&self.output, Some(self.gain)),
+            grid: GridView {
+                segment_frames: spec.grid.segment(),
+                stride_frames: spec.grid.stride(),
+                segments: spec.grid.len(),
+                segment_run_seconds,
+            },
             arrived: summary.arrived,
             ready: summary.ready,
-            pieces,
+            stems,
+            complete: track.complete_with(pieces),
             planned,
             waiting_for: match (waiting, summary.needs_stats) {
                 (true, true) => Some("the whole upload, or mean and std"),
@@ -908,6 +1032,16 @@ const fn gcd(a: u32, b: u32) -> u32 {
 #[error("{0} sessions are open, the most this server allows")]
 pub struct TooMany(pub usize);
 
+/// Why a session could not join a track.
+#[derive(Debug, thiserror::Error)]
+pub enum JoinError {
+    #[error(transparent)]
+    TooMany(#[from] TooMany),
+    /// The track was dropped or closed after it was found.
+    #[error("the track closed")]
+    Gone,
+}
+
 /// What a client asks for when it opens a session.
 pub struct Request {
     pub output: Output,
@@ -930,6 +1064,8 @@ pub struct Sessions {
     /// The last [`ENDED_KEPT`] sessions to end, oldest first.
     ended: Mutex<VecDeque<Ended>>,
     seq: AtomicU64,
+    /// Counts changes any view can show, for long polls.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for Sessions {
@@ -948,7 +1084,66 @@ impl Sessions {
             pieces: Mutex::new(None),
             ended: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
+            changes: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Record that a view may have changed, and wake the long polls.
+    pub fn changed(&self) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A receiver that wakes on every [`Sessions::changed`].
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// What `session`'s client sees now, with its `rev`.
+    pub fn view_of(&self, session: &Session, segment_run_seconds: Option<f64>) -> View {
+        use std::hash::{Hash, Hasher};
+        let mut view = session.view(
+            self.idle_timeout(),
+            &self.cached_for(session),
+            self.stems_for(session),
+            segment_run_seconds,
+        );
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(&view)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        view.rev = hasher.finish();
+        view
+    }
+
+    /// How each stem `session` serves is stored.
+    pub fn stems_for(&self, session: &Session) -> Vec<StemView> {
+        use crate::separations::{Storage, sources};
+        let track = session.track();
+        let dir = self.track_dir(session);
+        let extension = session.output.format.extension();
+        served(&session.output)
+            .into_iter()
+            .map(|name| {
+                let mut stem = StemView {
+                    name,
+                    sources: sources(name),
+                    stored: Storage::None,
+                    bytes: None,
+                    pieces: Vec::new(),
+                };
+                if let Some(whole) = self.whole(session, name) {
+                    stem.stored = Storage::Whole;
+                    stem.bytes = std::fs::metadata(&whole.path).map(|m| m.len()).ok();
+                } else if let Some(dir) = &dir {
+                    let stored = Pieces::stem_pieces(dir, name, extension, track.spec.grid.len());
+                    if !stored.is_empty() {
+                        stem.stored = Storage::Pieces;
+                        stem.pieces = spans_of(&stored);
+                    }
+                }
+                stem
+            })
+            .collect()
     }
 
     pub fn set_limits(&self, idle: Duration, max: usize) {
@@ -959,12 +1154,52 @@ impl Sessions {
         self.limits.lock().0
     }
 
-    pub fn set_pieces(&self, pieces: Arc<Pieces>) {
+    /// Use `pieces` as the cache, and keep the tracks of open sessions from eviction.
+    pub fn set_pieces(self: &Arc<Self>, pieces: Arc<Pieces>) {
+        let sessions = Arc::downgrade(self);
+        pieces.set_in_use(Box::new(move || {
+            sessions
+                .upgrade()
+                .map(|s| s.open_track_ids())
+                .unwrap_or_default()
+        }));
+        let sessions = Arc::downgrade(self);
+        pieces.set_on_change(Box::new(move || {
+            if let Some(sessions) = sessions.upgrade() {
+                sessions.changed();
+            }
+        }));
         *self.pieces.lock() = Some(pieces);
+    }
+
+    /// The ids of the verified tracks open sessions play.
+    fn open_track_ids(&self) -> HashSet<String> {
+        let tracks: Vec<Arc<Track>> = self.tracks.lock().values().cloned().collect();
+        tracks.iter().filter_map(|t| t.verified()).collect()
     }
 
     pub fn pieces(&self) -> Option<Arc<Pieces>> {
         self.pieces.lock().clone()
+    }
+
+    /// The track directory of `session`'s output, once its track id is known.
+    pub fn track_dir(&self, session: &Session) -> Option<PathBuf> {
+        let track = session.track();
+        let type_dir = type_dir(&session.output, session.gain);
+        Some(
+            self.pieces()?
+                .verified_dir(&track.model_id, &type_dir, &track.verified()?),
+        )
+    }
+
+    /// The open track whose whole upload hashed to `id`, separated into `parts`.
+    pub fn open_track(&self, id: &str, parts: Parts) -> Option<Arc<Track>> {
+        let uid = *self.by_id.lock().get(&format!("{id}-{parts}"))?;
+        self.tracks
+            .lock()
+            .get(&uid)
+            .filter(|t| t.closed().is_none())
+            .cloned()
     }
 
     /// Open a session on a track of its own.
@@ -994,6 +1229,45 @@ impl Sessions {
             track,
         ));
         sessions.insert(session.id.clone(), Arc::clone(&session));
+        drop(sessions);
+        self.changed();
+        Ok(session)
+    }
+
+    /// Open a session on `track`, already uploaded and hashed, so its client uploads nothing.
+    pub fn join(
+        &self,
+        output: Output,
+        in_format: PcmFormat,
+        peak: Option<f32>,
+        track: Arc<Track>,
+    ) -> Result<Arc<Session>, JoinError> {
+        let max = self.limits.lock().1;
+        let mut sessions = self.sessions.lock();
+        if sessions.len() >= max {
+            return Err(JoinError::TooMany(TooMany(sessions.len())));
+        }
+        if !self.tracks.lock().contains_key(&track.uid) || track.closed().is_some() {
+            return Err(JoinError::Gone);
+        }
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let session = Arc::new(Session::new(
+            format!("s{seq}-{nanos:08x}"),
+            seq + 1,
+            output,
+            in_format,
+            peak,
+            Arc::clone(&track),
+        ));
+        sessions.insert(session.id.clone(), Arc::clone(&session));
+        drop(sessions);
+        // Writes this output's pieces of what is ready already.
+        self.store_pieces(&track, 0..track.spec.frames);
+        session.set_cached(self.cached_for(&session));
+        self.changed();
         Ok(session)
     }
 
@@ -1016,31 +1290,295 @@ impl Sessions {
             ),
             Some(Verdict::Verified(id)) => {
                 let track = self.settle(&track, &id);
-                if let Some(pieces) = self.pieces() {
-                    pieces.publish(self, &track, 0..track.spec.frames);
-                }
+                self.store_pieces(&track, 0..track.spec.frames);
+                self.record_file(session, &id);
                 for other in self.of_track(&track) {
                     other.set_cached(self.cached_for(&other));
                 }
             }
         }
+        self.changed();
+        Ok(())
+    }
+
+    /// Record `session`'s file key against `track_id`, when it sent one.
+    pub fn record_file(&self, session: &Session, track_id: &str) {
+        let key = session.file.lock().clone();
+        if let (Some(pieces), Some(key)) = (self.pieces(), key)
+            && let Err(err) = pieces.record_file(&key, track_id)
+        {
+            tracing::warn!(session = %session.id, "recording file key {key}: {err:#}");
+        }
+    }
+
+    /// Replace `session`'s plan, against the pieces on disk now: a file deleted
+    /// outside the server is separated again.
+    pub fn set_window(&self, session: &Session, request: &WindowRequest) -> Result<()> {
+        request.check()?;
+        session.set_cached(self.cached_for(session));
+        session.set_window(request)?;
+        self.changed();
         Ok(())
     }
 
     /// The pieces of `session`'s output stored under its track's id.
     pub fn cached_for(&self, session: &Session) -> Vec<usize> {
-        let track = session.track();
-        let (Some(pieces), Some(id)) = (self.pieces(), track.verified()) else {
+        let Some(dir) = self.track_dir(session) else {
             return Vec::new();
         };
-        pieces.cached(
-            &track.model_id,
-            &type_dir(&session.output, session.gain),
-            &id,
+        Pieces::cached(
+            &dir,
             &served(&session.output),
             session.output.format.extension(),
-            track.spec.grid.len(),
+            session.track().spec.grid.len(),
         )
+    }
+
+    /// Encode and write the pieces near `touched` that are complete in `track`, once it is hashed.
+    pub fn store_pieces(&self, track: &Track, touched: Range<usize>) {
+        let (Some(pieces), Some(id)) = (self.pieces(), track.verified()) else {
+            return;
+        };
+        // Pieces are a cache, so a nearly full disk skips them and the job goes on.
+        if crate::disk::low(pieces.root()) {
+            tracing::debug!(track = %id, "disk nearly full, not writing pieces");
+            return;
+        }
+        let info = TrackInfo::from(&track.spec);
+        let first = touched.start.saturating_sub(RESAMPLE_CONTEXT) / info.stride;
+        let last = (touched.end + RESAMPLE_CONTEXT)
+            .div_ceil(info.stride)
+            .min(info.pieces);
+
+        let mut outputs: Vec<(String, Output, f32)> = Vec::new();
+        for session in self.of_track(track) {
+            let name = type_dir(&session.output, session.gain);
+            if !outputs.iter().any(|(n, _, _)| *n == name) {
+                let mut output = session.output.clone();
+                output.derived = true;
+                outputs.push((name, output, session.gain));
+            }
+        }
+        for (name, output, gain) in outputs {
+            let converts = output.rate.hz() != track.spec.sample_rate;
+            let dir = pieces.verified_dir(&track.model_id, &name, &id);
+            if let Err(err) = pieces.write_info(&dir, &info) {
+                tracing::warn!(track = %id, "describing {name}: {err:#}");
+                continue;
+            }
+            for k in first..last {
+                if !track.piece_writable(k, &name, converts) {
+                    continue;
+                }
+                let piece = track.piece(k);
+                let written = stems_of(&output).into_iter().try_for_each(|stem| {
+                    let excerpt = track.read(&output, stem, piece.start, piece.end)?;
+                    let bytes = stemd_core::encode_stem(&excerpt.audio, output.format, gain)?;
+                    pieces.write_verified(&dir, stem, k, output.format.extension(), &bytes)
+                });
+                match written {
+                    Ok(()) => track.mark_written(k, &name),
+                    Err(err) => tracing::warn!(track = %id, "piece {k}: {err:#}"),
+                }
+            }
+            let task = Consolidation {
+                dir,
+                format: output.format,
+                rate: output.rate.hz(),
+                info,
+                stems: stems_of(&output),
+            };
+            if Pieces::needs_consolidation(&task) {
+                pieces.consolidate_later(task);
+            }
+        }
+    }
+
+    /// Part `name` over `from..to` at the output rate and the transfer scale, from memory or disk.
+    pub fn read_stored(
+        &self,
+        session: &Session,
+        name: &str,
+        from: usize,
+        to: usize,
+    ) -> Result<Excerpt> {
+        if let Some(reason) = session.closed() {
+            bail!("this session is closed: {reason}");
+        }
+        let output = &session.output;
+        if !served(output).contains(&name) {
+            bail!("this session serves {:?}, not {name}", served(output));
+        }
+        let track = session.track();
+        if from >= to || to > track.spec.frames {
+            bail!(
+                "{from}..{to} is not a range of this {}-sample track",
+                track.spec.frames
+            );
+        }
+        let stride = track.spec.grid.stride().unsigned_abs() as usize;
+        let whole = self.whole(session, name);
+        let dir = self.track_dir(session);
+        let lookup = |k: usize| {
+            if whole.is_some() {
+                return Some(Source::Whole);
+            }
+            Pieces::lookup(dir.as_ref()?, name, k, output.format.extension()).map(Source::Piece)
+        };
+
+        // A chunk comes from memory when it is ready with the context a rate
+        // conversion needs, else from disk, else from memory with less context.
+        // Consecutive chunks from memory or from the whole file are read as one range.
+        let converts = output.rate.hz() != track.spec.sample_rate;
+        let mut runs: Vec<(Range<usize>, Source)> = Vec::new();
+        for k in from / stride..to.div_ceil(stride) {
+            let piece = track.piece(k);
+            let chunk = piece.start.max(from)..piece.end.min(to);
+            let context = if converts {
+                chunk.start.saturating_sub(RESAMPLE_CONTEXT)
+                    ..(chunk.end + RESAMPLE_CONTEXT).min(track.spec.frames)
+            } else {
+                chunk.clone()
+            };
+            let source = if track.ready_covers(&context) {
+                Source::Memory
+            } else if let Some(source) = lookup(k) {
+                source
+            } else if track.ready_covers(&chunk) {
+                Source::Memory
+            } else {
+                bail!(
+                    "samples {}..{} are neither ready nor stored",
+                    chunk.start,
+                    chunk.end
+                );
+            };
+            match (runs.last_mut(), source) {
+                (Some((run, Source::Memory)), Source::Memory)
+                | (Some((run, Source::Whole)), Source::Whole) => run.end = chunk.end,
+                (_, source) => runs.push((chunk, source)),
+            }
+        }
+
+        let (model, out) = (
+            u64::from(track.spec.sample_rate),
+            u64::from(output.rate.hz()),
+        );
+        let start = output_index(from, model, out);
+        let frames = output_index(to, model, out) - start;
+        let mut data = vec![Vec::with_capacity(frames); track.spec.channels];
+        for (run, source) in runs {
+            let at = output_index(run.start, model, out);
+            let len = output_index(run.end, model, out) - at;
+            let cut = |whole: &Whole| {
+                crate::whole::read(
+                    whole,
+                    output.format,
+                    track.spec.channels,
+                    output.rate.hz(),
+                    at,
+                    at + len,
+                )
+            };
+            let audio = match source {
+                Source::Memory => {
+                    let mut audio = track.read(output, name, run.start, run.end)?.audio;
+                    for v in audio.data.iter_mut().flatten() {
+                        *v *= session.gain;
+                    }
+                    audio
+                }
+                Source::Whole => cut(whole.as_ref().context("the whole file went away")?)?,
+                Source::Piece(path) => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let k = run.start / stride;
+                        let piece_at = output_index(track.piece(k).start, model, out);
+                        let piece_len = output_index(track.piece(k).end, model, out) - piece_at;
+                        let audio = crate::pieces::decode(
+                            bytes,
+                            output.format,
+                            track.spec.channels,
+                            output.rate.hz(),
+                        )
+                        .with_context(|| format!("decoding {}", path.display()))?;
+                        if audio.frames() != piece_len {
+                            bail!(
+                                "{} holds {} samples, not {piece_len}",
+                                path.display(),
+                                audio.frames()
+                            );
+                        }
+                        excerpt(&audio, at - piece_at, at - piece_at + len)
+                    }
+                    // Stored whole since the lookup.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => cut(&self
+                        .whole(session, name)
+                        .with_context(|| format!("{} went away", path.display()))?)?,
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("reading {}", path.display()));
+                    }
+                },
+            };
+            if audio.frames() != len {
+                bail!(
+                    "samples {}..{} read back {} samples, not {len}",
+                    run.start,
+                    run.end,
+                    audio.frames()
+                );
+            }
+            for (dst, src) in data.iter_mut().zip(audio.data) {
+                dst.extend(src);
+            }
+        }
+        Ok(Excerpt {
+            audio: Audio::new(data, output.rate.hz()),
+            from: start,
+        })
+    }
+
+    /// The whole file of `name` for `session`'s output, when it holds the whole track.
+    pub fn whole(&self, session: &Session, name: &str) -> Option<Whole> {
+        if session.closed().is_some() || !served(&session.output).contains(&name) {
+            return None;
+        }
+        let dir = self.track_dir(session)?;
+        let frames = TrackInfo::from(&session.track().spec).frames_at(session.output.rate.hz());
+        let whole =
+            crate::whole::find_track(&dir, name, session.output.format.extension(), frames)?;
+        Pieces::touch(&dir);
+        Some(whole)
+    }
+
+    /// Store `bytes`, the whole of `name` just encoded for `session`, in place
+    /// of its pieces. Does nothing for a track that is not shared.
+    pub fn consolidate(
+        &self,
+        session: &Session,
+        name: &str,
+        bytes: &[u8],
+        frames: usize,
+        clipped: Option<usize>,
+    ) -> Result<()> {
+        let track = session.track();
+        let (Some(pieces), Some(dir), Some(id)) =
+            (self.pieces(), self.track_dir(session), track.verified())
+        else {
+            return Ok(());
+        };
+        if crate::disk::low(pieces.root()) {
+            return Ok(());
+        }
+        let task = Consolidation {
+            dir,
+            format: session.output.format,
+            rate: session.output.rate.hz(),
+            info: TrackInfo::from(&track.spec),
+            stems: stems_of(&session.output),
+        };
+        pieces.consolidate(&task, name, bytes, frames, clipped)?;
+        tracing::info!(track = %id, "stored {name} whole");
+        Ok(())
     }
 
     /// File `track`, whose whole upload hashed to `id`, under that id.
@@ -1112,6 +1650,7 @@ impl Sessions {
             self.record_end(session.number, reason.to_owned());
         }
         self.drop_orphans();
+        self.changed();
         removed.is_some()
     }
 
@@ -1152,16 +1691,24 @@ impl Sessions {
         if !closed.is_empty() {
             tracing::info!("closed {} sessions: {reason}", closed.len());
         }
+        self.changed();
     }
 
-    /// The next segment to run at `priority`: the oldest window's first.
-    pub fn next(&self, priority: Priority) -> Option<(Arc<Track>, usize)> {
+    /// The best-ranked segment of `class` across sessions; at a tie, the one served longest ago.
+    pub fn next(&self, class: Class) -> Option<(Arc<Track>, usize)> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
-        sessions
-            .into_iter()
-            .filter_map(|s| s.next(priority))
-            .min_by_key(|(_, _, at)| *at)
-            .map(|(track, k, _)| (track, k))
+        let (session, (track, k, _, _)) = sessions
+            .iter()
+            .filter_map(|s| s.next(class).map(|next| (s, next)))
+            .min_by_key(|(_, (_, k, rank, served))| (*rank, *served, *k))?;
+        session.state.lock().last_served = Some(Instant::now());
+        Some((track, k))
+    }
+
+    /// True when a session has a segment that can run now.
+    pub fn has_runnable(&self) -> bool {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        sessions.iter().any(|s| s.has_runnable())
     }
 
     /// Drop idle sessions and the tracks nobody plays; return the number of sessions dropped.
@@ -1184,19 +1731,19 @@ impl Sessions {
             self.record_end(number, reason);
         }
         self.drop_orphans();
+        if count > 0 {
+            self.changed();
+        }
         count
     }
 
     /// Drop the tracks no session plays.
     fn drop_orphans(&self) {
-        let used: HashSet<u64> = self
-            .sessions
-            .lock()
-            .values()
-            .map(|s| s.track().uid)
-            .collect();
-        self.tracks.lock().retain(|uid, _| used.contains(uid));
-        let tracks = self.tracks.lock();
+        // Held throughout, so a `join` cannot attach to a track while it is dropped.
+        let sessions = self.sessions.lock();
+        let used: HashSet<u64> = sessions.values().map(|s| s.track().uid).collect();
+        let mut tracks = self.tracks.lock();
+        tracks.retain(|uid, _| used.contains(uid));
         self.by_id.lock().retain(|_, uid| tracks.contains_key(uid));
     }
 }
@@ -1228,60 +1775,78 @@ mod tests {
         Grid::new(100_000, 1000, 0.25).expect("a grid")
     }
 
-    fn window(needle: usize, ahead: (usize, Priority), behind: (usize, Priority)) -> WindowRequest {
+    fn region(at: usize, ahead: usize, behind: usize, priority: u8) -> Region {
+        Region {
+            at,
+            ahead,
+            behind,
+            priority,
+        }
+    }
+
+    fn window(regions: &[Region]) -> WindowRequest {
         WindowRequest {
-            needle,
-            ahead: Margin {
-                frames: ahead.0,
-                priority: ahead.1,
-            },
-            behind: Margin {
-                frames: behind.0,
-                priority: behind.1,
-            },
+            regions: regions.to_vec(),
         }
     }
 
     #[test]
-    fn a_plan_starts_under_the_needle_then_takes_two_ahead_for_one_behind() {
-        use Priority::{Bonus, Critical};
-        let planned = plan(&grid(), &window(10_000, (3000, Critical), (1500, Bonus)));
-        let order: Vec<usize> = planned.iter().map(|(k, _)| *k).collect();
-        assert_eq!(order, vec![13, 14, 15, 12, 16, 17, 11]);
-        let priorities: Vec<Priority> = planned.iter().map(|(_, p)| *p).collect();
+    fn segments_run_nearest_at_first_with_behind_counted_twice() {
+        let planned = plan(&grid(), &window(&[region(10_000, 3000, 1500, 0)]));
+        let order: Vec<(usize, usize)> = planned.iter().map(|(k, r)| (*k, r.distance)).collect();
         assert_eq!(
-            priorities,
+            order,
             vec![
-                Critical, Critical, Critical, Bonus, Critical, Critical, Bonus
+                (13, 0),
+                (12, 1),
+                (14, 500),
+                (15, 1250),
+                (11, 1501),
+                (16, 2000),
+                (17, 2750)
             ]
         );
+        assert!(planned.iter().all(|(_, r)| r.priority == 0));
     }
 
     #[test]
-    fn a_critical_behind_leads_a_bonus_ahead() {
-        use Priority::{Bonus, Critical};
-        let planned = plan(&grid(), &window(10_000, (1500, Bonus), (3000, Critical)));
-        let order: Vec<usize> = planned.iter().map(|(k, _)| *k).collect();
-        assert_eq!(order, vec![13, 12, 11, 14, 10, 9, 15]);
-        assert_eq!(
-            planned[0].1, Critical,
-            "the needle takes the higher priority"
-        );
+    fn a_segment_takes_its_best_rank_across_regions() {
+        let request = window(&[
+            region(50_000, 1000, 0, 1),
+            region(10_000, 1000, 0, 0),
+            region(10_000, 0, 0, 7),
+        ]);
+        let planned = plan(&grid(), &request);
+        let order: Vec<(usize, u8)> = planned.iter().map(|(k, r)| (*k, r.priority)).collect();
+        assert_eq!(order, vec![(13, 0), (14, 0), (66, 1), (67, 1)]);
+        assert_eq!(planned[0].1.class(), Class::BeforeJobs);
+        let idle = plan(&grid(), &window(&[region(0, 0, 0, BEFORE_JOBS)]));
+        assert_eq!(idle[0].1.class(), Class::WhenIdle);
     }
 
     #[test]
     fn a_plan_stays_inside_the_track() {
-        let request = window(
-            99_999,
-            (50_000, Priority::Critical),
-            (2000, Priority::Critical),
-        );
-        let planned = plan(&grid(), &request);
+        let planned = plan(&grid(), &window(&[region(99_999, 50_000, 2000, 0)]));
         assert!(planned.iter().all(|(k, _)| *k < grid().len()));
         let mut ks: Vec<usize> = planned.iter().map(|(k, _)| *k).collect();
         ks.sort_unstable();
         ks.dedup();
         assert_eq!(ks.len(), planned.len(), "a segment is planned twice");
+    }
+
+    #[test]
+    fn a_window_past_its_limits_is_refused() {
+        assert!(window(&[region(0, 0, 0, MAX_PRIORITY)]).check().is_ok());
+        assert!(
+            window(&[region(0, 0, 0, MAX_PRIORITY + 1)])
+                .check()
+                .is_err()
+        );
+        assert!(
+            window(&vec![region(0, 0, 0, 0); MAX_REGIONS + 1])
+                .check()
+                .is_err()
+        );
     }
 
     fn output(format: StemFormat) -> Output {
@@ -1341,6 +1906,40 @@ mod tests {
             Some(Verdict::Verified(id)) => sessions.settle(&track, &id),
             other => panic!("the upload came to {other:?}"),
         }
+    }
+
+    #[test]
+    fn two_sessions_at_one_rank_take_turns_and_a_better_rank_goes_first() {
+        let sessions = Sessions::new(Duration::from_secs(30), 4);
+        let a = sessions.open(request()).expect("open");
+        let b = sessions.open(request()).expect("open");
+        for (i, session) in [&a, &b].into_iter().enumerate() {
+            session
+                .track()
+                .upload(0, &audio(100_000, 0.01 + i as f32 / 100.0))
+                .expect("upload");
+            session
+                .set_window(&window(&[region(10_000, 3000, 0, 0)]))
+                .expect("window");
+        }
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            let (track, k) = sessions.next(Class::BeforeJobs).expect("a segment");
+            order.push(if track.uid == a.track().uid { 'a' } else { 'b' });
+            track.done(k);
+        }
+        assert!(
+            order.windows(2).all(|w| w[0] != w[1]),
+            "the sessions did not take turns: {order:?}"
+        );
+
+        b.set_window(&window(&[region(50_000, 0, 0, 0)]))
+            .expect("window");
+        a.set_window(&window(&[region(60_000, 0, 0, 1)]))
+            .expect("window");
+        let (track, _) = sessions.next(Class::BeforeJobs).expect("a segment");
+        assert_eq!(track.uid, b.track().uid, "priority 0 waited for priority 1");
+        assert!(sessions.next(Class::WhenIdle).is_none());
     }
 
     #[test]
@@ -1477,11 +2076,7 @@ mod tests {
             .upload(0, &audio(40_000, 0.01))
             .expect("upload the first part");
         session
-            .set_window(&window(
-                0,
-                (100_000, Priority::Critical),
-                (0, Priority::Bonus),
-            ))
+            .set_window(&window(&[region(0, 100_000, 0, 0)]))
             .expect("window");
         track.done(0);
         session.set_cached([1]);
@@ -1492,8 +2087,8 @@ mod tests {
         assert_eq!(activity.ready, 1, "the stored piece");
         assert_eq!(activity.arrived, 40_000);
         assert_eq!(activity.covered, track.piece(1).len(), "the stored piece");
-        assert_eq!(activity.bonus, 0);
-        assert!(activity.critical > 0, "{activity:?}");
+        assert_eq!(activity.normal, 0);
+        assert!(activity.high > 0, "{activity:?}");
         assert!(!activity.runnable, "runnable without the mix statistics");
 
         let mix = audio(100_000, 0.01);

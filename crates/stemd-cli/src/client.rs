@@ -21,9 +21,9 @@ pub struct Health {
     pub model: String,
     #[serde(default = "default_rate")]
     pub sample_rate: u32,
-    /// Stems the server transfers. The remaining part is rebuilt client-side.
+    /// The output a job that names no format, rate or parts gets.
     #[serde(default)]
-    pub stems: Vec<String>,
+    pub default_output: DefaultOutput,
     #[serde(default = "unbounded")]
     pub max_track_seconds: f64,
     /// Output rates this server offers. Empty when it is too old to say.
@@ -32,15 +32,16 @@ pub struct Health {
     /// DSP modes this server offers. Empty when it is too old to say.
     #[serde(default)]
     pub dsp_modes: Vec<u8>,
-    /// Behaviors added after protocol 1, such as `dsp-filters`.
-    #[serde(default)]
-    pub features: Vec<String>,
 }
 
-impl Health {
-    pub fn has(&self, feature: &str) -> bool {
-        self.features.iter().any(|f| f == feature)
-    }
+#[derive(Debug, Default, Deserialize)]
+pub struct DefaultOutput {
+    /// Parts a job that names none gets.
+    #[serde(default)]
+    pub parts: Vec<String>,
+    /// The part rebuilt client-side from the mix.
+    #[serde(default)]
+    pub derived: Option<String>,
 }
 
 /// A conversion filter as the server describes it.
@@ -75,22 +76,22 @@ const fn unity() -> f32 {
     1.0
 }
 
-fn default_derived_stem() -> Option<String> {
-    Some("drums".into())
+/// The output the stems are in.
+#[derive(Debug, Deserialize)]
+pub struct Output {
+    pub format: String,
+    /// Rate the stems are at, which is the requested output rate rather than
+    /// the rate of the mix that was uploaded.
+    pub sample_rate: u32,
+    /// The part to rebuild as `mix` minus the stems, when one is left out.
+    pub derived: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct JobResult {
-    /// Rate the stems are at, which is the requested output rate rather than
-    /// the rate of the mix that was uploaded.
-    pub sample_rate: u32,
-    pub format: String,
+    pub output: Output,
     pub stems: Vec<StemRef>,
     pub model_residual_db: f64,
-    /// The part to rebuild as `mix` minus `stems`; absent from older servers,
-    /// which always mean `drums`.
-    #[serde(default = "default_derived_stem")]
-    pub derived_stem: Option<String>,
     pub separation_secs: f64,
     pub realtime_factor: f64,
 }
@@ -218,13 +219,13 @@ impl Server {
     }
 
     pub fn health(&self) -> Result<Health> {
-        get_json(&format!("{}/v1/health", self.base))
+        get_json(&format!("{}/v2/health", self.base))
     }
 
     /// Upload the mix and return the new job's id.
     pub fn submit(&self, body: &[u8], sample_rate: u32, formats: Formats<'_>) -> Result<String> {
         let mut url = format!(
-            "{}/v1/jobs?sample_rate={sample_rate}&channels=2&format={}&output_format={}",
+            "{}/v2/jobs?sample_rate={sample_rate}&channels=2&format={}&output_format={}",
             self.base, formats.upload, formats.download,
         );
         if let Some(rate) = formats.rate {
@@ -255,7 +256,7 @@ impl Server {
     pub fn ensure_filter(&self, bytes: &[u8]) -> Result<(FilterSummary, bool)> {
         use sha2::{Digest, Sha256};
         let id = format!("{:x}", Sha256::digest(bytes));
-        let url = format!("{}/v1/filters/{id}", self.base);
+        let url = format!("{}/v2/filters/{id}", self.base);
         match ureq::get(&url).call() {
             Ok(response) => Ok((serde_json::from_str(&read_body(response)?)?, false)),
             Err(ureq::Error::StatusCode(404)) => {
@@ -280,7 +281,7 @@ impl Server {
     /// Poll until the job reaches a terminal stage, reporting progress changes
     /// to `on_progress` as they happen.
     pub fn wait(&self, id: &str, mut on_progress: impl FnMut(&str, f64)) -> Result<JobResult> {
-        let url = format!("{}/v1/jobs/{id}", self.base);
+        let url = format!("{}/v2/jobs/{id}", self.base);
         let mut last = String::new();
         loop {
             let job: JobView = get_json(&url)?;
@@ -380,12 +381,14 @@ mod tests {
         // The server sends a good deal more than this; a client that broke on
         // an unknown field would break on every server-side addition.
         let health: Health = serde_json::from_str(
-            r#"{"model":"htdemucs","sample_rate":44100,"stems":["harmonics","vocals"],
+            r#"{"model":"htdemucs","sample_rate":44100,
+                "default_output":{"format":"flac","sample_rate":44100,"parts":["harmonics","vocals"],"derived":"drums"},
                 "max_track_seconds":600.0,"backend":"demucs","cached_tracks":3}"#,
         )
         .unwrap();
         assert_eq!(health.model, "htdemucs");
-        assert_eq!(health.stems.len(), 2);
+        assert_eq!(health.default_output.parts.len(), 2);
+        assert_eq!(health.default_output.derived.as_deref(), Some("drums"));
         assert!((health.max_track_seconds - 600.0).abs() < 1e-9);
     }
 
@@ -393,7 +396,7 @@ mod tests {
     fn a_health_response_missing_optional_fields_falls_back() {
         let health: Health = serde_json::from_str(r#"{"model":"x"}"#).unwrap();
         assert_eq!(health.sample_rate, 44100);
-        assert!(health.stems.is_empty());
+        assert!(health.default_output.parts.is_empty());
         assert!(
             health.max_track_seconds.is_infinite(),
             "an unstated limit must not reject every track"

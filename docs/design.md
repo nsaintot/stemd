@@ -14,7 +14,7 @@ This is the *client* side. What the server actually does is
     |                                    |                     |
     |<--- mDNS _stemd._tcp ------------->|                     |
     |                                    |<-- track load hook --|  (LD_PRELOAD shim)
-    |<--- POST /v1/jobs (raw PCM) -------|                     |
+    |<--- POST /v2/jobs (raw PCM) -------|                     |
     |---- 2 stems: harmonics, vocals --->|                     |
     |                                  /dev/shm/stems-<hash>   |
     |                                    |--- mmap ----------->|
@@ -31,7 +31,7 @@ decode-and-stretch chains do not fit. All stems share an identical time base, so
 apply gains, sum to one buffer, and feed the *existing* single stretcher. The
 added RT cost is a few multiply-accumulate passes, which is also why the third
 part is rebuilt inside that sum rather than materialised
-([api.md](api.md#4-rebuild-the-third-part-while-mixing)).
+([api.md](api.md#rebuilding-the-derived-part)).
 
 **Nothing network-facing runs inside the player.** Discovery, HTTP and decode
 live in a separate sidecar daemon. The `LD_PRELOAD` shim inside the player only
@@ -57,8 +57,8 @@ in [evaluation.md](evaluation.md#on-device-separation).
   LRU of two or three tracks, current plus prefetched next, is the budget.
 - Nothing is written to persistent storage. `/` is ramfs, unbounded and
   unreclaimable, so stems must never be written there.
-- Store the two transferred stems only, losslessly, keyed on `model_id`: the
-  reasoning is in [api.md](api.md#caching-on-the-client).
+- Store the two transferred stems only, losslessly, keyed on `model_id`: see
+  [api.md](api.md#a-deck-loading-a-track).
 
 ## Discovery
 

@@ -1,7 +1,7 @@
 //! Progress reporting.
 //!
 //! Separation is chunked, so progress is a real count of completed work rather
-//! than a spinner. The client polls `GET /v1/jobs/{id}` and sees the chunk
+//! than a spinner. The client polls `GET /v2/jobs/{id}` and sees the chunk
 //! counter advance.
 
 use serde::{Deserialize, Serialize};

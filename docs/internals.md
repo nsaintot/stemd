@@ -97,8 +97,42 @@ separator holds GPU state a running forward pass is using. The worker also
 *builds* it: MLX weights have to be allocated on the thread that will evaluate
 them, so what crosses the thread boundary is a closure, never a loaded model.
 The switch thread does the 320 MB download and then waits for the answer, which
-is what keeps a failed switch reportable and stops `/v1/health` naming a model
+is what keeps a failed switch reportable and stops `/v2/health` naming a model
 the worker has not got yet.
+
+## API design notes
+
+Why the contract in [api.md](api.md) is shaped as it is.
+
+- **Raw PCM uploads.** The client already holds decoded samples. A second
+  decoder on the server can disagree on encoder delay, which leaves a shallow
+  null when the client rebuilds the derived part.
+- **`model_id`** is `<artefact>-<8 hex>` of a digest over the weights and the
+  preset's recipe. A preset that changes how it uses an artefact changes the id,
+  so stems made before the change stop matching. Precision and overlap stay out
+  of it: they go only into the server's internal cache key.
+- **Numbered `dsp_mode`s and filters.** A client that rebuilds
+  `drums = mix − harmonics − vocals` at another rate must resample its mix
+  through the same filter as the stems. Two good resamplers agree to about
+  −77 dB of the mix, which is −36 dB of a part 41 dB below it; the same filter
+  gives −101 dB. A filter's delay is part of it: mode 1 sits 64 samples later at
+  96 kHz than mode 0.
+- **`model_residual_db`.** On `Fast` the four sources come straight from the
+  model and miss the mix by its residual, which lands on the rebuilt part.
+  `Balanced` and `Quality` build one part as the remainder, so the residual reads
+  about −160 dB and only says the arithmetic is right.
+- **Fixed FLAC block size.** STREAMINFO declares `min_blocksize ==
+  max_blocksize`, leaving the trailing partial block out of the minimum, as
+  libFLAC and ffmpeg do. A stream declaring them unequal tells the decoder to
+  locate frames by sample number, and decoders then stop early or report frames
+  out of order.
+- **Read costs**, a 6-minute stem at 96 kHz in FLAC on an M1 Pro:
+
+  | Read | Time | Memory |
+  | --- | --- | --- |
+  | whole stem, stored whole | the file transfer | a few MB of buffer |
+  | whole stem, first read from 62 stored pieces | 1.7 s: decode 0.65 s, encode 1.0 s | 1.5 GB peak, 1.2 GB of it in the FLAC encoder |
+  | one piece's range, stored whole | 10 ms plus the encode of the range | the range only |
 
 ## Discovery
 
@@ -133,7 +167,7 @@ logged and ignored: a client with the address configured out of band still works
 
 ## Drops
 
-A file dropped on the window is the same job a `POST /v1/jobs` makes: same hash
+A file dropped on the window is the same job a `POST /v2/jobs` makes: same hash
 ingredients, same store, same worker. A drop and a client asking for the same
 track join one separation, and the same file twice is a cache hit. `drops.rs`
 differs at two points: the audio comes from a file, and it always asks for the
@@ -153,7 +187,7 @@ mechanics: timings, bookkeeping, paths that did no work. A whole separation
 costs two `info` lines.
 
 The two sinks are filtered apart: the console takes `info` and up, which is what
-a headless run should print, while the buffer behind `/v1/logs` keeps `debug`
+a headless run should print, while the buffer behind `/v2/logs` keeps `debug`
 too. `RUST_LOG` overrides both at once.
 
 ## Settings

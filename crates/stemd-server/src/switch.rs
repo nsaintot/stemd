@@ -389,6 +389,7 @@ mod tests {
                     },
                     model_id: "test".into(),
                     from_api: true,
+                    file: None,
                 })
                 .expect("queue has room");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);

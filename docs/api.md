@@ -1,621 +1,754 @@
 # API
 
+The HTTP contract between stemd-server and its clients, protocol 2. Every route
+is under `/v2`. Protocol 1, under `/v1`, is deprecated and may stop working in
+a future release: see [Protocol 1 (deprecated)](#protocol-1-deprecated).
+
 ```text
-GET    /v1/health                     runtime, model, queue and cache state
-POST   /v1/jobs                       raw PCM body -> 202 + job
-                                      200 + a finished job on a cache hit
-                                      429 when the queue is full
-GET    /v1/jobs/{id}                  progress, then the result object
-GET    /v1/jobs/{id}/stems/{name}     raw interleaved PCM stream
-                                      410 if the stems were reaped: resubmit
-DELETE /v1/jobs/{id}                  stop the job, drop the handle
-POST   /v1/sessions                   open a session: track length and output
-PUT    /v1/sessions/{id}/pcm?offset=N PCM placed at track sample N
-PUT    /v1/sessions/{id}/window       needle and margins, JSON
-GET    /v1/sessions/{id}              what has arrived and what is ready
-GET    /v1/sessions/{id}/stems/{name} one ready range, ?from=&to=
-                                      409 if it is not ready
-GET    /v1/sessions/{id}/pieces/{name}/{k}  piece k, encoded, as stored
-DELETE /v1/sessions/{id}              end the session
-GET    /v1/logs                       recent log lines
+GET    /v2/health                                  server, model and defaults
+POST   /v2/jobs                                    separate a whole track
+GET    /v2/jobs/{id}                               progress, then the result
+GET    /v2/jobs/{id}/stems/{name}                  one stem of a finished job
+DELETE /v2/jobs/{id}                               release or cancel the job
+PUT    /v2/filters/{id}                            upload a conversion filter
+GET    /v2/filters/{id}                            summary of a stored filter
+POST   /v2/sessions                                open a session
+PUT    /v2/sessions/{id}/pcm?offset=N              upload audio at track sample N
+PUT    /v2/sessions/{id}/window                    the regions to separate
+GET    /v2/sessions/{id}                           the session view; long-poll with ?wait=
+GET    /v2/sessions/{id}/stems/{name}              a range, or the whole stem
+GET    /v2/sessions/{id}/pieces/{name}/{k}         piece k, encoded
+DELETE /v2/sessions/{id}                           end the session
+GET    /v2/separations/{track id}                  what the server holds for one output
+GET    /v2/separations?file={file key}             the same, found by the client's file key
+GET    /v2/separations/{track id}/stems/{name}     one stem, stored whole
+GET    /v2/separations/{track id}/bundle           every stem in one file
+GET    /v2/logs                                    recent log lines
 ```
 
-## Protocol 1 (deprecated)
+- **Jobs** separate a whole track and return finished stems.
+- **Sessions** separate a track in pieces around a playhead, for a deck that
+  plays before the separation ends.
+- **Separations** tell a client what is already stored, by track id, before it
+  uploads anything.
 
-Every path above is protocol 1. It is deprecated and may stop working in a
-future release.
+The reference client is [stemd-cli](../crates/stemd-cli/src/main.rs).
 
-- Every `/v1` answer carries `Deprecation: true` and
-  `Link: <https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel="deprecation"; type="text/html"`.
-- The server logs one warning per client address that calls `/v1`.
+## Basics
+
+### Errors
+
+An error body is JSON:
+
+```json
+{"error": "no filter 3fa4…; upload it with PUT /v2/filters/3fa4…", "code": "unknown_filter"}
+```
+
+`code` is present only where a client acts on it:
+
+| `code` | Status | The client |
+| --- | --- | --- |
+| `unknown_filter` | `404` | uploads the filter, then resends |
+| `unknown_separation` | `404` | opens a session and uploads, or submits a job |
+| `protocol_1` | `410` | uses `/v2/sessions`: sessions are on `/v2` only |
+
+A malformed query or JSON body is a plain-text `400`, `415` or `422`; a
+malformed window is a JSON `400`. Every
+route, `/v2/health` included, answers `503` while the server is switched off in
+its window.
+
+### Health
+
+`GET /v2/health`:
+
+```json
+{"version": "0.2.1", "backend": "mlx", "model": "htdemucs", "device": "gpu",
+ "sample_rate": 44100, "channels": 2, "preset": "Fast",
+ "model_id": "htdemucs-22c7f2c9",
+ "completed_jobs": 0, "queue_depth": 0,
+ "cached_tracks": 0, "cached_bytes": 0, "cache_max_bytes": 4000000000,
+ "max_track_seconds": 600.0,
+ "output_sample_rates": [24000, 44100, 48000, 96000],
+ "dsp_modes": [0, 1], "dsp_mode_pairs": {"1": [44100, 96000]},
+ "parts": ["harmonics", "vocals", "drums", "bass", "other"],
+ "default_output": {"format": "flac", "sample_rate": 44100,
+                    "parts": ["harmonics", "vocals"], "derived": "drums"},
+ "features": [],
+ "segment_run_seconds": 0.41,
+ "session": {"methods": {"partial": {"requires": ["mean", "std"], "optional": ["peak"]},
+                         "whole": {"requires": [], "optional": ["peak"]}}}}
+```
+
+| Field | |
+| --- | --- |
+| `sample_rate`, `channels` | The model's rate and channel count. Positions in sessions are samples at this rate. |
+| `preset` | `Fast`, `Balanced` or `Quality`; absent for a custom model. |
+| `model_id` | What produced the stems. Key a cache on it, see [Identifiers](#identifiers). |
+| `running_job` | The job id running now; absent when idle. |
+| `max_track_seconds` | Longest accepted track. Longer is `413`. |
+| `output_sample_rates` | Values `output_sample_rate` accepts. |
+| `dsp_modes`, `dsp_mode_pairs` | Values `dsp_mode` accepts, and the one rate pair each numbered mode covers. |
+| `parts` | Parts a request can list in `parts`. |
+| `default_output` | The output of a request that names no format, rate or parts. Set in the window; read it, do not assume it. |
+| `features` | Behaviors added after protocol 2; empty for now. |
+| `segment_run_seconds` | Median seconds the loaded model takes per segment, over the last 16; `null` until one ran, and again after a model switch. |
+| `session` | [Upload methods](#upload-methods) of a session; `null` when the model cannot run segment by segment. |
+
+Read `/v2/health` again after a model switch: `model_id`, `preset`,
+`segment_run_seconds` and `session` change with the model.
+
+### The output block
+
+Job results, session views and lookups describe their stems with one shape:
+
+```json
+"output": {"format": "flac", "sample_rate": 44100, "gain": 0.7071068,
+           "parts": ["harmonics", "vocals"], "derived": "drums"}
+```
+
+| Field | |
+| --- | --- |
+| `format` | `flac`, `wav`, `mp3`, `pcm16` or `pcm32`. |
+| `sample_rate` | Output rate. |
+| `gain` | Multiply every sample by `1.0 / gain`. Absent in job results, where each stem carries its own, and for an open track. |
+| `parts` | The parts shipped. |
+| `derived` | The part the client rebuilds as `mix` minus the parts, or `null` when nothing is left out. |
 
 ## Identifiers
 
-Two ids cross the wire, and a client stores both. Neither ever contains anything
-outside `[A-Za-z0-9._-]`, neither exceeds **31 characters**: an id plus its NUL
-fits a 32-byte buffer, and neither is empty, a path separator, `.` or `..`. So
-an id is safe to use directly as a path component, and a bounded copy is all the
-filtering a client needs. The server owns that invariant against arbitrary
-operator input, which is what `--demucs-model` is.
-
-| Field | Shape | Example |
+| Id | Shape | Example |
 | --- | --- | --- |
-| `model_id` (in `/v1/health`) | `<artefact>-<8 hex>` | `htdemucs-22c7f2c9` |
-| job `id` (in `/v1/jobs`) | `<12 hex of the cache key>-<attempt>` | `a8e29ff15c16-3` |
+| `model_id` | `<artefact>-<8 hex>`, or `custom-<name>-<8 hex>` | `htdemucs-22c7f2c9` |
+| job `id` | `<12 hex>-<attempt>` | `a8e29ff15c16-3` |
+| session `id` | `s<n>-<8 hex>` | `s1-0a1b2c3d` |
+| track id | 24 lowercase hex | `f9c29cbfe3466b674f9903d9` |
+| file key | 24 lowercase hex, made by the client | `3b0c55e19a7d42f08c6e1d2a` |
 
-`model_id` identifies *what produced the stems*: the artefact name, then 8 hex
-of a digest over everything that decides the samples: the weights, how the
-preset uses them, the precision the model runs at, and the segment overlap. Key
-a client-side stem cache on it rather than on `model`, since several artefacts
-can share one model name and `model` cannot tell you whether stems on disk came
-from the weights now loaded.
+Every id is at most 31 characters of `[A-Za-z0-9._-]`, never `.` or `..`, so it
+is safe as a path component.
 
-All of it is in there deliberately, and the weights are the least interesting
-part. Repointing a preset at a different artefact changes the id, which is
-obvious; so does changing the arrangement of a preset whose weights are
-untouched, which is not. `Balanced` did exactly that, it used to run all four of
-`htdemucs_ft`'s models and ship `bass + other` as the harmonics, and now runs two
-and ships the remainder. Same file, different audio. An id that covered only the
-file would have let stems from before that survive as though they were current.
-`--full-precision` and `--overlap` are there for the same reason: both change the
-samples without touching a byte of the artefact.
+- **`model_id`** covers the weights and how the preset uses them. Two presets on
+  one artefact, or one preset that changes its arrangement, have different ids.
+  It does not cover precision or segment overlap. Treat it as opaque.
+- **Job `id`**: the first half is the cache key, the same for every request
+  with the same audio and output; the attempt number keeps two clients' jobs
+  apart.
 
-**So the same artefact and preset do not give the same id on every machine.**
-Precision is chosen per model against the backend, so `htdemucs-389aad7d` above
-is what a GPU server reports; one with no usable GPU runs at f32 and reports
-`htdemucs-01db1f92`, and a CUDA server on a chained preset reports an id derived
-from both models' precisions. This is the point rather than a wrinkle: those
-servers produce different samples, and an id that hid the difference would let a
-client serve one machine's stems as though they were another's. Read the id, do
-not predict it.
+### Track id
 
-The server keys its own cache on the same fields, at full length, which you never
-see. Treat `model_id` as opaque: the field list grows when something new turns
-out to change the audio, and any id you have stored simply stops matching, which
-is the outcome you want.
+SHA-256 over:
 
-A job `id` identifies one *attempt* at one track. Its leading half is the cache
-key, which is also what the server logs, so a log line and a URL can be matched
-by eye. The trailing attempt number is what keeps two clients asking for the same
-track at different times from sharing an id: without it, a `DELETE` from a
-client that already finished would cancel the other's separation.
+1. three fields, each a little-endian `u32` byte length then its UTF-8 bytes:
+   `stemd-track-1`, the sample rate (`44100`), the channel count (`2`);
+2. every sample as little-endian `f32`, interleaved, at the model's rate.
 
-An artefact that is not a built-in preset (`--demucs-model` naming a
-`.safetensors` you put in `--models` yourself) publishes `custom-<name>-<8 hex>`,
-with the name sanitised and shortened to fit and the digest taken over the full
-name.
+The id is the first 24 hex characters. An `s16le` sample `v` hashes as the `f32`
+`v / 32768.0`, so `s16le` and `f32le` uploads of the same audio share an id.
 
-## What a client must do
+### File key
 
-Four things. The reference implementation is
-[stemd-cli](../crates/stemd-cli/src/main.rs).
+The track id needs the whole file decoded. A file key finds a track without
+decoding: the client derives it from the encoded file, for example from its size,
+its decoded length and a sample of its bytes. The server never computes it; it
+only stores and matches it.
 
-### 1. Upload raw PCM
+- Send `file=<key>` on `POST /v2/sessions` or `POST /v2/jobs`. Once the server
+  has hashed the whole upload, it records `key → track id`, persisted with the
+  stored stems.
+- `GET /v2/separations?file=<key>&<output>` then answers as a lookup by that
+  track id, `track` included.
+- A key that arrives with a second, different track id is ambiguous from then
+  on: lookups by it answer `404 unknown_separation`, and clients upload.
+- Clients that share a server share entries only when they compute the key the
+  same way and their decoders give the same samples. A decoder that trims
+  delay or padding differently gives a different track id.
 
-Not an encoded file. The client already has decoded samples, and decoding them
-again server-side risks the two decoders disagreeing on encoder delay, which
-shows up as a shallow null.
+### Track statistics
 
-```
-POST /v1/jobs?sample_rate=44100&channels=2&format=f32le
-```
+Sessions take three optional values computed over the whole decoded track, at
+the model's rate. The server checks `mean` and `std` against its own to the bit;
+a mismatch means the track is never shared or stored.
 
-| parameter | default | |
-|---|---|---|
-| `sample_rate` | `44100` | rate of the uploaded body; converted to the model's if it differs |
-| `channels` | `2` | |
-| `format` | `s16le` | encoding of the uploaded body: `s16le` or `f32le` |
-| `output_format` | `default_output_format` | `flac`, `wav`, `mp3`, `pcm16`, `pcm32` |
-| `output_sample_rate` | `default_output_sample_rate` | `24000`, `44100`, `48000` or `96000` |
-| `include_derived` | `false` | ship the derived part too, rather than leaving the client to rebuild it |
-| `parts` | `harmonics,vocals` | comma-separated parts to ship; see below |
-| `dsp_mode` | `0` | filter the output conversion runs through; numbered modes are deprecated, see below |
-| `dsp_filter` | none | id of an uploaded filter to use instead; see below |
-
-The two defaults are set in the server's window and persist across its launches,
-so read them from `/v1/health` rather than assuming, they are not constants.
-Every parameter here is part of the cache key, so two jobs differing in any of
-them are two separations.
-
-Upload at the model's own rate where you can. Anything else is converted on
-arrival, which costs time and puts a filter between the client's samples and the
-model's. The body limit is the byte count of the longest accepted track at
-96 kHz f32le, so a longer track at a higher rate is refused by length before the
-duration gate sees it.
-
-```bash
-curl -X POST --data-binary @track.pcm \
-  "http://host:8420/v1/jobs?sample_rate=44100&channels=2&format=s16le"
+```text
+m[i] = (f64(L[i]) + f64(R[i])) / 2
+mean = (m[0] + m[1] + … + m[n-1]) / n                f64, summed in index order
+var  = ((m[0] − mean)² + … + (m[n-1] − mean)²) / n   f64, in index order, divided by n
+std  = max(sqrt(var), 1e-8)
+peak = max |x| over every sample of both channels
 ```
 
-#### `parts`
+Send `mean` and `std` as `f32`, written as the shortest decimal that parses back
+to the same `f32`. Use a plain loop: a compensated or pairwise sum, such as
+Python's built-in `sum` since 3.12, can round differently.
 
-Every model separates four sources: `drums`, `bass`, `other` and `vocals`.
-`harmonics` is `bass` and `other` together. A job lists the parts it wants:
+## Audio
 
-| `parts` | ships | the client rebuilds |
-|---|---|---|
+### Upload
+
+Raw interleaved PCM, not an encoded file:
+
+| `format` | Sample |
+| --- | --- |
+| `s16le` (default) | `i16`, read as `v / 32768.0` |
+| `f32le` | `f32` |
+
+Upload at the model's `sample_rate`. A job converts any other rate on arrival;
+a session refuses it.
+
+### Output formats
+
+| `output_format` | Samples | Content type | 5-minute stem |
+| --- | --- | --- | --- |
+| `flac` | 16-bit | `audio/flac` | 20 to 30 MB |
+| `wav` | 16-bit | `audio/wav` | 53 MB |
+| `pcm16` | 16-bit, raw interleaved | `application/octet-stream` | 53 MB |
+| `pcm32` | `f32`, raw interleaved | `application/octet-stream` | 106 MB |
+| `mp3` | lossy, 320 kbps | `audio/mpeg` | 12 MB |
+
+- `flac`, `wav` and `pcm16` carry the same integers. `s16le`, `s16`, `f32le`
+  and `f32` are accepted spellings of `pcm16` and `pcm32`; responses always say
+  `pcm16` and `pcm32`.
+- A 16-bit sample is `round(clamp(x × gain, −1, 1) × 32767)`. Restore it as
+  `v / 32767 / gain`.
+- `pcm32` has headroom: its gain is always `1.0`. In a 16-bit format a sample
+  past full scale after the gain is clipped and counted in `x-stemd-clipped`.
+- `mp3` is for stems someone imports or archives, not for a deck: moving a
+  fader unmasks its coding noise, and lossy parts do not sum to the mix. It
+  stops at 48 kHz (`96000` with `mp3` is `400`), and sessions refuse it.
+- FLAC streams use one fixed block size.
+
+### Parts
+
+Every model separates `drums`, `bass`, `other` and `vocals`; `harmonics` is
+`bass` and `other` together. A request lists the parts to ship in `parts`:
+
+| `parts` | Ships | The client rebuilds |
+| --- | --- | --- |
 | `harmonics,vocals` (default) | `harmonics`, `vocals` | `drums` |
 | `bass,other,vocals` | `vocals`, `bass`, `other` | `drums` |
 | `drums,vocals` | `vocals`, `drums` | `harmonics` |
 | `drums,bass,other,vocals` | all four | nothing |
 
-- Parts may not overlap: `harmonics,bass` is refused.
-- They must leave out one part or none. The part left out is the one the client
-  rebuilds as `mix` minus the stems, and the one `include_derived` adds. The
-  result names it in `derived_stem`, which is `null` when nothing is left out.
-- `parts` in `/v1/health` lists what the loaded model offers. Every preset offers
-  all five.
-- Stems ship in the order `harmonics`, `vocals`, `drums`, `bass`, `other`.
-- `Balanced` runs a third model, `htdemucs_ft`'s bass specialist, when a job asks
-  for `bass` or `other`: about 1.5x the time. `Fast` and `Quality` get every part
-  from one pass.
-- With nothing left out, `Fast` ships its model's four sources as they are, and
-  they miss the mix by the model's residual (around −30 dB). `Balanced` and
-  `Quality` build `other` as the remainder, so the four sum exactly.
+- Parts may not overlap, and must leave out one part or none.
+- `include_derived=true` ships the part left out as well.
+- Stems come in the order `harmonics`, `vocals`, `drums`, `bass`, `other`, with
+  the derived part last.
+- `Balanced` runs a third model when `bass` or `other` is asked for: about 1.5x
+  the time.
 
-#### `dsp_mode`
+### Rebuilding the derived part
 
-Mode `0` is a general resampler and handles any rate pair. It is the default and
-almost certainly what you want.
+Do not store it. Mix it on the fly from the decoded mix and the stems:
 
-The numbered modes are deprecated. Mode 1 stays for clients that already send
-it; a new client uploads its converter's taps and sends
-[`dsp_filter`](#dsp_filter). Mode 1 and its taps uploaded as a filter give the
-same samples.
-
-A numbered mode is a copy of one particular client's own converter, and exists
-for one case: a client that rebuilds `drums = mix - harmonics - vocals` has to
-resample its mix to the stems' rate, and that subtraction only cancels if both
-sides went through the same filter. Two good resamplers are not enough. Against
-ffmpeg's `swresample` ours agrees to about -77 dB of the mix, which lands as
--36 dB of a part sitting 41 dB below it; matching the filter takes that to
--101 dB.
-
-Each numbered mode covers exactly one rate pair, listed in `dsp_mode_pairs` from
-`/v1/health`, and is a `400` on any other. Nothing falls back: a client asking
-for a filter it can match is never handed a different one under the same name.
-
-A mode's delay is part of the filter. Mode 1's output sits 64 samples later at
-96 kHz than mode 0's, which puts a feature exactly where the ratio does. That is
-the copied converter's own group delay, and carrying it is the point: the mix the
-client subtracts from went through the same taps.
-
-```bash
-# mode 1 covers 44100 -> 96000, so it needs that output rate.
-curl -X POST --data-binary @track.pcm \
-  "http://host:8420/v1/jobs?format=s16le&output_sample_rate=96000&dsp_mode=1"
+```text
+out = d·mix + (h − d)·H + (v − d)·V        h, v, d: the three faders
 ```
 
-#### `dsp_filter`
+At `h = v = d = 1.0` the output is the mix, bit for bit. Snap faders to a
+literal `1.0` for that. The sum is exact in every lossless format, since the
+derived part comes from the same mix it is summed against.
 
-A client can upload its own converter and name it on a job. Servers that support
-this list `dsp-filters` in `features`. The server keeps up to `max_dsp_filters`
-(in `/v1/health`) across restarts, and evicts the least recently used past
-that. Uploading or naming a filter counts as a use.
+## Jobs
+
+### Submit
 
 ```
-PUT /v1/filters/<id>     body: the filter file; 201 when new, 200 when already stored
-GET /v1/filters/<id>     200 with the summary, or 404
+POST /v2/jobs?sample_rate=44100&channels=2&format=s16le     body: the whole track
 ```
 
-`<id>` is the lowercase hex SHA-256 of the file. The file, little-endian:
+| Parameter | Default | |
+| --- | --- | --- |
+| `sample_rate`, `channels`, `format` | `44100`, `2`, `s16le` | The upload. |
+| `output_format` | `default_output.format` | See [Output formats](#output-formats). |
+| `output_sample_rate` | `default_output.sample_rate` | One of `output_sample_rates`. |
+| `parts` | `default_output.parts` | Comma-separated, see [Parts](#parts). |
+| `include_derived` | `false` | `true` ships the derived part too. |
+| `dsp_mode` | `0` | The output rate converter. `0` handles any pair; numbered modes are deprecated. |
+| `dsp_filter` | none | Id of an [uploaded filter](#filters) to convert with instead. |
+| `file` | none | The client's [file key](#file-key), recorded when the job's stems are stored. |
+
+| Status | |
+| --- | --- |
+| `202` | Accepted; poll the job. A request matching a job already running returns that job. |
+| `200` | Cached: the job is already done. |
+| `400` | A bad parameter, named in `error`. |
+| `404` | `unknown_filter`. |
+| `413` | Longer than `max_track_seconds`, or a body over the upload limit. |
+| `429` | The queue is full. |
+| `507` | The disk is full. |
+
+### Poll
+
+```json
+GET /v2/jobs/{id}
+{"id": "a8e29ff15c16-1",
+ "progress": {"stage": "done", "completed": 12, "total": 12, "fraction": 1.0, "detail": null},
+ "result": {
+   "output": {"format": "flac", "sample_rate": 44100,
+              "parts": ["harmonics", "vocals"], "derived": "drums"},
+   "channels": 2, "frames": 1323000,
+   "stems": [{"name": "harmonics", "url": "/v2/jobs/a8e29ff15c16-1/stems/harmonics",
+              "bytes": 2216440, "gain": 1.0},
+             {"name": "vocals", "url": "/v2/jobs/a8e29ff15c16-1/stems/vocals",
+              "bytes": 1120333, "gain": 1.0}],
+   "model_residual_db": -35.2, "separation_secs": 1.39, "realtime_factor": 21.6,
+   "cached": false}}
+```
+
+- `stage`: `queued`, `analysing`, `separating`, `reconstructing`, `writing`,
+  then `done`, `failed` (with `error`) or `cancelled`.
+- `fraction` runs 0 to 1; separation covers 0.10 to 0.90. While `queued`,
+  `completed` and `total` are the queue position and `detail` says so (`next`,
+  `2 ahead`).
+- `result` is present once `done`. `frames` is at the output rate. Each stem has
+  its own `gain`.
+- `model_residual_db` is diagnostic: `mix − sum(model sources)`. Around −30 dB
+  on `Fast`, where it lands in the rebuilt `drums`; about −160 dB on `Balanced`
+  and `Quality`, which build one part as the remainder. Do not compare it
+  across presets.
+- `separation_secs` is the cost of the run that made the stems, an earlier one
+  for a cached answer.
+
+### Download and release
+
+`GET /v2/jobs/{id}/stems/{name}` sends the stem in `output_format`.
+
+| Status | |
+| --- | --- |
+| `200` | The stem. |
+| `404` | No such job or stem. |
+| `409` | The job has not finished. |
+| `410` | The stems were evicted: submit again. |
+
+`DELETE /v2/jobs/{id}` releases the job (`204`). The last client to release a
+running job cancels it.
+
+A finished job also stores its stems for [lookups](#separations) and sessions on
+the same track.
+
+### Filters
+
+A client that rebuilds the derived part at another rate must resample its mix
+through the same filter as the stems. It uploads its converter once and names
+it in `dsp_filter`:
+
+```
+PUT /v2/filters/<id>     body: the filter file; 201 when new, 200 when stored already
+GET /v2/filters/<id>     the summary, or 404 unknown_filter
+```
+
+`<id>` is the lowercase hex SHA-256 of the file. Both answers carry
+`{"id", "in_rate", "out_rate", "taps", "branch_taps"}`. The file, little-endian:
 
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | 4 | magic `SFIR` |
-| 4 | 4 | version, `u32`, `1` |
-| 8 | 4 | input rate, `u32`: the model's rate, `sample_rate` in `/v1/health` |
-| 12 | 4 | output rate, `u32`: one of `output_sample_rates` |
+| 4 | 4 | version `u32`, `1` |
+| 8 | 4 | input rate `u32`: the model's `sample_rate` |
+| 12 | 4 | output rate `u32`: one of `output_sample_rates`, not the input rate |
 | 16 | 4 × n | prototype taps, `f32` |
 
 The filter is a stateless polyphase FIR. With `L / M = out / in` in lowest terms
 and `n = L × B` taps `p`, output frame `m` is
+`y[m] = Σ x[k] · p[m·M − k·L]`, with `p` and `x` zero outside their range. The
+output has `ceil(frames · L / M)` frames. Taps are applied as given (unity gain
+means they sum to `L`), and no delay is compensated. `B` is at most 1024 and `n`
+at most 1,048,576.
 
-```
-y[m] = sum over k of x[k] * p[m*M - k*L]
-```
-
-with `p` and `x` zero outside their range. The output has `ceil(frames * L / M)`
-frames. Taps are applied as given (unity passband gain means they sum to `L`) and
-no delay is compensated. `B` is at most 1024 and `n` at most 1,048,576.
-
-Both answers carry `{"id", "in_rate", "out_rate", "taps", "branch_taps"}`. A
-malformed file, or one whose hash is not `<id>`, is a `400` naming the problem.
-
-A job naming a filter must convert exactly its pair, like a numbered mode, and
-may not also set a non-zero `dsp_mode`. A filter the server does not hold is a
-`404` with `"code": "unknown_filter"`: upload it and resend the job.
-
-```bash
-id=$(shasum -a 256 player.fir | cut -d' ' -f1)
-curl -X PUT --data-binary @player.fir "http://host:8420/v1/filters/$id"
-curl -X POST --data-binary @track.pcm \
-  "http://host:8420/v1/jobs?format=s16le&output_sample_rate=96000&dsp_filter=$id"
-```
-
-A server without the `dsp-filters` feature ignores `dsp_filter` and uses mode 0,
-so check `features` before relying on it.
-
-### 2. Poll the returned job id
-
-Treat it as the job to poll, not as proof a new one was created: a request
-matching a separation already running returns *that* job. A `200` instead of
-`202` means the answer was cached and is already complete.
-
-Progress is a work counter, not a spinner:
-
-```json
-{"stage": "separating", "completed": 8, "total": 12, "fraction": 0.63}
-```
-
-Stages are `queued`, `analysing`, `separating`, `reconstructing`, `writing`,
-`done`, `failed`, `cancelled`. `fraction` is weighted so separation owns
-0.10–0.90. While `queued`, `completed`/`total` are the live queue position rather
-than a chunk count.
-
-`cancelled` is terminal and carries no `error`: it is what the client asked for.
-In practice a client rarely sees it, since the handle it cancelled is gone by
-then.
-
-### 3. Download both stems and apply `gain`
-
-```json
-{
-  "sample_rate": 44100, "channels": 2, "frames": 1323000,
-  "format": "flac",
-  "stems": [
-    {"name": "harmonics", "path": "~/Library/Caches/stemd/<key>/harmonics.flac",
-     "url": "/v1/jobs/{id}/stems/harmonics", "bytes": 2216440, "gain": 1.0}
-  ],
-  "model_residual_db": -35.2, "derived_stem": "drums",
-  "separation_secs": 1.39, "realtime_factor": 21.6,
-  "cached": false
-}
-```
-
-Multiply each stem by `1.0 / gain`. In any 16-bit format a stem peaking past full
-scale is scaled to fit, so `gain` is not always `1.0`; ignoring it plays those
-stems quiet. Only `pcm32` has the headroom to never need it.
-
-The gain is per stem, not shared: quantising a quiet stem against the loudest
-stem's peak throws away bits for nothing.
-
-`separation_secs` is what the run that produced the stems cost, which for a
-cached answer was an earlier job. `path` is useful only to a client on the same
-filesystem; everything else should fetch `url`.
-
-`model_residual_db` is diagnostic, not a gate: it is `mix − sum(model sources)`,
-what the model failed to account for. **What it means depends on the preset, so
-do not compare it across them.**
-
-On `Fast` it is around −30 dB and it lands on the rebuilt `drums`, making it the
-quality signal for that one control and nothing else. On `Balanced` and
-`Quality` it reads about −160 dB, and that is not a better model, those presets
-build `harmonics` as `mix − vocals − drums`, so the three parts are constructed
-to sum and there is no redundancy left to measure. There the number means "the
-arithmetic is right", and the leftover it used to describe is inside
-`harmonics`.
-
-The three parts sum exactly regardless of its value, on every preset.
-
-### 4. Rebuild the third part while mixing
-
-Never materialise it. Expanding `out = d·D + h·H + v·V` with `D = mix − H − V`
-collapses to:
-
-```
-out = d·mix + (h−d)·H + (v−d)·V
-```
-
-Three multiplies and two adds per sample, against buffers the client already
-holds: the same cost three transferred stems would have had. At
-`d == h == v == 1.0` both stem coefficients are exactly zero and the output is
-the untouched mix, **bit for bit**.
-
-> Snap the controls to a literal `1.0`. Bit-exactness at unity depends on `(h−d)`
-> being precisely zero, and 0.9997 does not qualify.
-
-Reconstruction is exact at any *lossless* wire format, because the rebuilt part
-comes from the *same* mix the parts are summed back against, so each stem's
-quantisation error cancels. What quantisation costs is that part's purity, not
-the sum. `mp3` is the one format this does not hold for: see below.
-
-## Wire format
-
-Stems ship as **FLAC** by default, carrying 16-bit samples. Four of the five
-formats carry *exactly* the integers `pcm16` would have: FLAC, WAV and `pcm16`
-are three containers over one set of samples, so which you ask for changes the
-bytes on the wire and not the audio, and a client rebuilding the third part gets
-the same answer from any of them.
-
-| `output_format` | per five-minute stem | content type | |
-|---|---|---|---|
-| `flac` *(default)* | ~20–30 MB, content-dependent | `audio/flac` | lossless |
-| `wav` | 53 MB | `audio/wav` | lossless |
-| `pcm16` | 53 MB | `application/octet-stream` | lossless, no container |
-| `pcm32` | 106 MB | `application/octet-stream` | lossless, no ceiling |
-| `mp3` | ~12 MB at 320 kbps | `audio/mpeg` | **lossy** |
-
-`s16le` and `f32le` are accepted as spellings of `pcm16` and `pcm32`.
-
-FLAC lands around 40% of the raw size on real material: a sparse stem such as
-vocals on an instrumental track compresses to a quarter. `pcm16` costs nothing to
-read and is the right choice if the client cannot spare a decode; `wav` is the
-same samples for anything that would rather be handed a header; `pcm32` exists
-for an exact reconstruction null with no quantisation anywhere.
-
-**`mp3` is not for a deck.** A perceptual codec hides its noise under a masking
-threshold computed for the signal as encoded, and a stem exists to have its gain
-changed afterwards: pull one down against the others and the noise that was
-masked stops being masked. Lossy parts also do not sum, so the rebuilt third part
-is no longer exact. It is the right choice for stems someone imports, auditions
-or archives, and the wrong one for anything that moves the faders.
-
-MP3 also constrains the rate: its modes stop at 48 kHz, so
-`output_format=mp3&output_sample_rate=96000` is a `400` rather than a slow encode
-to 48 kHz that no field in the response would have reported. `/v1/health`
-lists the rates, and the window offers only the ones the chosen format carries.
-
-Streams are **fixed block size**: STREAMINFO declares `min_blocksize ==
-max_blocksize`, matching frames written with the blocking-strategy bit clear.
-A stream that declares them unequal is telling the decoder to locate frames by
-sample number instead of frame number, and a decoder that follows that either
-stops partway through the file or reports every frame as out of order. The
-encoder therefore excludes the trailing partial block from the declared minimum,
-as libFLAC and ffmpeg do.
+- A malformed file, or one whose hash is not `<id>`, is `400`; an oversized one
+  is `413`.
+- The server keeps 64 filters across restarts and evicts the least recently
+  used. A job naming an evicted filter gets `404 unknown_filter`.
+- A job with `dsp_filter` must ask for exactly the filter's rate pair, and may
+  not also set a non-zero `dsp_mode`.
 
 ## Sessions
 
-A session separates one track in pieces, around a playhead, in the order the
-client asks. Use it to get stems near the needle within a segment or two instead
-of after the whole track.
+A session separates one track segment by segment, in the order its window asks.
+Positions are samples at the model's rate.
 
-Once a session's whole upload has arrived, the server hashes it into a
-[track id](#track-id). A session whose audio matches a track another session
-already has open joins it, so two decks playing one song share the model work
-and the memory from then on. Finished pieces are written to disk under that id,
-survive restarts, and serve any later session on the same audio without a model
-run.
+```text
+open ──▶ upload ──▶ window ──▶ long-poll the view ──▶ read ranges ──▶ end
+```
 
-All positions are track samples at the model's rate (`sample_rate` in
-`/v1/health`), whatever the output rate.
+Two sessions on the same audio share one track: the model work, the memory and
+the stored pieces. Finished pieces are stored under the [track id](#track-id)
+and serve any later session or lookup.
 
-### 1. Open
+### Open
 
 ```
-POST /v1/sessions?frames=<track length>&format=f32le&output_format=f32le&mean=<m>&std=<s>&peak=<p>
+POST /v2/sessions?frames=13230000&format=f32le&output_format=flac
 ```
 
 | Parameter | |
 | --- | --- |
-| `frames` | Required. Track length. |
-| `sample_rate`, `channels`, `format` | The upload. `sample_rate` must be the model's rate. |
-| `output_format`, `output_sample_rate`, `parts`, `include_derived`, `dsp_mode`, `dsp_filter` | As for `/v1/jobs`. `mp3` is refused. |
-| `mean`, `std` | Optional. Mean and standard deviation of the mono mixdown `(L + R) / 2` over the whole track, in f64, sent as f32. |
-| `peak` | Optional. Largest absolute sample of the mix, both channels. Sets the gain, and so the piece directory: send it to share pieces with whole-track jobs, which use the true peak. |
+| `frames` | Track length. Required unless `track` is set. |
+| `track` | A track id the lookup reports as `open`: join it and upload nothing. |
+| `file` | Optional. The client's [file key](#file-key). |
+| `sample_rate`, `channels`, `format` | The upload. Rate and channels must be the model's. |
+| output parameters | As for jobs. `mp3` is refused. |
+| `mean`, `std` | Optional, both or neither. See [Upload methods](#upload-methods) and [Track statistics](#track-statistics). |
+| `peak` | Optional. Sets the session's gain, see [Gain](#gain). |
 
-The body is optional PCM from sample 0. The answer is `201` and the session view.
-`429` means the `--max-sessions` limit is reached; `409` means the loaded model cannot run
-segment by segment.
+The body is optional audio from sample 0; it must be empty with `track`.
 
-### Track id
-
-The server computes it, as it does a job's cache key: SHA-256 over
-
-1. three fields, each a little-endian `u32` byte length then its UTF-8 bytes:
-   `stemd-track-1`, the sample rate (`44100`), the channel count (`2`);
-2. every frame's samples as little-endian `f32`, channel by channel within the
-   frame, at the model's rate.
-
-It is the first 24 lowercase hex characters, the same whether the upload was
-`s16le` or `f32le`. The view's `track` holds it once the whole track has
-arrived, with `verified: true`.
-
-When the upload completes:
-
-| The server finds | It does |
+| Status | |
 | --- | --- |
-| an open track with the same id and parts | moves the session onto it; what that track separated is ready at once |
-| pieces on disk for the id and this output | lists them in `pieces` and drops the segments they cover from the plan |
-| neither | writes this track's pieces as they complete |
+| `201` | The [session view](#view). |
+| `400` | A bad parameter: wrong rate or channels, `frames=0`, only one of `mean` and `std`, `frames` that differs from the joined track. |
+| `404` | `unknown_separation`: the track to join is no longer open. Open with `frames` and upload. |
+| `409` | The loaded model cannot run segment by segment. |
+| `413` | Longer than `max_track_seconds`. |
+| `429` | The session limit is reached. |
 
-Until then a session separates on its own, cue region first as usual. A second
-deck loading a song already open separates its cue once, then joins. If the
-client sent `mean` and `std` and they are not the mix's, the track is never
-shared or stored, since its stems differ from a whole-track run's.
+### Upload methods
 
-### 2. Upload
+`session.methods` in `/v2/health` says what each way of uploading needs on the
+loaded model:
+
+| Method | The open body | Segments run before the upload ends when |
+| --- | --- | --- |
+| `whole` | the whole track | always; `requires` is empty |
+| `partial` | a prefix, or nothing; the rest follows with `PUT /pcm` | the open sent every name in `requires` |
+
+| Model | `partial` requires |
+| --- | --- |
+| `htdemucs`, `htdemucs_ft` (Fast, Balanced) | `mean`, `std` |
+| `stemd_roformer` (Quality) | nothing |
+
+Without the required values a `partial` session still works, but no segment runs
+until the last sample arrives. Each name in `requires` and `optional` is an open
+parameter; a changed definition gets a new name. A client:
+
+1. ignores keys it does not know;
+2. uses a method only when it knows every name in its `requires`, and otherwise `whole`;
+3. ignores methods it does not know;
+4. leaves out an optional parameter it cannot compute exactly.
+
+### Gain
+
+One gain for the whole session, fixed at open: 3 dB over `peak`, or over full
+scale without it.
+
+```text
+gain = 1 / (peak × √2)   when that is below 1, else 1      (pcm32: always 1)
+```
+
+Without `peak` a 16-bit session ships at `0.7071068`. A stem that still passes
+full scale is clipped, and `x-stemd-clipped` counts the samples.
+
+### Upload
 
 ```
-PUT /v1/sessions/{id}/pcm?offset=<sample>
+PUT /v2/sessions/{id}/pcm?offset=<sample>
 ```
 
-Any piece, in any order, in the session's `format`. Send the cue region first,
-and the rest after: nothing is shared or stored until the whole track has
-arrived.
+Any range, in any order, in the session's `format`. Send the cue region first.
+The track is hashed, shared and stored once every sample has arrived. A sample
+sent twice must match to the bit (`409` otherwise). Past the track end is `400`;
+a closed session is `410`.
 
-A sample uploaded twice must match to the bit; a difference is `409`.
-
-### 3. Ask for a window
+### Window
 
 ```json
-PUT /v1/sessions/{id}/window
-{"needle": 661500,
- "ahead":  {"frames": 705600, "priority": "critical"},
- "behind": {"frames": 88200,  "priority": "bonus"}}
+PUT /v2/sessions/{id}/window
+Content-Type: application/json
+
+{"regions": [
+  {"at": 661500,  "ahead": 705600, "behind": 88200, "priority": 0},
+  {"at": 2205000, "ahead": 352800, "priority": 60}]}
 ```
 
-| Priority | Runs |
+A region asks for the segments covering `at − behind .. at + ahead`. `at` and
+`priority` are required; `ahead` and `behind` default to `0`. Up to 32 regions;
+`{"regions": []}` asks for nothing.
+
+| `priority` | Runs |
 | --- | --- |
-| `critical` | before whole-track jobs, also between two segments of one |
-| `bonus` | when no job is waiting |
+| `0` to `49` | before whole-track jobs, also between two segments of one |
+| `50` to `99` | only when no job is waiting |
 
-Each request replaces the last one's plan; segments already run are kept. The
-segments under the needle go first, at the higher of the two priorities, then
-both sides outward, two from the higher-priority side for each one from the
-other. Only what a window asks for is separated.
+- Segments run by priority, then by distance from their region's `at`, behind
+  counted twice. Across sessions the same order holds; at a tie the session
+  served longest ago goes first.
+- A window replaces this session's regions only. The server never moves a
+  region: send a new window when the needle or the cues move.
+- A running segment finishes. A segment already run or stored does not run
+  again.
 
-### 4. Read ready ranges
+Answers the view. `400` for a malformed body, a priority over 99 or more than 32
+regions, `410` when the session is closed.
 
-`GET /v1/sessions/{id}` lists `arrived` and `ready` as `[from, to]` pairs. A
-sample is ready once every segment covering it has run: the last ~25% of a
-segment waits for its neighbour.
+To have audio ready where the needle will be, lead it by the time two segments
+take:
+
+```text
+at = needle + (w + 2 × segment_run_seconds) × play rate × sample_rate
+w  = 0 when the worker is idle, else up to one segment_run_seconds
+```
+
+### View
+
+```json
+GET /v2/sessions/{id}
+{"id": "s1-0a1b2c3d", "state": "open", "rev": 7212845571041349902,
+ "track": {"id": "f9c29cbfe3466b674f9903d9", "frames": 13230000,
+           "sample_rate": 44100, "channels": 2},
+ "output": {"format": "flac", "sample_rate": 96000, "gain": 0.7071068,
+            "parts": ["harmonics", "vocals"], "derived": "drums"},
+ "grid": {"segment_frames": 343980, "stride_frames": 257985, "segments": 52,
+          "segment_run_seconds": 0.41},
+ "arrived": [[0, 13230000]],
+ "ready": [[0, 1031940]],
+ "stems": [
+   {"name": "harmonics", "sources": 6, "stored": "whole", "bytes": 28114522},
+   {"name": "vocals", "sources": 8, "stored": "pieces", "pieces": [[0, 4], [7, 9]]}],
+ "complete": false, "planned": 6, "idle_timeout_secs": 30}
+```
+
+| Field | |
+| --- | --- |
+| `state` | `open`, or `closed` with `error` saying why. |
+| `rev` | Changes when any other field does. A u64: compare the `ETag` instead in JavaScript. |
+| `track.id` | The track id, `null` until every sample has arrived. |
+| `grid` | Segment length and step, in samples; see [Pieces](#pieces). |
+| `arrived`, `ready` | Half-open `[from, to]` spans uploaded, and separated in memory. |
+| `stems[].stored` | `whole` with `bytes`, `pieces` with half-open piece index spans in `pieces`, or `none`. |
+| `stems[].sources` | Bitmask of the sources a stem holds: `1` drums, `2` bass, `4` other, `8` vocals. |
+| `complete` | Every sample is ready or stored: any range reads, the whole stem included. |
+| `planned` | Segments asked for and not started. |
+| `waiting_for` | Present while planned segments wait: `upload`, or `the whole upload, or mean and std`. |
+
+The view carries `ETag: "<rev in hex>"`. Long-poll by sending it back:
 
 ```
-GET /v1/sessions/{id}/stems/{name}?from=<sample>&to=<sample>
+GET /v2/sessions/{id}?wait=25
+If-None-Match: "64192cd4e1ab510e"
 ```
+
+The server answers when the view changes, or `304` after `wait` seconds (at most
+25, and at most half of `idle_timeout_secs`). Every request keeps the session
+open.
+
+### Read
+
+```
+GET /v2/sessions/{id}/stems/{name}?from=<sample>&to=<sample>    a range
+GET /v2/sessions/{id}/stems/{name}                              the whole stem
+```
+
+`from` and `to` are track samples; send both or neither. The body is in the
+session's `output_format`, at the output rate.
 
 | Header | |
 | --- | --- |
 | `x-stemd-from` | First sample of the body, at the output rate. |
 | `x-stemd-frames` | Samples in the body. |
-| `x-stemd-gain` | Multiply by `1.0 / gain`. |
-| `x-stemd-clipped` | Samples clipped to fit a 16-bit format. |
+| `x-stemd-gain` | The session gain. |
+| `x-stemd-clipped` | Samples clipped to fit 16 bits. Absent on a stored piece sent as it is. |
 
-`from..to` must sit inside one ready range. The derived part is served when
-`include_derived` is set.
+| Status | |
+| --- | --- |
+| `200` | The range. |
+| `400` | Only one of `from` and `to`. |
+| `404` | No such session. |
+| `409` | A sample is neither ready nor stored, the range is empty or past the end, the stem is not served, or the session is closed. |
+
+- A range is read from memory where it is ready there, and from stored files
+  otherwise. At the model's rate both give the same samples. At another rate,
+  about 1 sample in 10,000 can differ by 1 LSB, since stored pieces were
+  converted one by one.
+- The first whole-stem read stores the stem whole; later ones send that file.
+- Reads run beside the worker and do not slow separation.
 
 ### Pieces
 
-Piece `k` is track samples `[k * stride_frames, (k + 1) * stride_frames)`. The
-view's `pieces` lists those stored for this session's output; fetch one whole,
-already encoded, with
+Piece `k` is track samples `k × stride_frames` to `(k + 1) × stride_frames`, the
+last one cut at the track end. Piece `k` is ready once segments `k − 1` and `k`
+have run.
 
 ```
-GET /v1/sessions/{id}/pieces/{name}/{k}
+GET /v2/sessions/{id}/pieces/{name}/{k}
 ```
 
-It carries the same `x-stemd-*` headers. A stored piece is sent as it is; one
-that is ready in memory but not stored yet is encoded on the way out. A segment
-whose pieces are all stored is not run again, so a cached window shows in
-`pieces` rather than in `ready`.
-
-On disk, under `--pieces-dir` (default `stemd-pieces` in the platform's cache
-directory, capped by `--pieces-max-gb`, least recently used first):
-
-```
-<model_id>/<format>-<rate>[-dsp<N>|-fir<id>]-<parts>-g<gain>/<track id>/<stem>/<k>.<ext>
-htdemucs-22c7f2c9/flac-44100-harmonics.vocals-g1/f9c29cbfe3466b674f9903d9/vocals/0003.flac
-```
-
-The derived part is always stored beside the others. A whole-track job writes
-its pieces here too, so a session on a track already separated by a job starts
-with every piece.
-
-- **Gain** is one value for the whole session, since a stem's own peak is only
-  known once all of it is separated: 3 dB over `peak`, or over full scale when
-  `peak` is not given. `f32le` always ships at 1.0.
-- **At another output rate** a range is converted with up to 8192 samples of
-  context on each side, taken from the ready range around it. Its edges can
-  differ slightly from a whole-track job's.
-
-### 5. End
-
-`DELETE /v1/sessions/{id}`, or let it go idle: a session with nothing to run and
-no request for `--session-idle-secs` (default 30) is ended. A model switch ends
-every session.
+The piece, encoded, with the [read headers](#read). `404` for `k` past the last
+piece or a stem the session does not serve; `409` when it is not ready or
+stored. When the stem is stored whole, the answer also carries
+`x-stemd-whole: /v2/sessions/{id}/stems/{name}`: fetch that once instead of
+the remaining pieces.
 
 | Segments | Fast, Balanced | Quality |
 | --- | --- | --- |
 | length | 343,980 samples (7.8 s) | 588,800 samples (13.35 s) |
-| step at `--overlap 0.25` | 257,985 samples | 441,600 samples |
+| step | 257,985 samples | 441,600 samples |
 
-Read the exact values from the session view's `segment_frames`, `stride_frames`
-and `segments`.
+Read the values from `grid`.
 
-## Caching on the client
+### Storage
 
-Key stems on `model_id`, which is safe to use directly as a directory name and
-changes when the weights do: see [Identifiers](#identifiers) for why not
-`model`.
+- Pieces are stored per track id, model and output, under `--pieces-dir`.
+- Once every piece of a track is stored, the server rewrites each stem as one
+  whole file in the background and deletes its pieces. A whole-track job or a
+  whole-stem read does the same right away.
+- Past `--pieces-max-gb` the least recently used track is evicted. A track an
+  open session plays is never evicted.
+- A piece missing from disk shows in `stems` and turns `complete` to `false`;
+  send the window again to run it.
 
-Store the **two transferred stems only** and rebuild the third on playback, for
-the same reason the wire carries two: it is a third less disk, and the sum stays
-exact against whatever mix the client decodes.
+### End
 
-Store them **losslessly**. Perceptual codecs place their noise under a masking
-threshold computed for the signal as encoded, and a stem player exists to change
-the relative gains, which is exactly what un-masks it. Solo a lossily-stored stem
-and the coding noise is no longer hidden behind the other stems.
+`DELETE /v2/sessions/{id}` (`204`), or let it go idle: a session with nothing
+to run and no request for `idle_timeout_secs` is ended. A model switch ends
+every session. An ended session's id is `404`.
 
-Stems arrive as FLAC, so the cheapest correct thing is to write those bytes
-straight to disk: the encode already happened on the server, and storing the
-stream verbatim costs no transcode in either direction. Ask for `pcm16` instead
-if the device would rather spend disk than a decode. Not `mp3`, for the reason
-under [Wire format](#wire-format): it is the format whose failure mode is
-precisely a stem player.
+## Separations
+
+What the server holds for one track and output, without uploading:
+
+```
+GET /v2/separations/<track id>?output_format=flac&output_sample_rate=96000&parts=harmonics,vocals
+```
+
+The parameters are the output parameters of a job. `mp3` is `400`; a track id
+that is not 24 lowercase hex is `400`. `GET /v2/separations?file=<key>&<output>`
+finds the track by [file key](#file-key) instead, and answers `404
+unknown_separation` for a key the server has not recorded or found ambiguous.
+
+```json
+{"track": "f9c29cbfe3466b674f9903d9", "model_id": "htdemucs-22c7f2c9",
+ "frames": 13230000, "sample_rate": 44100, "channels": 2,
+ "output": {"format": "flac", "sample_rate": 96000, "gain": 0.7071068,
+            "parts": ["harmonics", "vocals"], "derived": "drums"},
+ "state": "stored",
+ "stems": [
+   {"name": "harmonics", "sources": 6, "stored": "whole", "bytes": 28114522},
+   {"name": "vocals", "sources": 8, "stored": "whole", "bytes": 9120333}]}
+```
+
+| `state` | The server holds | The client |
+| --- | --- | --- |
+| `stored` | every stem whole | fetches the stems or the bundle |
+| `derivable` | every stem whole in another 16-bit container, or in `pcm32` at the default gain; `from` is that output block | fetches: the server converts once, stores, sends |
+| `consolidating` | every piece; whole files are being written | asks again shortly, or joins with a session |
+| `open` | the mix, in a session | opens a session with `track=<id>` |
+| `partial` | some pieces or whole files | opens a session and uploads |
+
+`404 unknown_separation` means nothing is held for this output.
+
+- `frames` and `sample_rate` are at the model's rate.
+- `output.gain` is the stored gain, any gain matches; it is absent for `open`.
+- For `derivable`, every `stems[].stored` is `none`.
+- A track whose whole files fail to write reads as `partial` and is retried
+  after 10 minutes.
+
+### Stems and bundle
+
+```
+GET /v2/separations/<track id>/stems/<name>?<output parameters>
+GET /v2/separations/<track id>/bundle?<output parameters>
+```
+
+`200` when the state is `stored` or `derivable`, `409` otherwise, `404
+unknown_separation` when nothing is held, `410` when the stems are evicted
+during the request: ask again. A stem carries the [read headers](#read). A bundle carries `x-stemd-frames` and is
+`application/octet-stream`.
+
+The bundle is an index, then each stem's file as `/stems/<name>` sends it, back
+to back. Little-endian:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | magic `STMB` |
+| 4 | 2 | version `u16`, `1` |
+| 6 | 2 | format `u16`: `0` flac, `1` wav, `2` pcm16, `3` pcm32 |
+| 8 | 4 | stem count `n`, `u32` |
+| 12 | 4 | frames at the output rate, `u32` |
+| 16 | 4 | output rate, `u32` |
+| 20 | 4 | channels, `u32` |
+| 24 | 32 × n | one entry per stem, in [stem order](#parts) |
+
+| Entry offset | Size | Field |
+| --- | --- | --- |
+| 0 | 2 | sources `u16`, the bitmask above |
+| 2 | 2 | reserved, `0` |
+| 4 | 4 | gain `f32` |
+| 8 | 8 | offset of the stem's file from the start of the bundle, `u64` |
+| 16 | 8 | length of the stem's file, `u64` |
+| 24 | 4 | samples clipped `u32`; `0xFFFFFFFF` for pcm32 |
+| 28 | 4 | reserved, `0` |
+
+A player skips an entry whose `sources` holds a bit it does not know.
+
+## A deck loading a track
+
+1. Compute the [file key](#file-key). With `model_id`, the key and the output in
+   the client's own cache, stop here.
+2. `GET /v2/separations?file=<key>&<output>`. On `stored` or `derivable`, fetch
+   the bundle and stop. On `open`, open a session with `track=<track>`.
+3. Otherwise open a session with `file=<key>` and the method `/v2/health`
+   allows, send a window, long-poll the view, read ranges near the needle.
+4. When the view says `complete`, fetch each stem whole, or the bundle once the
+   lookup says `stored`. Store the bytes as they are, keyed on `model_id`, the
+   track id, the format and the rate. End the session.
+
+Store the shipped parts losslessly and rebuild the derived one on playback.
 
 ## Discovery
 
-The server advertises `_stemd._tcp`. TXT records carry enough to decide
-compatibility without a round trip:
+The server advertises `_stemd._tcp` over mDNS:
 
 ```
-features=dsp-filters  model=htdemucs  path=/v1  v=1  version=0.2.1
+features=  model=htdemucs  path=/v2  v=2  version=0.2.1
 ```
 
-`features` lists behaviors added since protocol 1, comma-separated. `/v1/health`
-has the same list as `features`.
+| Entry | |
+| --- | --- |
+| `v` | Protocol version. Accept only versions you speak. |
+| `path` | Where the API lives. |
+| `features` | As in `/v2/health`. |
+| `model` | The artefact name, a label only: cache on `model_id`. |
+| `version` | Server version. |
 
-| Feature | Since | Meaning |
+| Protocol | Path | Servers |
 | --- | --- | --- |
-| `dsp-filters` | 0.2.1 | `PUT /v1/filters/{id}` and the `dsp_filter` parameter. |
+| 1 | `/v1` | 0.2.0 and earlier; deprecated, served beside protocol 2 |
+| 2 | `/v2` | 0.2.1 and later |
 
-**`v=1` is the whole contract.** It means a job that names no `parts` gets two
-stems (`harmonics` and `vocals`) and a third the client rebuilds from the mix
-itself. `parts` changes that only for a client that asks. Changing the default
-is protocol 2, `v=2`, which a client checking the version rejects.
+Any change to a route, a field or a default in this document is protocol 3.
 
-There used to be a `stems=harmonics,vocals` entry saying the same thing a second
-time. It was dropped because a field that cannot vary invites a branch that can
-never be taken: a client reading it would be writing code for a case protocol 1
-does not have.
+## Protocol 1 (deprecated)
 
-**`model` is a label, not an identity.** It names the artefact and says nothing
-about how the preset uses it, so two servers can advertise the same `model` and
-produce different audio: `Quality` did exactly that when it started chaining
-its halves. Discovery is for finding a server and deciding you can talk to it.
-Cache on `model_id` from `/v1/health`, which covers both, and which the section
-above is about.
+`/v1` keeps the 0.2.0 health and jobs for clients that have not moved to
+protocol 2, such as stemd-cli 0.2.0. It runs on the same jobs and cache as
+`/v2`. It is deprecated and may stop working in a future release. Every `/v1`
+answer carries:
+
+```
+Deprecation: true
+Link: <https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel="deprecation"; type="text/html"
+```
+
+The server logs one warning per client address that calls `/v1`, and the
+window's Clients list marks those jobs `protocol 1`.
+
+| Route | Protocol 1 |
+| --- | --- |
+| `GET /v1/health` | `stems`, `default_output_format`, `default_output_sample_rate`, `derived_stem` and `default_parts` in place of `default_output`. No `features`, `session` or `segment_run_seconds`. |
+| `POST /v1/jobs`, `GET /v1/jobs/{id}` | The result has `sample_rate`, `format` and `derived_stem` in place of `output`, and each stem has its server-local `path`. No `file=`. |
+| `GET /v1/jobs/{id}/stems/{name}`, `DELETE /v1/jobs/{id}`, `GET /v1/logs` | As under `/v2`. |
+| `/v1/sessions` and every path below it | `410` with code `protocol_1`. Sessions are protocol 2 only: use `/v2/sessions`. |
+
+Nothing else is served under `/v1`. The TXT record advertises protocol 2 only.
 
 ## Reference client
-
-`stemd-cli` finds the server over mDNS (or takes `--host`), decodes wav, flac,
-mp3, m4a, aac, aiff, mp4 and ogg via symphonia, uploads, shows progress, rebuilds
-the third part exactly as a client should, and writes all three so they can be
-auditioned without a DAW. It does not link the model at all: decoding lives in
-`stemd-audio` precisely so the client stays a small binary.
 
 ```bash
 cargo run --release -p stemd-cli -- track.mp3
 cargo run --release -p stemd-cli -- track.wav --host 10.10.50.245:8420 --out ./stems
 ```
 
-```
-transfers    : 2 stems [harmonics, vocals]: `drums` is rebuilt here, never sent
-separated    : 20.99s server-side (18.9x realtime)
-  downloaded   : harmonics.flac  -15.2 dBFS
-  downloaded   : vocals.flac     -22.7 dBFS
-  rebuilt here : drums.flac      -10.8 dBFS
-reconstruct  : -inf dB  (harmonics+vocals+drums vs the original)
-model resid  : -35.2 dB (the model's own error, it all lands on `drums`)
-```
-
-`reconstruct` is the check that matters: it sums the three parts and nulls them
-against the decode. Anything above roughly −120 dB means a part went missing, not
-that the model separated badly.
-
-All three files are written as FLAC at one shared scale, so they can be auditioned
-against each other. `--wav-f32` writes unscaled float wavs for a DAW instead;
-`--f32` uploads and receives float; `--dsp-filter <file>` uploads a filter file
-if the server does not hold it and converts the stems through it; `--dsp-mode`
-asks for a deprecated numbered filter. Both are refused locally if this server
-does not offer them.
-
-A file at any other rate is uploaded as it is and converted server-side, with a
-note saying so. `mix - stems` needs both sides at one rate to line up, so `drums`
-is rebuilt only when the stems come back at the file's own rate;
-`--include-derived` has the server send it otherwise. Even when the two agree,
-the stems have been through the model's rate and back while the mix on disk has
-not, so `reconstruct` reads shallower than it does at 44.1 kHz throughout.
+`stemd-cli` finds a server over mDNS or takes `--host`, decodes the file,
+submits a job, rebuilds the derived part, and checks that the three parts sum to
+the mix. `--f32` uploads and receives `f32`, `--dsp-filter <file>` uploads and
+uses a filter, `--include-derived` asks the server for the third part.

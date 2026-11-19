@@ -5,11 +5,11 @@
 //! dropzone  the globe, the drop target, and progress while it works
 //! activity  client jobs and sessions, and the session segments waiting
 //! recents   what has been separated, and where the stems went
-//! logs      the same lines GET /v1/logs serves
+//! logs      the same lines GET /v2/logs serves
 //! status    server state and the cache, along the bottom
 //! ```
 //!
-//! A drop and a `POST /v1/jobs` become the same job in the same queue; see
+//! A drop and a `POST /v2/jobs` become the same job in the same queue; see
 //! [`crate::drops`]. The server runs headless without any of this.
 
 mod activity;
@@ -474,7 +474,10 @@ impl Window {
                 _ => None,
             });
         let drop_left = match working_on {
-            Some((key, progress)) => self.drop_eta.update(key, now, &progress),
+            Some((key, progress)) => {
+                let segment_secs = self.state.queue.segment_run_seconds();
+                self.drop_eta.update(key, now, &progress, segment_secs)
+            }
             // A later drop can reuse the address that keys this one.
             None => {
                 self.drop_eta = eta::Eta::default();

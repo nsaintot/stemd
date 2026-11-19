@@ -1,7 +1,7 @@
 //! The bottom bar: the server switch and port, what is stored, and the way to
 //! the log. On Linux, also a newer release.
 //!
-//! The same state `/v1/health` reports: a second view, never a second source.
+//! It shows the state `/v2/health` reports.
 
 use eframe::egui::{self, Sense, pos2, vec2};
 

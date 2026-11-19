@@ -1,15 +1,15 @@
 //! HTTP surface.
 //!
 //! ```text
-//! GET    /v1/health                     runtime, model, queue and cache state
-//! POST   /v1/jobs                       raw interleaved PCM body -> 202 + job,
+//! GET    /v2/health                     runtime, model, queue and cache state
+//! POST   /v2/jobs                       raw interleaved PCM body -> 202 + job,
 //!                                       or 200 + a finished one on a cache hit
-//! GET    /v1/jobs/{id}                  progress, then the result object
-//! GET    /v1/jobs/{id}/stems/{name}     raw interleaved PCM stream
-//! DELETE /v1/jobs/{id}                  stop the job, drop the handle
-//! GET    /v1/logs                       recent log lines
-//! PUT    /v1/filters/{id}               store a conversion filter, see [`crate::filters`]
-//! GET    /v1/filters/{id}               a stored filter's summary
+//! GET    /v2/jobs/{id}                  progress, then the result object
+//! GET    /v2/jobs/{id}/stems/{name}     raw interleaved PCM stream
+//! DELETE /v2/jobs/{id}                  stop the job, drop the handle
+//! GET    /v2/logs                       recent log lines
+//! PUT    /v2/filters/{id}               store a conversion filter, see [`crate::filters`]
+//! GET    /v2/filters/{id}               a stored filter's summary
 //! ```
 //!
 //! Upload is raw PCM, no decode/encode
@@ -17,6 +17,7 @@
 //! Nothing here deletes stems: `DELETE` drops a handle, and the two rules in
 //! [`crate::cache`] are the only things that free disk.
 
+use crate::separations::OutputView;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -52,7 +53,7 @@ pub struct AppState {
     /// changes these while the server is running.
     pub settings: Arc<SettingsStore>,
     /// Longest track accepted, from `--max-track-minutes`. Advertised in
-    /// `/v1/health` so a client can refuse locally instead of uploading a track
+    /// `/v2/health` so a client can refuse locally instead of uploading a track
     /// it will be told to take back.
     pub max_track_secs: f64,
     /// Whether the API answers, and its mDNS advertisement. Shared so every
@@ -64,15 +65,17 @@ pub struct AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/jobs", post(create_job))
-        .route("/v1/jobs/{id}", get(get_job))
-        .route("/v1/jobs/{id}", delete(delete_job))
-        .route("/v1/jobs/{id}/stems/{name}", get(get_stem))
-        .route("/v1/logs", get(get_logs))
-        .route("/v1/filters/{id}", put(put_filter))
-        .route("/v1/filters/{id}", get(get_filter))
+        .route("/v2/health", get(health))
+        .route("/v2/jobs", post(create_job))
+        .route("/v2/jobs/{id}", get(get_job))
+        .route("/v2/jobs/{id}", delete(delete_job))
+        .route("/v2/jobs/{id}/stems/{name}", get(get_stem))
+        .route("/v2/logs", get(get_logs))
+        .route("/v2/filters/{id}", put(put_filter))
+        .route("/v2/filters/{id}", get(get_filter))
         .merge(crate::session_api::routes())
+        .merge(crate::separations::routes())
+        .merge(crate::v1::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             refuse_when_off,
@@ -99,7 +102,7 @@ async fn refuse_when_off(
 }
 
 #[derive(Debug, Serialize)]
-struct Health {
+pub(crate) struct Health {
     version: &'static str,
     backend: String,
     model: String,
@@ -109,11 +112,6 @@ struct Health {
     /// client has to send.
     sample_rate: u32,
     channels: usize,
-    /// Stems served over the wire at the native rate. A job that asks for a
-    /// different `output_sample_rate` also gets the derived part, which it
-    /// could not reconstruct itself at that rate: read the `stems` of the job
-    /// result rather than assuming this list.
-    stems: Vec<String>,
     /// Which of the window's two presets is loaded, if either.
     #[serde(skip_serializing_if = "Option::is_none")]
     preset: Option<&'static str>,
@@ -151,34 +149,68 @@ struct Health {
     /// The `[from, to]` a numbered mode is limited to, keyed by the mode. Mode 0
     /// is absent because it has no such limit.
     dsp_mode_pairs: BTreeMap<u8, [u32; 2]>,
-    /// Filters `PUT /v1/filters/{id}` keeps before evicting the least recently
-    /// used.
-    max_dsp_filters: usize,
-    /// What a job that names neither gets. Set in the window, so read them here
-    /// rather than assuming: they persist across launches and can change while
-    /// this server is running.
-    default_output_format: String,
-    default_output_sample_rate: u32,
-    /// The part `include_derived=true` adds. Not shipped by default: a client
-    /// holding the mix rebuilds it as `mix` minus the stems above.
-    derived_stem: &'static str,
     /// Parts a job can list in `parts`. Which one the player rebuilds follows from
     /// the request: whatever it leaves out.
     parts: Vec<String>,
-    /// What a job that names no `parts` gets.
-    default_parts: Vec<&'static str>,
+    /// The output of a request that names no format, rate or parts. Format and rate
+    /// are set in the window and can change while the server runs.
+    default_output: OutputView,
     /// Behaviors a client can test for, see [`FEATURES`].
     features: &'static [&'static str],
+    /// Median seconds the loaded model takes to run one segment, `null` until one ran.
+    segment_run_seconds: Option<f64>,
+    /// How a session can upload, or `null` when the model cannot run segment by segment.
+    session: Option<SessionMethods>,
 }
 
-/// Behaviors added after protocol 1, listed in `/v1/health` and the TXT record.
-///
-/// | Feature | Since | Meaning |
-/// |---------|-------|---------|
-/// | `dsp-filters` | 0.2.1 | `PUT /v1/filters/{id}` and the `dsp_filter` parameter |
-pub const FEATURES: &[&str] = &["dsp-filters"];
+/// The upload methods of a session on the loaded model.
+#[derive(Debug, Serialize)]
+struct SessionMethods {
+    methods: BTreeMap<&'static str, Method>,
+}
 
-async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
+/// What a method needs before a segment can run ahead of the upload's end.
+#[derive(Debug, Serialize)]
+struct Method {
+    /// Open parameters the method needs.
+    requires: Vec<&'static str>,
+    /// Open parameters that change the output but are never needed.
+    optional: Vec<&'static str>,
+}
+
+impl SessionMethods {
+    /// The methods of the loaded model, or `None` when it cannot run segment by segment.
+    fn of(queue: &crate::queue::Queue) -> Option<Self> {
+        queue.segmenting()?;
+        let partial = if queue.normalises() {
+            vec!["mean", "std"]
+        } else {
+            Vec::new()
+        };
+        let methods = BTreeMap::from([
+            (
+                "whole",
+                Method {
+                    requires: Vec::new(),
+                    optional: vec!["peak"],
+                },
+            ),
+            (
+                "partial",
+                Method {
+                    requires: partial,
+                    optional: vec!["peak"],
+                },
+            ),
+        ]);
+        Some(Self { methods })
+    }
+}
+
+/// Behaviors added after protocol 2, listed in `/v2/health` and the TXT record.
+pub const FEATURES: &[&str] = &[];
+
+pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
     // Asked of the queue rather than kept alongside it: the worker owns the
     // separator, so it is the only thing that can say which one is loaded
     // without racing a switch that has not been applied yet.
@@ -192,7 +224,6 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
         device: info.device,
         sample_rate: info.sample_rate,
         channels: info.channels,
-        stems: info.stems,
         preset: state.switcher.current().map(Preset::label),
         model_id: state.switcher.published_identity(),
         completed_jobs: state.store.len(),
@@ -208,13 +239,17 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
             .iter()
             .filter_map(|m| m.only_pair().map(|(from, to)| (m.id(), [from, to])))
             .collect(),
-        max_dsp_filters: crate::filters::MAX_FILTERS,
-        default_output_format: defaults.format.to_string(),
-        default_output_sample_rate: defaults.rate.hz(),
-        derived_stem: stemd_core::DERIVED,
         parts: info.parts,
-        default_parts: Parts::DEFAULT.names().collect(),
+        default_output: OutputView {
+            format: defaults.format.to_string(),
+            sample_rate: defaults.rate.hz(),
+            gain: None,
+            parts: Parts::DEFAULT.names().map(str::to_owned).collect(),
+            derived: Parts::DEFAULT.derived(),
+        },
         features: FEATURES,
+        segment_run_seconds: state.queue.segment_run_seconds(),
+        session: SessionMethods::of(&state.queue),
     })
 }
 
@@ -228,11 +263,11 @@ pub(crate) struct CreateParams {
     #[serde(default)]
     pub(crate) format: Option<String>,
     /// Container for the stems returned: `flac`, `s16le` or `f32le`. Defaults to
-    /// `default_output_format` from `/v1/health`.
+    /// `default_output.format` from `/v2/health`.
     #[serde(default)]
     pub(crate) output_format: Option<String>,
     /// Rate the stems are converted to: 24000, 44100, 48000 or 96000. Defaults
-    /// to `default_output_sample_rate` from `/v1/health`.
+    /// to `default_output.sample_rate` from `/v2/health`.
     #[serde(default)]
     pub(crate) output_sample_rate: Option<String>,
     /// Ship the derived part as well. Off by default: a client holding the mix
@@ -241,18 +276,21 @@ pub(crate) struct CreateParams {
     #[serde(default)]
     pub(crate) include_derived: Option<bool>,
     /// Comma-separated parts to ship, such as `bass,other,vocals`. Defaults to
-    /// `default_parts` from `/v1/health`. They must not overlap, and must leave out
+    /// `default_output.parts` from `/v2/health`. They must not overlap, and must leave out
     /// one part or none: that part is the one `include_derived` adds.
     #[serde(default)]
     pub(crate) parts: Option<String>,
     /// Filter the conversion to `output_sample_rate` runs through. `0`, the
-    /// default, converts any pair. See `dsp_modes` in `/v1/health`.
+    /// default, converts any pair. See `dsp_modes` in `/v2/health`.
     #[serde(default)]
     pub(crate) dsp_mode: Option<String>,
     /// Id of an uploaded filter the conversion runs through instead. See
-    /// `PUT /v1/filters/{id}`.
+    /// `PUT /v2/filters/{id}`.
     #[serde(default)]
     pub(crate) dsp_filter: Option<String>,
+    /// The client's key for the file the audio came from, recorded against the track id.
+    #[serde(default)]
+    pub(crate) file: Option<String>,
 }
 
 pub(crate) const fn default_rate() -> u32 {
@@ -332,7 +370,7 @@ fn parse_dsp(params: &CreateParams, filters: &Filters) -> Result<Dsp, ApiError> 
     filters.get(id).map(Dsp::Fir).ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_FOUND,
-            format!("no filter {id}; upload it with PUT /v1/filters/{id}"),
+            format!("no filter {id}; upload it with PUT /v2/filters/{id}"),
         )
         .with_code("unknown_filter")
     })
@@ -563,7 +601,7 @@ async fn decode_upload(
 ///
 /// Queue positions shift as the worker drains it, so the live one is resolved
 /// at read time rather than trusting what was stored at submit.
-fn live_view(state: &AppState, job: &crate::jobs::Job) -> crate::jobs::JobView {
+pub(crate) fn live_view(state: &AppState, job: &crate::jobs::Job) -> crate::jobs::JobView {
     let mut view = job.view();
     if view.progress.stage == Stage::Queued
         && let Some(progress) = state.queue.queued_progress_for(&job.id)
@@ -578,7 +616,20 @@ async fn create_job(
     Query(params): Query<CreateParams>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let submission = Submission::parse(&params, &body, &state)?;
+    let (status, job) = submit(&state, &params, body).await?;
+    Ok((status, Json(live_view(&state, &job))).into_response())
+}
+
+/// Start a job, join the one running for the same track, or answer from the cache.
+pub(crate) async fn submit(
+    state: &Arc<AppState>,
+    params: &CreateParams,
+    body: Bytes,
+) -> Result<(StatusCode, Arc<crate::jobs::Job>), ApiError> {
+    if let Some(key) = &params.file {
+        crate::separations::check_file_key(key)?;
+    }
+    let submission = Submission::parse(params, &body, state)?;
     let (key, body) = hash_upload(body, submission.clone(), state.switcher.identity()).await?;
 
     // Claim the key before the decode, not after: `claim` registers the job
@@ -592,7 +643,7 @@ async fn create_job(
                 "joining a separation already under way for {}",
                 crate::cache::short(&key)
             );
-            return Ok((StatusCode::ACCEPTED, Json(live_view(&state, &existing))).into_response());
+            return Ok((StatusCode::ACCEPTED, existing));
         }
         Ok(job) => job,
     };
@@ -605,7 +656,7 @@ async fn create_job(
             entry.separation_secs
         );
         job.complete(entry, true);
-        return Ok((StatusCode::OK, Json(job.view())).into_response());
+        return Ok((StatusCode::OK, job));
     }
 
     // Stems are written to the cache before they are served, and a full disk
@@ -619,8 +670,8 @@ async fn create_job(
     }
 
     let mix = decode_upload(body, submission.clone(), &job).await?;
-    enqueue(&state, &job, mix, submission)?;
-    Ok((StatusCode::ACCEPTED, Json(job.view())).into_response())
+    enqueue(state, &job, mix, submission, params.file.clone())?;
+    Ok((StatusCode::ACCEPTED, job))
 }
 
 /// Hand the decoded mix to the worker, failing the job if the queue is full.
@@ -629,6 +680,7 @@ fn enqueue(
     job: &Arc<crate::jobs::Job>,
     mix: Audio,
     submission: Submission,
+    file: Option<String>,
 ) -> Result<(), ApiError> {
     let duration = mix.duration_secs();
     let position = state
@@ -639,6 +691,7 @@ fn enqueue(
             output: submission.output.clone(),
             model_id: state.switcher.published_identity(),
             from_api: true,
+            file,
         })
         .map_err(|full| {
             job.fail(format!("{full}"));
@@ -666,7 +719,7 @@ async fn get_job(
     Ok(Json(live_view(&state, &job)).into_response())
 }
 
-async fn delete_job(
+pub(crate) async fn delete_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
@@ -692,7 +745,7 @@ async fn delete_job(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn get_stem(
+pub(crate) async fn get_stem(
     State(state): State<Arc<AppState>>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -738,7 +791,7 @@ async fn get_stem(
 }
 
 #[derive(Debug, Deserialize)]
-struct LogParams {
+pub(crate) struct LogParams {
     #[serde(default = "default_log_limit")]
     limit: usize,
 }
@@ -747,7 +800,7 @@ const fn default_log_limit() -> usize {
     200
 }
 
-async fn get_logs(
+pub(crate) async fn get_logs(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LogParams>,
 ) -> impl IntoResponse {
@@ -872,6 +925,7 @@ mod tests {
             parts: None,
             dsp_mode: None,
             dsp_filter: None,
+            file: None,
         }
     }
 

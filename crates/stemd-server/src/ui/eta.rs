@@ -1,10 +1,17 @@
-//! Time left on a separation, from how fast its progress fraction moves.
+//! Time left on a separation, plus 15%.
 //!
-//! The estimate is the time left at the slower of two rates, plus 15%: the
-//! average since the window first saw the job separating, and the rate over the
-//! last [`RECENT_STEPS`] progress steps. Both are measured to the last step,
-//! and the time since it is taken off, up to one average step: a stalled step
-//! holds the estimate.
+//! With the server's median segment time, the estimate is the segments left
+//! times that median, or times this job's own time per segment over the last
+//! [`RECENT_STEPS`] segments when that is slower, such as when session
+//! segments run in between. The time into the running segment is taken off, up
+//! to one segment.
+//!
+//! Before a segment has run on the loaded model, the estimate is the time left
+//! at the slower of two rates of the progress fraction: the average since the
+//! window first saw the job separating, and the rate over the last
+//! [`RECENT_STEPS`] steps. Both are measured to the last step, and the time
+//! since it is taken off, up to one average step: a stalled step holds the
+//! estimate.
 //!
 //! The shown value is recomputed every [`RECALC_SECS`] and counts down in
 //! between. A new estimate below the countdown replaces it; one above replaces
@@ -42,14 +49,23 @@ pub struct Eta {
     first: (f64, f32),
     /// Time and fraction at each of the last steps, oldest first.
     steps: VecDeque<(f64, f32)>,
+    /// Time and segments done at each of the last steps, oldest first.
+    segments: VecDeque<(f64, u32)>,
     /// When the shown value was computed, and the value.
     shown: Option<(f64, f64)>,
 }
 
 impl Eta {
-    /// Seconds left on job `key` at `progress`, `now` being the window's clock.
-    /// `None` outside [`Stage::Separating`]. Starts over when `key` changes.
-    pub fn update(&mut self, key: u64, now: f64, progress: &Progress) -> Option<f64> {
+    /// Seconds left on job `key` at `progress`, `now` being the window's clock
+    /// and `segment_secs` the server's median segment time. `None` outside
+    /// [`Stage::Separating`]. Starts over when `key` changes.
+    pub fn update(
+        &mut self,
+        key: u64,
+        now: f64,
+        progress: &Progress,
+        segment_secs: Option<f64>,
+    ) -> Option<f64> {
         let fraction = progress.fraction;
         if progress.stage != Stage::Separating {
             *self = Self::default();
@@ -60,6 +76,7 @@ impl Eta {
                 job: Some(key),
                 first: (now, fraction),
                 steps: VecDeque::from([(now, fraction)]),
+                segments: VecDeque::from([(now, progress.completed)]),
                 shown: None,
             };
         } else if self.steps.back().is_some_and(|(_, last)| fraction > *last) {
@@ -67,13 +84,20 @@ impl Eta {
             if self.steps.len() > RECENT_STEPS + 1 {
                 self.steps.pop_front();
             }
+            self.segments.push_back((now, progress.completed));
+            if self.segments.len() > RECENT_STEPS + 1 {
+                self.segments.pop_front();
+            }
         }
         if let Some((at, secs)) = self.shown
             && now - at < RECALC_SECS
         {
             return Some(secs);
         }
-        let estimate = remaining(self.first, self.steps.make_contiguous(), now)?;
+        let estimate = match segment_secs.filter(|secs| *secs > 0.0) {
+            Some(median) => by_segments(progress, median, self.segments.make_contiguous(), now),
+            None => remaining(self.first, self.steps.make_contiguous(), now)?,
+        };
         let secs = match self.shown {
             Some((at, secs)) => next_shown(secs - (now - at), estimate),
             None => estimate,
@@ -95,8 +119,24 @@ fn next_shown(countdown: f64, estimate: f64) -> f64 {
     }
 }
 
-// TODO: estimate from the server's median segment run time times the segments
-// left, once `segment_run_seconds` from the session-exchange branch is on main.
+/// Seconds left at time `now` from the segments left in `progress`, at
+/// `median` seconds each or at the pace over `segments`, the time and segments
+/// done at each of the last steps, when that pace is slower.
+fn by_segments(progress: &Progress, median: f64, segments: &[(f64, u32)], now: f64) -> f64 {
+    let left = progress.total.saturating_sub(progress.completed);
+    let pace = match (segments.first(), segments.last()) {
+        (Some(&(from_at, from)), Some(&(last_at, last)))
+            if segments.len() > RECENT_STEPS && last > from =>
+        {
+            (last_at - from_at) / f64::from(last - from)
+        }
+        _ => 0.0,
+    };
+    let each = median.max(pace);
+    let into = segments.last().map_or(0.0, |&(at, _)| now - at);
+    ((f64::from(left) * each - into.min(each)) * MARGIN).max(0.0)
+}
+
 /// Seconds left at time `now`, from the time and fraction when the job was
 /// first seen, and at each of the last steps, oldest first.
 pub fn remaining(first: (f64, f32), steps: &[(f64, f32)], now: f64) -> Option<f64> {
@@ -188,6 +228,33 @@ mod tests {
     }
 
     #[test]
+    fn with_the_median_the_estimate_shows_at_once() {
+        let mut eta = Eta::default();
+        let progress = Progress::counted(Stage::Separating, 2, 10);
+        let secs = eta.update(1, 0.0, &progress, Some(3.0)).unwrap();
+        assert!((secs - 24.0 * MARGIN).abs() < 1e-9, "{secs}");
+    }
+
+    #[test]
+    fn the_estimate_counts_segments_left_at_the_median_or_a_slower_pace() {
+        let close = |got: f64, want: f64| {
+            assert!((got - want * MARGIN).abs() < 1e-9, "{got}, not {want}");
+        };
+        let at = |completed| Progress::counted(Stage::Separating, completed, 10);
+        // 8 segments of 3 s, 2 s into the running one.
+        close(by_segments(&at(2), 3.0, &[(0.0, 2)], 2.0), 22.0);
+        // At most one segment is taken off for the running one.
+        close(by_segments(&at(2), 3.0, &[(0.0, 2)], 10.0), 21.0);
+        // 4 s per segment over the last 4 segments: the slower pace wins.
+        let paced = [(0.0, 0), (4.0, 1), (8.0, 2), (12.0, 3), (16.0, 4)];
+        close(by_segments(&at(4), 2.0, &paced, 16.0), 24.0);
+        // A pace over fewer segments is not used.
+        close(by_segments(&at(1), 2.0, &[(0.0, 0), (8.0, 1)], 8.0), 18.0);
+        // The last segment is done.
+        close(by_segments(&at(10), 2.0, &[(0.0, 10)], 1.0), 0.0);
+    }
+
+    #[test]
     fn a_stalled_step_holds_the_estimate() {
         let steps = [(0.0, 0.1), (4.0, 0.2), (8.0, 0.3)];
         let at = |now| remaining((0.0, 0.1), &steps, now).unwrap();
@@ -198,11 +265,11 @@ mod tests {
     #[test]
     fn the_shown_value_holds_for_5_s() {
         let mut eta = Eta::default();
-        assert_eq!(eta.update(1, 0.0, &separating(0.1)), None);
-        let first = eta.update(1, 10.0, &separating(0.5)).unwrap();
-        assert_eq!(eta.update(1, 12.0, &separating(0.7)), Some(first));
-        assert_eq!(eta.update(1, 14.9, &separating(0.8)), Some(first));
-        assert_ne!(eta.update(1, 15.0, &separating(0.8)), Some(first));
+        assert_eq!(eta.update(1, 0.0, &separating(0.1), None), None);
+        let first = eta.update(1, 10.0, &separating(0.5), None).unwrap();
+        assert_eq!(eta.update(1, 12.0, &separating(0.7), None), Some(first));
+        assert_eq!(eta.update(1, 14.9, &separating(0.8), None), Some(first));
+        assert_ne!(eta.update(1, 15.0, &separating(0.8), None), Some(first));
     }
 
     #[test]
@@ -224,7 +291,7 @@ mod tests {
         for tick in 0..=400 {
             let t = f64::from(tick) * 0.25;
             let fraction = 0.1 + 0.04 * (t / 4.0).floor() as f32;
-            if let Some(secs) = eta.update(1, t, &separating(fraction.min(0.9))) {
+            if let Some(secs) = eta.update(1, t, &separating(fraction.min(0.9)), None) {
                 shown.push(secs);
             }
         }
@@ -238,29 +305,33 @@ mod tests {
     #[test]
     fn only_a_separation_has_an_estimate() {
         let mut eta = Eta::default();
-        assert_eq!(eta.update(1, 0.0, &separating(0.1)), None);
-        assert!(eta.update(1, 10.0, &separating(0.5)).is_some());
+        assert_eq!(eta.update(1, 0.0, &separating(0.1), None), None);
+        assert!(eta.update(1, 10.0, &separating(0.5), None).is_some());
         for stage in [Stage::Queued, Stage::Analysing, Stage::Writing] {
             assert_eq!(
-                eta.update(1, 11.0, &Progress::new(stage)),
+                eta.update(1, 11.0, &Progress::new(stage), None),
                 None,
                 "{stage:?}"
             );
         }
-        assert_eq!(eta.update(1, 12.0, &separating(0.6)), None, "restarted");
+        assert_eq!(
+            eta.update(1, 12.0, &separating(0.6), None),
+            None,
+            "restarted"
+        );
     }
 
     #[test]
     fn a_new_job_restarts_the_clock() {
         let mut eta = Eta::default();
-        assert_eq!(eta.update(1, 0.0, &separating(0.0)), None);
-        assert!(eta.update(1, 10.0, &separating(0.5)).is_some());
+        assert_eq!(eta.update(1, 0.0, &separating(0.0), None), None);
+        assert!(eta.update(1, 10.0, &separating(0.5), None).is_some());
         assert_eq!(
-            eta.update(2, 11.0, &separating(0.5)),
+            eta.update(2, 11.0, &separating(0.5), None),
             None,
             "kept job 1's clock"
         );
-        assert!(eta.update(2, 21.0, &separating(0.75)).is_some());
+        assert!(eta.update(2, 21.0, &separating(0.75), None).is_some());
     }
 
     #[test]
