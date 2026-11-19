@@ -10,25 +10,32 @@
 //! because a client holding the mix can rebuild it for free; a folder of stems has
 //! no such context.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
+use sha2::{Digest, Sha256};
 use stemd_core::{Audio, DspMode, PART_NAMES, PcmFormat, Progress, Stage};
 
 use crate::api::AppState;
 use crate::cache::{Entry, Ingredients, Output};
 use crate::jobs::Job;
 use crate::queue::QueuedWork;
-use crate::settings::DropParts;
+use crate::settings::{DropParts, Settings};
 
 /// Where a drop records the scale of parts written below unity.
 const GAINS_FILE: &str = "stems.json";
 
 /// Recent drops kept for the window's list. Older ones fall off the end.
 pub const REMEMBERED: usize = 12;
+
+/// Finished drops kept in memory to answer a repeat drop without separating.
+/// Independent of [`REMEMBERED`]: taking a row off the list keeps its entry.
+pub const HISTORY: usize = 25;
 
 /// What a stems folder is called, after the track. Named once because the
 /// window's delete control checks it before removing anything recursively.
@@ -73,6 +80,8 @@ pub struct Finished {
     pub secs: f64,
     /// The stems were already on disk and nothing was separated.
     pub cached: bool,
+    /// Every file written: the parts and the gains note, if any.
+    pub files: Vec<PathBuf>,
 }
 
 /// One dropped file, from the moment it lands until its stems are written.
@@ -105,6 +114,7 @@ impl Dropped {
                 parts: (0..parts).map(|i| format!("stem {i}")).collect(),
                 secs: 1.0,
                 cached: false,
+                files: Vec::new(),
             })),
             job: Mutex::new(None),
             stopped: AtomicBool::new(false),
@@ -157,6 +167,103 @@ impl Dropped {
 pub struct Drops {
     recent: Mutex<Vec<Arc<Dropped>>>,
     turns: Turnstile,
+    history: History,
+}
+
+/// The last [`HISTORY`] finished drops, newest first.
+#[derive(Default)]
+struct History(Mutex<Vec<Past>>);
+
+/// A finished drop and the state of its files when it finished.
+#[derive(Clone)]
+struct Past {
+    /// See [`history_key`].
+    key: String,
+    finished: Finished,
+    files: Vec<Stamp>,
+}
+
+/// A file's length and modification time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Stamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    /// `None` when `path` is not a file.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        Some(Self {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+impl History {
+    /// Keep `finished` under `key`, replacing an older entry with the same key.
+    fn record(&self, key: String, finished: &Finished) {
+        let Some(files) = finished.files.iter().map(|f| Stamp::of(f)).collect() else {
+            return;
+        };
+        let mut past = self.0.lock();
+        past.retain(|p| p.key != key);
+        past.insert(
+            0,
+            Past {
+                key,
+                finished: finished.clone(),
+                files,
+            },
+        );
+        past.truncate(HISTORY);
+    }
+
+    /// The drop finished under `key`, if each of its files is still there and
+    /// unchanged. An entry with a missing or changed file is removed.
+    fn find(&self, key: &str) -> Option<Finished> {
+        let mut past = self.0.lock();
+        let at = past.iter().position(|p| p.key == key)?;
+        if past[at]
+            .files
+            .iter()
+            .all(|f| Stamp::of(&f.path).as_ref() == Some(f))
+        {
+            return Some(past[at].finished.clone());
+        }
+        past.remove(at);
+        None
+    }
+}
+
+/// SHA-256 of the file's bytes, the output settings and the model: what a
+/// drop's result depends on. The path and title play no part.
+fn history_key(source: &Path, settings: &Settings, model: &str) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(source)?;
+    let mut buf = vec![0; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    for field in [
+        format!("{:?}", settings.format),
+        format!("{:?}", settings.rate),
+        format!("{:?}", settings.drop_parts),
+        model.to_owned(),
+    ] {
+        hasher.update(u32::try_from(field.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Queue positions in drop order: a short track decodes faster than a long one
@@ -274,7 +381,7 @@ impl Drops {
             .spawn(move || {
                 let mut turn = Turn::new(&drops.turns, ticket);
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(&state, &started, &mut turn)
+                    run(&state, &drops.history, &started, &mut turn)
                 }));
                 let failure = match ran {
                     Ok(Ok(())) => None,
@@ -358,13 +465,37 @@ fn remove_stems(dir: &Path) {
     }
 }
 
-/// Decode, separate, and write the stems out.
-fn run(state: &Arc<AppState>, item: &Arc<Dropped>, turn: &mut Turn) -> Result<()> {
+/// Decode, separate, and write the stems out. A track finished before with the
+/// same settings and model, whose files are unchanged, is shown as it was.
+fn run(
+    state: &Arc<AppState>,
+    history: &History,
+    item: &Arc<Dropped>,
+    turn: &mut Turn,
+) -> Result<()> {
+    let settings = state.settings.get();
+    let key = history_key(&item.source, &settings, &state.switcher.identity())
+        .inspect_err(|err| tracing::debug!("{}: not hashed: {err}", item.title))
+        .ok();
+    if let Some(finished) = key.as_deref().and_then(|key| history.find(key)) {
+        tracing::info!(
+            "{}: already separated into {}",
+            item.title,
+            finished.dir.display()
+        );
+        if let Some(key) = key {
+            history.record(key, &finished);
+        }
+        item.set(State::Done(Finished {
+            cached: true,
+            ..finished
+        }));
+        return Ok(());
+    }
     let mix = read(state, &item.source)?;
     if item.stopped() {
         anyhow::bail!("stopped");
     }
-    let settings = state.settings.get();
     let output = Output {
         format: settings.format,
         rate: settings.rate,
@@ -394,6 +525,9 @@ fn run(state: &Arc<AppState>, item: &Arc<Dropped>, turn: &mut Turn) -> Result<()
         finished.parts.len(),
         finished.dir.display()
     );
+    if let Some(key) = key {
+        history.record(key, &finished);
+    }
     item.set(State::Done(finished));
     Ok(())
 }
@@ -566,6 +700,7 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
     clear_parts(&dir)?;
 
     let mut parts = Vec::new();
+    let mut files = Vec::new();
     let mut scaled = Vec::new();
     for stem in &entry.stems {
         // Not ticked: count it as fetched so the reaper treats the entry as consumed.
@@ -589,10 +724,12 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
             scaled.push((stem.name.clone(), stem.gain));
         }
         parts.push(stem.name.clone());
+        files.push(dir.join(&name));
     }
 
     if !scaled.is_empty() {
         write_gains(&dir, &scaled)?;
+        files.push(dir.join(GAINS_FILE));
     }
 
     Ok(Finished {
@@ -600,6 +737,7 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
         parts,
         secs: entry.separation_secs,
         cached,
+        files,
     })
 }
 
@@ -819,5 +957,71 @@ mod tests {
             "the re-run did not move to the top"
         );
         assert!(Arc::ptr_eq(&recent[1], &other), "an unrelated row moved");
+    }
+
+    fn finished_in(dir: &Path, names: &[&str]) -> Finished {
+        let files: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+        for file in &files {
+            std::fs::write(file, b"stem").unwrap();
+        }
+        Finished {
+            dir: dir.to_path_buf(),
+            parts: names.iter().map(|n| (*n).to_owned()).collect(),
+            secs: 12.0,
+            cached: false,
+            files,
+        }
+    }
+
+    #[test]
+    fn a_repeat_drop_finds_its_result_while_the_files_are_unchanged() {
+        let dir = scratch("history");
+        let history = History::default();
+        history.record(
+            "a".into(),
+            &finished_in(&dir, &["vocals.flac", "drums.flac"]),
+        );
+        assert_eq!(history.find("a").unwrap().dir, dir);
+        assert!(history.find("b").is_none(), "another key");
+
+        std::fs::write(dir.join("drums.flac"), b"edited stem").unwrap();
+        assert!(history.find("a").is_none(), "a changed file");
+
+        history.record("a".into(), &finished_in(&dir, &["vocals.flac"]));
+        std::fs::remove_file(dir.join("vocals.flac")).unwrap();
+        assert!(history.find("a").is_none(), "a missing file");
+    }
+
+    #[test]
+    fn the_history_keeps_the_last_25() {
+        let dir = scratch("history-cap");
+        let history = History::default();
+        let finished = finished_in(&dir, &["vocals.flac"]);
+        for n in 0..=HISTORY {
+            history.record(n.to_string(), &finished);
+        }
+        assert!(history.find("0").is_none(), "the oldest fell off");
+        assert!(history.find("1").is_some());
+    }
+
+    #[test]
+    fn a_track_is_known_by_its_bytes_and_settings() {
+        let dir = scratch("history-key");
+        let (a, b, c) = (dir.join("a.wav"), dir.join("b.wav"), dir.join("c.wav"));
+        std::fs::write(&a, b"same audio").unwrap();
+        std::fs::write(&b, b"same audio").unwrap();
+        std::fs::write(&c, b"other audio").unwrap();
+        let settings = Settings::default();
+        let key = |path: &Path, settings: &Settings, model: &str| {
+            history_key(path, settings, model).unwrap()
+        };
+        assert_eq!(key(&a, &settings, "m"), key(&b, &settings, "m"), "a copy");
+        assert_ne!(key(&a, &settings, "m"), key(&c, &settings, "m"));
+        assert_ne!(key(&a, &settings, "m"), key(&a, &settings, "n"), "a model");
+        let parts = Settings {
+            drop_parts: settings.drop_parts.toggle("vocals"),
+            ..settings
+        };
+        assert_ne!(key(&a, &settings, "m"), key(&a, &parts, "m"), "the parts");
     }
 }
