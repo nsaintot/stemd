@@ -353,4 +353,40 @@ mod tests {
             let _ = elst_media_time(&full[..cut]);
         }
     }
+
+    /// A 16-bit big-endian AIFF file.
+    #[test]
+    fn decodes_aiff() {
+        let samples: [i16; 6] = [0, 1000, -1000, 32767, -32768, 12345];
+        let mut ssnd = vec![0u8; 8];
+        for s in samples {
+            ssnd.extend_from_slice(&s.to_be_bytes());
+        }
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&2i16.to_be_bytes());
+        comm.extend_from_slice(&3u32.to_be_bytes());
+        comm.extend_from_slice(&16i16.to_be_bytes());
+        // 44100 as an 80-bit extended float.
+        comm.extend_from_slice(&[0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0]);
+        let mut body = b"AIFF".to_vec();
+        for (id, chunk) in [(b"COMM", &comm), (b"SSND", &ssnd)] {
+            body.extend_from_slice(id);
+            body.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            body.extend_from_slice(chunk);
+        }
+        let mut file = b"FORM".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        file.extend_from_slice(&body);
+
+        let path = std::env::temp_dir().join(format!("stemd-audio-{}.aiff", std::process::id()));
+        std::fs::write(&path, &file).expect("writing");
+        let decoded = super::decode(&path);
+        let _ = std::fs::remove_file(&path);
+        let decoded = decoded.expect("decoding");
+
+        assert_eq!(decoded.sample_rate, 44_100);
+        let scale = |q: i16| f32::from(q) / 32768.0;
+        assert_eq!(decoded.data[0], [0, -1000, -32768].map(scale));
+        assert_eq!(decoded.data[1], [1000, 32767, 12345].map(scale));
+    }
 }
