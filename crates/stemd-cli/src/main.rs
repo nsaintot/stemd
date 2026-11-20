@@ -380,15 +380,14 @@ fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, el
             names.join("+")
         );
     }
-    match result.output.derived.as_deref() {
-        Some(derived) => println!(
-            "model resid  : {:.1} dB (the model's own error — it all lands on `{derived}`)",
-            result.model_residual_db,
+    match (result.model_residual_db, result.output.derived.as_deref()) {
+        (Some(resid), Some(derived)) => println!(
+            "model resid  : {resid:.1} dB (the model's own error — it all lands on `{derived}`)",
         ),
-        None => println!(
-            "model resid  : {:.1} dB (the model's own error — no part is left to absorb it)",
-            result.model_residual_db,
+        (Some(resid), None) => println!(
+            "model resid  : {resid:.1} dB (the model's own error — no part is left to absorb it)",
         ),
+        (None, _) => println!("model resid  : unknown (stems stored by a session)"),
     }
     println!("total        : {elapsed:.1}s end to end");
 }

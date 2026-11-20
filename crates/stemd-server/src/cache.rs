@@ -1,278 +1,1045 @@
-//! Content-addressed store for separated stems.
+//! Separated pieces on disk, each one encoded and ready to send as it is.
 //!
-//! An entry is keyed by the uploaded samples and by everything else that changes
-//! what comes back, so a hit is the bytes a miss would have produced.
+//! ```text
+//! <root>/<model_id>/<type>/<track>/<stem>/<k>.<ext>
+//! <root>/<model_id>/<type>/<track>/<stem>.<ext>       the whole stem, see [`crate::whole`]
+//! <root>/<model_id>/<type>/<track>/track.json         length and grid, see [`TrackInfo`]
+//! ```
 //!
-//! `max_bytes` bounds the disk. Two rules apply, and neither runs while the store
-//! has room:
+//! | Level   | Example                                        |
+//! |---------|------------------------------------------------|
+//! | `model_id` | `htdemucs-22c7f2c9`, as in `/v2/health`     |
+//! | `type`  | `flac-96000-dsp1-harmonics.vocals-g1`; `-dsp1` or `-fir<id>` names the filter |
+//! | `track` | the 24-hex track id, see [`crate::sessions::track_id`] |
+//! | `k`     | piece index, four digits                       |
 //!
-//! 1. Past half full, an entry nobody pulled and has not touched for
-//!    `unfetched_ttl` goes.
-//! 2. Over the cap, least-recently-used, until it fits.
+//! The one cache of separated stems, for sessions, jobs and drops alike. A
+//! piece is written once its track's whole upload has been hashed, so the track
+//! id in the path is always the server's own. The root survives restarts, since
+//! a path names everything its bytes depend on. Once a stem is stored whole,
+//! its pieces are deleted, and ranges are read from the whole file. Once
+//! every piece of a track directory is stored, a background thread stores each
+//! stem whole. A job stores its stems whole at once.
 //!
-//! The entry directory holds the stems; a job only borrows it.
+//! A track directory is whole when every stem in it is stored whole, else
+//! partial. A `.used` file in it records its last use. [`Rules`] decide what
+//! goes, skipping a track in use: one an open session plays, or a job result
+//! not fully fetched within [`Rules::unfetched_ttl`].
+//!
+//! | Rule | |
+//! | --- | --- |
+//! | partial, unused for `partial_max_age` | deleted |
+//! | whole, unused for `whole_max_age` | deleted |
+//! | over the budget | partial tracks, oldest first; then whole tracks, least recently used |
+//!
+//! The budget is `max_bytes`, or less when the disk is short of
+//! [`crate::disk::FLOOR`]. The age rules run at start and every
+//! [`CLEAN_EVERY`]; the budget also after each write.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
-use stemd_core::{Audio, OutputRate, Parts, PcmFormat, StemFormat, Stems};
+use serde::{Deserialize, Serialize};
+use stemd_core::{Audio, StemFormat};
 
-use crate::filters::Dsp;
+use crate::jobs::Entry;
+use crate::output::Output;
+use crate::sessions::output_index;
 
-/// Invalidates every stored entry when bumped by hand. Covers a change to which
-/// stems ship, or to how one is encoded or scaled on the way out. The model is in
-/// the key by digest, so re-tracing one invalidates its own entries without
-/// touching this.
-///
-/// 2: FLAC streams declare a fixed block size; earlier entries decode short.
-const EPOCH: u32 = 2;
-
-/// What a job asks for on the way out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Output {
-    pub format: StemFormat,
-    pub rate: OutputRate,
-    /// Ship the derived part as well, instead of leaving the client to rebuild
-    /// it from the mix. See [`to_output_rate`].
-    pub derived: bool,
-    /// Filter the conversion to `rate` runs through.
-    pub dsp: Dsp,
-    /// Parts to ship. The derived part is the one they leave out.
-    pub parts: Parts,
+/// The directory name for one output at one gain.
+pub fn type_dir(output: &Output, gain: f32) -> String {
+    format!("{}{gain}", type_prefix(output))
 }
 
-impl Output {
-    /// How many parts this asks for, for a log line.
-    pub fn parts(&self) -> usize {
-        self.parts.len() + usize::from(self.ships_derived())
+/// The directory name for one output, up to its gain.
+pub fn type_prefix(output: &Output) -> String {
+    let dsp = output.dsp.dir_suffix();
+    let parts: Vec<&str> = output.parts.names().collect();
+    format!(
+        "{}-{}{dsp}-{}-g",
+        output.format,
+        output.rate,
+        parts.join(".")
+    )
+}
+
+/// The file whose modification time is a track directory's last use.
+const USED: &str = ".used";
+/// Directory under the root holding one file per file key, naming its track id.
+const FILES: &str = ".files";
+/// What a file key's file holds once two uploads under it hashed differently.
+const AMBIGUOUS: &str = "ambiguous";
+/// The file in a track directory a job writes its [`Separation`] to.
+const SEPARATION: &str = ".separation.json";
+/// The lock file in the root, which emptying the cache keeps.
+pub const LOCK_FILE: &str = "stemd.lock";
+
+/// How often the age rules run.
+pub const CLEAN_EVERY: Duration = Duration::from_secs(3600);
+
+/// What the cache deletes, and when.
+#[derive(Debug, Clone, Copy)]
+pub struct Rules {
+    pub max_bytes: u64,
+    pub partial_max_age: Duration,
+    pub whole_max_age: Duration,
+    /// How long a job result stays in use after it finished or after its last
+    /// stem fetch, until every stem has been fetched.
+    pub unfetched_ttl: Duration,
+}
+
+impl Rules {
+    /// A budget of `max_bytes` and the default ages.
+    #[cfg(test)]
+    pub fn sized(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            partial_max_age: Duration::from_secs(24 * 3600),
+            whole_max_age: Duration::from_secs(30 * 86400),
+            unfetched_ttl: Duration::from_secs(300),
+        }
     }
-
-    /// Whether the derived part ships: asked for, and something is left out.
-    pub fn ships_derived(&self) -> bool {
-        self.derived && self.parts.derived().is_some()
-    }
 }
 
-/// Everything that decides what a separation returns.
-///
-/// A struct rather than positional arguments: leaving one out is not a compile
-/// error, it is a cache that serves the wrong audio.
-#[derive(Clone, Copy)]
-pub struct Ingredients<'a> {
-    /// The uploaded bytes, hashed as received, which keeps the key independent
-    /// of how samples are represented in memory.
-    pub pcm: &'a [u8],
-    pub sample_rate: u32,
-    pub channels: usize,
-    pub in_format: PcmFormat,
-    pub out_format: StemFormat,
-    /// Rate the stems are converted to on the way out. In the key because a hit
-    /// must never hand back audio at a rate the caller did not ask for.
-    pub out_rate: OutputRate,
-    /// Whether the derived part ships. In the key for the same reason: it
-    /// changes which files an entry holds.
-    pub include_derived: bool,
-    /// Parts the job ships. In the key because it changes which files an entry
-    /// holds.
-    pub parts: Parts,
-    /// Filter the conversion to `out_rate` ran through. In the key because two
-    /// filters at one rate are two different files.
-    pub dsp: &'a Dsp,
-    /// Digest of the model artefact where one is pinned, else its name.
-    pub model: &'a str,
-}
-
-/// Hash the ingredients into an entry name.
-///
-/// About 0.3 GB/s, so a five-minute s16le upload takes roughly 160 ms: kept off
-/// the async runtime. Fields are length-prefixed so different splits cannot
-/// collide.
-pub fn key(ingredients: &Ingredients<'_>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(ingredients.pcm);
-    for field in [
-        EPOCH.to_string(),
-        ingredients.sample_rate.to_string(),
-        ingredients.channels.to_string(),
-        ingredients.in_format.to_string(),
-        ingredients.out_format.to_string(),
-        ingredients.out_rate.to_string(),
-        // Asking for the derived part when the parts leave nothing out changes nothing.
-        (ingredients.include_derived && ingredients.parts.derived().is_some()).to_string(),
-        ingredients.parts.to_string(),
-        ingredients.dsp.to_string(),
-        ingredients.model.to_owned(),
-    ] {
-        hasher.update(u32::try_from(field.len()).unwrap_or(u32::MAX).to_le_bytes());
-        hasher.update(field.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-/// Sweeps per TTL. More than one so an abandoned separation cannot sit for
-/// twice as long as configured; the bounds keep a very short or very long TTL
-/// from turning that into a busy loop or an hour of silence.
-const SWEEPS_PER_TTL: u32 = 5;
-const MIN_SWEEP: Duration = Duration::from_secs(5);
-const MAX_SWEEP: Duration = Duration::from_secs(60);
-
-/// Characters of a key worth putting in a log line. Enough to tell entries
-/// apart by eye without wrapping the message.
-const SHORT_KEY: usize = 12;
-
-/// The leading `SHORT_KEY` characters of a key, for logging.
-pub fn short(key: &str) -> &str {
-    &key[..key.len().min(SHORT_KEY)]
-}
-
-/// One stem file inside an entry.
-#[derive(Debug, Clone)]
-pub struct CachedStem {
-    pub name: String,
-    pub path: PathBuf,
-    pub bytes: u64,
-    /// Scale already applied so the samples fit the output format. The client
-    /// multiplies by `1.0 / gain` to restore the original level.
-    pub gain: f32,
-}
-
-#[derive(Debug)]
-struct State {
-    /// Stems no client has pulled yet. Empty means the entry did its job.
-    unfetched: HashSet<String>,
-    last_used: Instant,
-}
-
-/// One separation's output, owned by the cache and borrowed by jobs.
-#[derive(Debug)]
-pub struct Entry {
-    pub key: String,
-    pub dir: PathBuf,
-    pub stems: Vec<CachedStem>,
-    pub sample_rate: u32,
-    pub channels: usize,
-    pub frames: usize,
-    pub format: StemFormat,
+/// What a job's separation cost, kept beside its stems.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Separation {
     pub model_residual_db: f64,
-    /// The part a client rebuilds as `mix` minus the stems: whatever the request
-    /// left out. Listed in `stems` too when it was asked for.
-    pub derived: Option<&'static str>,
-    /// What the separation cost when it actually ran. Preserved across hits, so
-    /// a client can tell a cheap answer from an expensive one.
     pub separation_secs: f64,
+}
+
+/// The cache's size, for `/v2/health` and the window.
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    pub tracks: usize,
     pub bytes: u64,
-    /// Set when the cache deletes this entry's directory, so a job holding the
-    /// last reference can tell that its stems are gone.
-    evicted: AtomicBool,
-    /// Set once [`Cache::get`] or a stem download gives the entry to a caller,
-    /// so a drop that made it does not delete it from under them.
-    handed_out: AtomicBool,
-    state: Mutex<State>,
+    pub max_bytes: u64,
 }
 
-impl Entry {
-    /// True once every shipped stem has been pulled at least once.
-    ///
-    /// All of them, not any: a client that fetched one stem and died did not get
-    /// a usable result, and rule 1 should still collect it.
-    pub fn consumed(&self) -> bool {
-        self.state.lock().unfetched.is_empty()
+/// The track ids open sessions play, which eviction skips.
+pub type InUse = Box<dyn Fn() -> HashSet<String> + Send + Sync>;
+
+/// True when background consolidation may use the CPU now.
+pub type Gate = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// The file in each track directory that holds its [`TrackInfo`].
+const INFO: &str = "track.json";
+
+/// How often a consolidation waiting on its [`Gate`] checks again.
+const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a track directory that failed to be stored whole waits before another try.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A track's length and piece grid, at the model's rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackInfo {
+    pub frames: usize,
+    pub sample_rate: u32,
+    pub channels: usize,
+    /// Samples per piece; the last piece may be shorter.
+    pub stride: usize,
+    pub pieces: usize,
+}
+
+impl TrackInfo {
+    /// Samples piece `k` covers.
+    pub fn piece(&self, k: usize) -> std::ops::Range<usize> {
+        (k * self.stride).min(self.frames)..((k + 1) * self.stride).min(self.frames)
     }
 
-    pub fn last_used(&self) -> Instant {
-        self.state.lock().last_used
+    /// The track's length at `rate`.
+    pub fn frames_at(&self, rate: u32) -> usize {
+        output_index(self.frames, u64::from(self.sample_rate), u64::from(rate))
     }
 
-    pub fn touch(&self) {
-        self.state.lock().last_used = Instant::now();
+    /// Each piece's length at `rate`.
+    pub fn lengths(&self, rate: u32) -> Vec<usize> {
+        let (model, out) = (u64::from(self.sample_rate), u64::from(rate));
+        (0..self.pieces)
+            .map(|k| {
+                let piece = self.piece(k);
+                output_index(piece.end, model, out) - output_index(piece.start, model, out)
+            })
+            .collect()
     }
+}
 
-    pub fn evicted(&self) -> bool {
-        self.evicted.load(Ordering::SeqCst)
-    }
+/// A track directory of one output, to store whole stem by stem.
+#[derive(Debug, Clone)]
+pub struct Consolidation {
+    pub dir: PathBuf,
+    pub format: StemFormat,
+    /// The output rate.
+    pub rate: u32,
+    pub info: TrackInfo,
+    pub stems: Vec<&'static str>,
+}
 
-    /// Record that a client outside the window has the entry. See `handed_out`.
-    pub fn hand_out(&self) {
-        self.handed_out.store(true, Ordering::SeqCst);
-    }
-
-    /// Record that `name` was pulled, and restart the idle clock.
-    ///
-    /// Touching here is what stops rule 1 from collecting an entry between a
-    /// client's first and second stem fetch.
-    pub fn mark_fetched(&self, name: &str) {
-        let mut state = self.state.lock();
-        state.unfetched.remove(name);
-        state.last_used = Instant::now();
-    }
-
-    pub fn stem(&self, name: &str) -> Option<&CachedStem> {
-        self.stems.iter().find(|s| s.name == name)
-    }
-
-    /// Whether every stem this entry promises is still readable.
-    fn present(&self) -> bool {
-        self.stems.iter().all(|stem| stem.path.exists())
-    }
-
-    pub fn duration_secs(&self) -> f64 {
-        if self.sample_rate == 0 {
-            return 0.0;
+#[cfg(test)]
+impl Consolidation {
+    /// A one-piece track of `frames` samples at 44.1 kHz in `dir`, stored as `format`.
+    pub fn at_44100(dir: PathBuf, format: StemFormat, frames: usize) -> Self {
+        let info = TrackInfo {
+            frames,
+            sample_rate: 44_100,
+            channels: 2,
+            stride: frames,
+            pieces: 1,
+        };
+        Self {
+            dir,
+            format,
+            rate: 44_100,
+            info,
+            stems: Vec::new(),
         }
-        self.frames as f64 / f64::from(self.sample_rate)
-    }
-
-    /// How much faster than realtime the separation ran. The single
-    /// definition; the worker's log line and the API response both read it.
-    pub fn realtime_factor(&self) -> f64 {
-        if self.separation_secs > 0.0 {
-            self.duration_secs() / self.separation_secs
-        } else {
-            f64::INFINITY
-        }
     }
 }
 
-/// Bytes held by every entry in the store.
-fn total_bytes(entries: &HashMap<String, Arc<Entry>>) -> u64 {
-    entries.values().map(|e| e.bytes).sum()
-}
-
-/// What one sweep collected.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Reaped {
-    /// Entries deleted by rule 1: over budget, separated, never pulled.
-    pub unfetched: usize,
-    /// Entries deleted by rule 2: the store was over budget.
-    pub rotated: usize,
-    pub bytes: u64,
-}
-
-impl Reaped {
-    pub fn any(self) -> bool {
-        self.unfetched > 0 || self.rotated > 0
-    }
+/// A file name for piece `k`.
+fn file(k: usize, extension: &str) -> String {
+    format!("{k:04}.{extension}")
 }
 
 pub struct Cache {
     root: PathBuf,
-    entries: Mutex<HashMap<String, Arc<Entry>>>,
-    max_bytes: u64,
-    unfetched_ttl: Duration,
-    /// Makes staging directory names unique. The worker is serialised today, so
-    /// two publishes cannot overlap, this keeps that from being load-bearing.
-    seq: AtomicU64,
-    /// Whether the cap shrinks to keep [`crate::disk::FLOOR`] free.
-    disk_aware: AtomicBool,
+    rules: Rules,
+    bytes: AtomicU64,
+    /// Job results, in use until fetched; see [`Entry::held`].
+    holds: Mutex<Vec<Weak<Entry>>>,
+    /// Track directories a job is storing its stems in.
+    writing: Mutex<HashSet<PathBuf>>,
+    /// The last track count, and when it was taken.
+    counted: Mutex<Option<(Instant, usize)>>,
+    /// Held while a path is chosen and written, and while a track's pieces move,
+    /// so no write lands in a directory that has just moved.
+    lock: Mutex<()>,
+    in_use: Mutex<Option<InUse>>,
+    gate: Mutex<Option<Gate>>,
+    /// Called after a stem is stored whole in the background.
+    on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Track directories queued or being stored whole.
+    consolidating: Mutex<HashSet<PathBuf>>,
+    /// Tasks for the one consolidation thread, and whether it runs.
+    tasks: Mutex<(VecDeque<Consolidation>, bool)>,
+    /// Track directories that failed to be stored whole, and when.
+    failed: Mutex<HashMap<PathBuf, Instant>>,
+    /// One lock per track directory a conversion is writing.
+    converting: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Numbers staged files so two writers never share one.
+    staged: AtomicU64,
 }
 
-/// Where entries live when no directory is configured.
+impl Cache {
+    /// Open `root` with a budget of `max_bytes` and the default ages.
+    #[cfg(test)]
+    pub fn open(root: PathBuf, max_bytes: u64) -> Result<Arc<Self>> {
+        Self::open_with(root, Rules::sized(max_bytes))
+    }
+
+    /// Open `root`, delete leftover `.part` files and the stems of stemd 0.2.0
+    /// and earlier, and apply `rules`.
+    pub fn open_with(root: PathBuf, rules: Rules) -> Result<Arc<Self>> {
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+        crate::migrate::remove_old_layout(&root);
+        let mut bytes = 0;
+        for (path, size, _) in files(&root) {
+            if path.extension().is_some_and(|e| e == "part") {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                bytes += size;
+            }
+        }
+        let cache = Arc::new(Self {
+            root,
+            rules,
+            bytes: AtomicU64::new(bytes),
+            holds: Mutex::new(Vec::new()),
+            writing: Mutex::new(HashSet::new()),
+            counted: Mutex::new(None),
+            lock: Mutex::new(()),
+            in_use: Mutex::new(None),
+            gate: Mutex::new(None),
+            on_change: Mutex::new(None),
+            consolidating: Mutex::new(HashSet::new()),
+            tasks: Mutex::new((VecDeque::new(), false)),
+            failed: Mutex::new(HashMap::new()),
+            converting: Mutex::new(HashMap::new()),
+            staged: AtomicU64::new(0),
+        });
+        cache.clean();
+        Ok(cache)
+    }
+
+    /// Keep `entry`'s track directory while [`Entry::held`] says so.
+    pub fn hold(&self, entry: &Arc<Entry>) {
+        let _held = self.lock.lock();
+        let mut holds = self.holds.lock();
+        holds.retain(|held| held.strong_count() > 0);
+        holds.push(Arc::downgrade(entry));
+    }
+
+    /// Keep `track_dir` while the guard lives, as a job stores its stems there.
+    pub fn writing(&self, track_dir: &Path) -> Writing<'_> {
+        let _held = self.lock.lock();
+        self.writing.lock().insert(track_dir.to_owned());
+        Writing {
+            cache: self,
+            dir: track_dir.to_owned(),
+        }
+    }
+
+    /// The track directories jobs are writing or their results hold now.
+    fn held_dirs(&self) -> HashSet<PathBuf> {
+        let mut dirs = self.writing.lock().clone();
+        let mut holds = self.holds.lock();
+        holds.retain(|held| held.strong_count() > 0);
+        dirs.extend(
+            holds
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|entry| entry.held(self.rules.unfetched_ttl))
+                .map(|entry| entry.dir.clone()),
+        );
+        dirs
+    }
+
+    /// Record what a job's separation cost in `track_dir`.
+    pub fn write_separation(&self, track_dir: &Path, separation: &Separation) -> Result<()> {
+        let bytes = serde_json::to_vec(separation)?;
+        self.publish_file(&track_dir.join(SEPARATION), &bytes)?;
+        self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// What the job that stored `track_dir` recorded, if a job did.
+    pub fn separation(track_dir: &Path) -> Option<Separation> {
+        let bytes = std::fs::read(track_dir.join(SEPARATION)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// The number of track directories, counted at most once a second, the
+    /// bytes held and the cap.
+    pub fn stats(&self) -> Stats {
+        let mut counted = self.counted.lock();
+        let tracks = match *counted {
+            Some((at, tracks)) if at.elapsed() < Duration::from_secs(1) => tracks,
+            _ => {
+                let tracks = count_tracks(&self.root);
+                *counted = Some((Instant::now(), tracks));
+                tracks
+            }
+        };
+        Stats {
+            tracks,
+            bytes: self.bytes(),
+            max_bytes: self.rules.max_bytes,
+        }
+    }
+
+    /// Delete every track not in use and every file key. Returns the tracks and
+    /// bytes freed.
+    pub fn clear(&self) -> (usize, u64) {
+        let _held = self.lock.lock();
+        let in_use = self.in_use();
+        let (mut tracks, mut freed) = (0, 0);
+        for track in track_dirs(&self.root) {
+            if !in_use.blocks(&track) && std::fs::remove_dir_all(&track.dir).is_ok() {
+                tracks += 1;
+                freed += track.bytes;
+            }
+        }
+        let _ = std::fs::remove_dir_all(self.root.join(FILES));
+        self.recount();
+        (tracks, freed)
+    }
+
+    /// Delete everything in the root but the lock file.
+    pub fn wipe(&self) {
+        let _held = self.lock.lock();
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == LOCK_FILE) {
+                    continue;
+                }
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
+        }
+        self.recount();
+    }
+
+    /// Set the byte count from the disk, and count the tracks again on the next [`Self::stats`].
+    fn recount(&self) {
+        let bytes = files(&self.root).iter().map(|(_, size, _)| size).sum();
+        self.bytes.store(bytes, Ordering::Relaxed);
+        *self.counted.lock() = None;
+    }
+
+    /// What may not be deleted now.
+    fn in_use(&self) -> InUseNow {
+        InUseNow {
+            tracks: self.in_use.lock().as_ref().map(|f| f()).unwrap_or_default(),
+            dirs: self.held_dirs(),
+        }
+    }
+
+    /// Apply the age rules, then the budget.
+    pub fn clean(&self) {
+        let now = SystemTime::now();
+        let held = self.lock.lock();
+        let in_use = self.in_use();
+        let (mut count, mut freed) = (0usize, 0u64);
+        for track in track_dirs(&self.root) {
+            let max_age = if track.whole {
+                self.rules.whole_max_age
+            } else {
+                self.rules.partial_max_age
+            };
+            let unused = now.duration_since(track.used).unwrap_or_default();
+            if unused > max_age
+                && !in_use.blocks(&track)
+                && std::fs::remove_dir_all(&track.dir).is_ok()
+            {
+                count += 1;
+                freed += track.bytes;
+            }
+        }
+        self.bytes
+            .fetch_sub(freed.min(self.bytes()), Ordering::Relaxed);
+        drop(held);
+        if count > 0 {
+            *self.counted.lock() = None;
+            tracing::info!(
+                "cache: deleted {count} tracks unused past their age ({:.0} MB)",
+                freed as f64 / 1e6
+            );
+        }
+        self.evict();
+    }
+
+    /// Set how eviction learns which tracks are in use.
+    pub fn set_in_use(&self, in_use: InUse) {
+        *self.in_use.lock() = Some(in_use);
+    }
+
+    /// Set when background consolidation may run. Without one it runs at once.
+    pub fn set_gate(&self, gate: Gate) {
+        *self.gate.lock() = Some(gate);
+    }
+
+    /// Set what runs after a stem is stored whole in the background.
+    pub fn set_on_change(&self, on_change: Box<dyn Fn() + Send + Sync>) {
+        *self.on_change.lock() = Some(on_change);
+    }
+
+    /// The pieces of `stem` below `count` stored under `track_dir`.
+    pub fn stem_pieces(track_dir: &Path, stem: &str, extension: &str, count: usize) -> Vec<usize> {
+        (0..count)
+            .filter(|&k| track_dir.join(stem).join(file(k, extension)).is_file())
+            .collect()
+    }
+
+    fn gate_open(&self) -> bool {
+        self.gate.lock().as_ref().is_none_or(|open| open())
+    }
+
+    /// The [`TrackInfo`] of `track_dir`, when it was written.
+    pub fn info(track_dir: &Path) -> Option<TrackInfo> {
+        let bytes = std::fs::read(track_dir.join(INFO)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Write `info` into `track_dir` unless it is there already.
+    pub fn write_info(&self, track_dir: &Path, info: &TrackInfo) -> Result<()> {
+        if Self::info(track_dir).as_ref() == Some(info) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(info)?;
+        std::fs::create_dir_all(track_dir)
+            .with_context(|| format!("creating {}", track_dir.display()))?;
+        self.publish_file(&track_dir.join(INFO), &bytes)?;
+        self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// True while `track_dir` is queued or being stored whole.
+    #[cfg(test)]
+    pub fn is_consolidating(&self, track_dir: &Path) -> bool {
+        self.consolidating.lock().contains(track_dir)
+    }
+
+    /// True when every stem of `task` is stored and one is still in pieces.
+    pub fn needs_consolidation(task: &Consolidation) -> bool {
+        let extension = task.format.extension();
+        let mut whole = 0;
+        for stem in &task.stems {
+            if crate::whole::find(&task.dir, stem, extension).is_some() {
+                whole += 1;
+            } else if !(0..task.info.pieces)
+                .all(|k| task.dir.join(stem).join(file(k, extension)).is_file())
+            {
+                return false;
+            }
+        }
+        whole < task.stems.len()
+    }
+
+    /// True when `track_dir` failed to be stored whole less than [`RETRY_AFTER`] ago.
+    pub fn consolidation_failed(&self, track_dir: &Path) -> bool {
+        let mut failed = self.failed.lock();
+        failed.retain(|_, at| at.elapsed() < RETRY_AFTER);
+        failed.contains_key(track_dir)
+    }
+
+    /// Queue every stem of `task` to be stored whole; false when it failed recently.
+    pub fn consolidate_later(self: &Arc<Self>, task: Consolidation) -> bool {
+        if self.consolidation_failed(&task.dir) {
+            return false;
+        }
+        if !self.consolidating.lock().insert(task.dir.clone()) {
+            return true;
+        }
+        let mut tasks = self.tasks.lock();
+        tasks.0.push_back(task);
+        if !tasks.1 {
+            tasks.1 = true;
+            let cache = Arc::clone(self);
+            std::thread::spawn(move || cache.consolidate_queued());
+        }
+        true
+    }
+
+    /// Run queued consolidations one at a time until the queue is empty.
+    fn consolidate_queued(&self) {
+        loop {
+            let task = {
+                let mut tasks = self.tasks.lock();
+                match tasks.0.pop_front() {
+                    Some(task) => task,
+                    None => {
+                        tasks.1 = false;
+                        return;
+                    }
+                }
+            };
+            if let Err(err) = self.consolidate_task(&task) {
+                tracing::warn!("storing {} whole: {err:#}", task.dir.display());
+                self.failed.lock().insert(task.dir.clone(), Instant::now());
+            }
+            self.consolidating.lock().remove(&task.dir);
+        }
+    }
+
+    /// Store every stem of `task` whole, waiting for the gate before each.
+    fn consolidate_task(&self, task: &Consolidation) -> Result<()> {
+        for stem in &task.stems {
+            while !self.gate_open() {
+                std::thread::sleep(GATE_POLL);
+            }
+            ensure!(
+                !crate::disk::low(&self.root),
+                "the disk is nearly full, so {stem} stays in pieces"
+            );
+            self.consolidate_pieces(task, stem)
+                .with_context(|| format!("storing {stem} whole"))?;
+            if let Some(on_change) = self.on_change.lock().as_ref() {
+                on_change();
+            }
+        }
+        Ok(())
+    }
+
+    /// The lock a conversion holds while it writes into `track_dir`.
+    pub fn converting(&self, track_dir: &Path) -> Arc<Mutex<()>> {
+        let mut converting = self.converting.lock();
+        converting.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(converting.entry(track_dir.to_owned()).or_default())
+    }
+
+    /// Store `stem` as one file built from its pieces, and delete the pieces.
+    fn consolidate_pieces(&self, task: &Consolidation, stem: &str) -> Result<()> {
+        let extension = task.format.extension();
+        if crate::whole::find(&task.dir, stem, extension).is_some() {
+            return Ok(());
+        }
+        let channels = task.info.channels;
+        let mut data = vec![Vec::new(); channels];
+        for (k, len) in task.info.lengths(task.rate).into_iter().enumerate() {
+            let path = task.dir.join(stem).join(file(k, extension));
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let audio = decode(bytes, task.format, channels, task.rate)
+                .with_context(|| format!("decoding {}", path.display()))?;
+            ensure!(
+                audio.frames() == len,
+                "{} holds {} samples, not {len}",
+                path.display(),
+                audio.frames()
+            );
+            for (dst, src) in data.iter_mut().zip(audio.data) {
+                dst.extend(src);
+            }
+        }
+        let audio = Audio::new(data, task.rate);
+        let bytes = stemd_core::encode_stem(&audio, task.format, 1.0)?;
+        let clipped =
+            (!task.format.has_headroom()).then(|| crate::whole::clipped(&audio, 1.0, true));
+        self.consolidate(task, stem, &bytes, audio.frames(), clipped)?;
+        tracing::info!("stored {stem} whole in {}", task.dir.display());
+        Ok(())
+    }
+
+    /// Record that an upload sent with `key` hashed to `track`; a key of two tracks is ambiguous.
+    pub fn record_file(&self, key: &str, track: &str) -> Result<()> {
+        let path = self.root.join(FILES).join(key);
+        let _held = self.lock.lock();
+        let value = match std::fs::read_to_string(&path) {
+            Ok(known) if known == track || known == AMBIGUOUS => return Ok(()),
+            Ok(_) => {
+                tracing::info!("file key {key} names two tracks; lookups by it are refused");
+                AMBIGUOUS
+            }
+            Err(_) => track,
+        };
+        std::fs::create_dir_all(path.parent().expect("a parent"))
+            .with_context(|| format!("creating {}", path.display()))?;
+        self.publish_file(&path, value.as_bytes())
+    }
+
+    /// The track id recorded for `key`, unless the key is unknown or ambiguous.
+    pub fn file_track(&self, key: &str) -> Option<String> {
+        let known = std::fs::read_to_string(self.root.join(FILES).join(key)).ok()?;
+        (known != AMBIGUOUS).then_some(known)
+    }
+
+    /// The type directories under `model_id`.
+    pub fn types(&self, model_id: &str) -> Vec<String> {
+        std::fs::read_dir(self.root.join(model_id))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Mark a track directory used now.
+    pub fn touch(track_dir: &Path) {
+        if let Ok(f) = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(track_dir.join(USED))
+        {
+            let _ = f.set_modified(SystemTime::now());
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Where a verified track's pieces of one type live.
+    pub fn verified_dir(&self, model_id: &str, type_dir: &str, track: &str) -> PathBuf {
+        self.root.join(model_id).join(type_dir).join(track)
+    }
+
+    /// The file for piece `k` of `stem` under `track_dir`, when it exists.
+    pub fn lookup(track_dir: &Path, stem: &str, k: usize, extension: &str) -> Option<PathBuf> {
+        let path = track_dir.join(stem).join(file(k, extension));
+        path.is_file().then(|| {
+            Self::touch(track_dir);
+            path
+        })
+    }
+
+    /// Store `bytes`, the whole of `stem`, in `task`'s directory and delete the stem's pieces.
+    pub fn consolidate(
+        &self,
+        task: &Consolidation,
+        stem: &str,
+        bytes: &[u8],
+        frames: usize,
+        clipped: Option<usize>,
+    ) -> Result<()> {
+        let (track_dir, format) = (task.dir.as_path(), task.format);
+        let extension = format.extension();
+        let expected = task.info.frames_at(task.rate);
+        ensure!(
+            frames == expected,
+            "{stem} holds {frames} samples, not the track's {expected}"
+        );
+        if crate::whole::find(track_dir, stem, extension).is_some() {
+            return Ok(());
+        }
+        // Described and written to staged files outside the lock, which separation also takes.
+        let meta = crate::whole::describe(bytes, format, frames, clipped)?;
+        let meta = serde_json::to_vec(&meta)?;
+        crate::disk::ensure_room(&self.root)?;
+        std::fs::create_dir_all(track_dir)
+            .with_context(|| format!("creating {}", track_dir.display()))?;
+        let file_path = crate::whole::file(track_dir, stem, extension);
+        let meta_path = crate::whole::meta_file(track_dir, stem);
+        let staged_file = self.stage(&file_path, bytes)?;
+        let staged_meta = match self.stage(&meta_path, &meta) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = std::fs::remove_file(&staged_file);
+                return Err(err);
+            }
+        };
+        let held = self.lock.lock();
+        if crate::whole::find(track_dir, stem, extension).is_some() {
+            let _ = std::fs::remove_file(&staged_file);
+            let _ = std::fs::remove_file(&staged_meta);
+            return Ok(());
+        }
+        // The description last: a whole file counts once both are in place.
+        std::fs::rename(&staged_file, &file_path)
+            .with_context(|| format!("publishing {}", file_path.display()))?;
+        std::fs::rename(&staged_meta, &meta_path)
+            .with_context(|| format!("publishing {}", meta_path.display()))?;
+        let pieces_dir = track_dir.join(stem);
+        let freed: u64 = files(&pieces_dir).iter().map(|(_, size, _)| size).sum();
+        if pieces_dir.is_dir() {
+            std::fs::remove_dir_all(&pieces_dir)
+                .with_context(|| format!("removing {}", pieces_dir.display()))?;
+        }
+        let added = (bytes.len() + meta.len()) as u64;
+        self.bytes.fetch_add(added, Ordering::Relaxed);
+        self.bytes
+            .fetch_sub(freed.min(self.bytes()), Ordering::Relaxed);
+        Self::touch(track_dir);
+        drop(held);
+        self.evict();
+        Ok(())
+    }
+
+    /// The piece indices below `count` stored under `dir` for every one of `stems`, as a
+    /// piece file or in a whole file.
+    pub fn cached(dir: &Path, stems: &[&str], extension: &str, count: usize) -> Vec<usize> {
+        if !dir.is_dir() {
+            return Vec::new();
+        }
+        Self::touch(dir);
+        let whole: Vec<bool> = stems
+            .iter()
+            .map(|stem| crate::whole::find(dir, stem, extension).is_some())
+            .collect();
+        (0..count)
+            .filter(|&k| {
+                stems.iter().zip(&whole).all(|(stem, &whole)| {
+                    whole || dir.join(stem).join(file(k, extension)).is_file()
+                })
+            })
+            .collect()
+    }
+
+    /// Write piece `k` of `stem` under `track_dir`, unless it or the whole stem
+    /// is there already.
+    pub fn write_verified(
+        &self,
+        track_dir: &Path,
+        stem: &str,
+        k: usize,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let held = self.lock.lock();
+        let dir = track_dir.join(stem);
+        if dir.join(file(k, extension)).is_file()
+            || crate::whole::file(track_dir, stem, extension).is_file()
+        {
+            return Ok(());
+        }
+        self.write_in(&dir, k, extension, bytes)?;
+        Self::touch(track_dir);
+        drop(held);
+        self.evict();
+        Ok(())
+    }
+
+    /// The directory the pieces live in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Write a piece file.
+    fn write_in(&self, dir: &Path, k: usize, extension: &str, bytes: &[u8]) -> Result<()> {
+        crate::disk::ensure_room(&self.root)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        self.publish_file(&dir.join(file(k, extension)), bytes)?;
+        self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Delete track directories until the cache is under budget: partial ones
+    /// first, oldest first, then whole ones, least recently used first.
+    pub fn evict(&self) {
+        let budget = crate::disk::budget(self.rules.max_bytes, self.bytes(), &self.root);
+        if self.bytes() <= budget {
+            return;
+        }
+        let _held = self.lock.lock();
+        let in_use = self.in_use();
+        let mut tracks = track_dirs(&self.root);
+        tracks.sort_by_key(|t| (t.whole, t.used));
+        let target = budget / 10 * 9;
+        let (mut freed, mut kept, mut deleted) = (0u64, 0usize, 0usize);
+        for track in tracks {
+            if self.bytes().saturating_sub(freed) <= target {
+                break;
+            }
+            if in_use.blocks(&track) {
+                kept += 1;
+                continue;
+            }
+            if std::fs::remove_dir_all(&track.dir).is_ok() {
+                freed += track.bytes;
+                deleted += 1;
+            }
+        }
+        self.bytes
+            .fetch_sub(freed.min(self.bytes()), Ordering::Relaxed);
+        if deleted > 0 {
+            *self.counted.lock() = None;
+        }
+        tracing::info!("cache over budget, deleted {:.0} MB", freed as f64 / 1e6);
+        if self.bytes() > target && kept > 0 {
+            tracing::warn!("cache still over budget: {kept} tracks in use were kept");
+        }
+    }
+}
+
+impl Cache {
+    /// Write `bytes` to a `.part` file of its own beside `path`, and return it.
+    fn stage(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        let n = self.staged.fetch_add(1, Ordering::Relaxed);
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(format!(".{n}.part"));
+        let staged = PathBuf::from(staged);
+        if let Err(err) = std::fs::write(&staged, bytes) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err).with_context(|| format!("writing {}", staged.display()));
+        }
+        Ok(staged)
+    }
+
+    /// Write `path` through a staged file and a rename, so a reader never sees half of it.
+    fn publish_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let staged = self.stage(path, bytes)?;
+        std::fs::rename(&staged, path).map_err(|err| {
+            let _ = std::fs::remove_file(&staged);
+            anyhow::Error::new(err).context(format!("publishing {}", path.display()))
+        })
+    }
+}
+
+/// Keeps a track directory from deletion while a job writes it.
+pub struct Writing<'a> {
+    cache: &'a Cache,
+    dir: PathBuf,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.cache.writing.lock().remove(&self.dir);
+    }
+}
+
+/// The tracks open sessions play and the directories job results hold.
+struct InUseNow {
+    tracks: HashSet<String>,
+    dirs: HashSet<PathBuf>,
+}
+
+impl InUseNow {
+    fn blocks(&self, track: &TrackDir) -> bool {
+        self.tracks.contains(&track.id) || self.dirs.contains(&track.dir)
+    }
+}
+
+/// One track's stems of one type.
+struct TrackDir {
+    dir: PathBuf,
+    id: String,
+    bytes: u64,
+    used: SystemTime,
+    /// Some stem is stored and every one is whole: no piece directory is left.
+    whole: bool,
+}
+
+/// How many `<model_id>/<type>/<track>` directories `root` holds.
+fn count_tracks(root: &Path) -> usize {
+    let subdirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    subdirs(root)
+        .iter()
+        .filter(|model| model.file_name().is_none_or(|n| n != FILES))
+        .flat_map(|model| subdirs(model))
+        .map(|kind| subdirs(&kind).len())
+        .sum()
+}
+
+/// Every `<model_id>/<type>/<track>` directory under `root`. A directory without
+/// a `.used` file counts as used when its newest file was written.
+fn track_dirs(root: &Path) -> Vec<TrackDir> {
+    let subdirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for model in subdirs(root) {
+        if model.file_name().is_some_and(|n| n == FILES) {
+            continue;
+        }
+        for kind in subdirs(&model) {
+            for dir in subdirs(&kind) {
+                let all = files(&dir);
+                let stem_file = |path: &Path| {
+                    path.file_name()
+                        .is_some_and(|n| ![INFO, USED, SEPARATION].contains(&&*n.to_string_lossy()))
+                };
+                let whole = subdirs(&dir).is_empty() && all.iter().any(|(p, _, _)| stem_file(p));
+                let marker = std::fs::metadata(dir.join(USED)).and_then(|m| m.modified());
+                let used = marker.unwrap_or_else(|_| {
+                    all.iter()
+                        .map(|(_, _, t)| *t)
+                        .max()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                });
+                out.push(TrackDir {
+                    id: dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bytes: all.iter().map(|(_, size, _)| size).sum(),
+                    used,
+                    whole,
+                    dir,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Decode a stored piece to the samples `encode_stem(_, format, 1.0)` turns back
+/// into the same bytes: 16-bit samples as `q / 32767`, `f32le` as stored.
+pub fn decode(bytes: Vec<u8>, format: StemFormat, channels: usize, rate: u32) -> Result<Audio> {
+    let planar = |samples: Vec<f32>| -> Result<Audio> {
+        anyhow::ensure!(
+            channels > 0 && samples.len().is_multiple_of(channels),
+            "{} samples do not divide into {channels} channels",
+            samples.len()
+        );
+        let mut data = vec![Vec::with_capacity(samples.len() / channels); channels];
+        for (i, v) in samples.into_iter().enumerate() {
+            data[i % channels].push(v);
+        }
+        Ok(Audio::new(data, rate))
+    };
+    let s16 = |raw: &[u8]| -> Vec<f32> {
+        raw.chunks_exact(2)
+            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / S16_SCALE)
+            .collect()
+    };
+    match format {
+        StemFormat::Pcm32 => planar(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        ),
+        StemFormat::Pcm16 => planar(s16(&bytes)),
+        // The 44-byte header `encode_stem` writes.
+        StemFormat::Wav => planar(s16(bytes
+            .get(44..)
+            .context("a wav piece without its header")?)),
+        StemFormat::Flac => {
+            // Symphonia reads `q` as `q / 32768`, which is exact in f32.
+            let decoded = stemd_audio::decode_flac(bytes)?;
+            anyhow::ensure!(
+                decoded.data.len() == channels,
+                "a flac piece with {} channels, not {channels}",
+                decoded.data.len()
+            );
+            let data = decoded
+                .data
+                .into_iter()
+                .map(|c| {
+                    c.into_iter()
+                        .map(|v| (v * 32768.0).round() / S16_SCALE)
+                        .collect()
+                })
+                .collect();
+            Ok(Audio::new(data, rate))
+        }
+        StemFormat::Mp3 => anyhow::bail!("mp3 is never stored as pieces"),
+    }
+}
+
+/// The multiplier `encode_stem` quantises 16-bit samples with.
+const S16_SCALE: f32 = 32767.0;
+
+/// Every part a piece directory holds: the parts, and the derived one.
+///
+/// Written whether or not a session asked for the derived part, so one type
+/// directory serves every session of that type.
+pub fn stems_of(output: &Output) -> Vec<&'static str> {
+    output.parts.names().chain(output.parts.derived()).collect()
+}
+
+/// Every file under `dir`, with its size and when it was last used.
+fn files(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let used = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((path, meta.len(), used));
+            }
+        }
+    }
+    out
+}
+
+/// Where the cache lives when no directory is configured.
 ///
 /// ```text
 /// macOS    ~/Library/Caches/stemd
@@ -281,7 +1048,7 @@ pub struct Cache {
 /// ```
 ///
 /// The cache root, not the data root: every byte here is derived. Model artefacts
-/// live under [`crate::models::support_dir`], outside the startup clear below.
+/// live under [`crate::models::support_dir`].
 ///
 /// Windows takes an extra component: `FOLDERID_LocalAppData` is what both
 /// `dirs::cache_dir` and `dirs::data_local_dir` return there.
@@ -303,9 +1070,6 @@ pub fn root(args: &crate::cli::Args) -> Result<PathBuf> {
         None => default_dir(),
     }
 }
-
-/// The lock file in the cache root, which the startup clear keeps.
-const LOCK_FILE: &str = "stemd.lock";
 
 /// Lock `root` for this process, or fail if another stemd holds it, whatever
 /// port that one serves on. The system releases the lock when the process ends.
@@ -330,1058 +1094,330 @@ pub fn lock(root: &Path) -> Result<std::fs::File> {
     }
 }
 
-impl Cache {
-    /// Prepare `root`, discarding whatever a previous run left behind.
-    ///
-    /// Whether an entry was ever pulled is not recorded on disk and rule 1 turns on
-    /// it, so start empty. Also disposes of any `.part` directory left by a kill
-    /// mid-write. The contents go, not the directory: `root` defaults to the whole
-    /// cache directory.
-    pub fn new(root: PathBuf, max_bytes: u64, unfetched_ttl: Duration) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        clear_contents(&root).with_context(|| format!("clearing {}", root.display()))?;
-        Ok(Arc::new(Self {
-            root,
-            entries: Mutex::new(HashMap::new()),
-            max_bytes,
-            unfetched_ttl,
-            seq: AtomicU64::new(0),
-            disk_aware: AtomicBool::new(true),
-        }))
-    }
-
-    /// Fetch an entry, marking it as used. `None` on a miss.
-    ///
-    /// An entry counts as a hit only while its files are there. This map decides what
-    /// exists and the bytes are read later by another request, so the two diverge
-    /// when something outside this process empties the root, such as a second
-    /// instance starting on the same directory.
-    pub fn get(&self, key: &str) -> Option<Arc<Entry>> {
-        let entry = {
-            //  Touched under the lock the sweep takes, so a hit and the decision to collect
-            //  cannot interleave.
-            let entries = self.entries.lock();
-            let entry = entries.get(key).cloned()?;
-            entry.touch();
-            entry.hand_out();
-            entry
-        };
-
-        if !entry.present() {
-            tracing::warn!(
-                "{} is in the index but not on disk; separating it again",
-                short(&entry.key)
-            );
-            let mut entries = self.entries.lock();
-            // Only if it is still the one that went missing: a publish may have
-            // replaced it under this key in the meantime.
-            if entries
-                .get(key)
-                .is_some_and(|held| Arc::ptr_eq(held, &entry))
-            {
-                entries.remove(key);
-                entry.evicted.store(true, Ordering::SeqCst);
-            }
-            return None;
-        }
-        Some(entry)
-    }
-
-    /// Delete every entry and its stems. Returns the tracks and bytes freed.
-    ///
-    /// A download already reading its file finishes from the open descriptor; one
-    /// that has not opened yet gets a 410.
-    pub fn clear(&self) -> (usize, u64) {
-        let mut entries = self.entries.lock();
-        let tracks = entries.len();
-        let freed = entries.values().map(|entry| entry.bytes).sum();
-        for entry in entries.values() {
-            self.delete(entry);
-        }
-        entries.clear();
-        (tracks, freed)
-    }
-
-    /// Delete `entry` and its stems now, unless it was replaced under its key or
-    /// [`Cache::get`] has handed it to anyone. Returns whether it went.
-    pub fn discard_unshared(&self, entry: &Arc<Entry>) -> bool {
-        let mut entries = self.entries.lock();
-        let ours = entries
-            .get(&entry.key)
-            .is_some_and(|held| Arc::ptr_eq(held, entry));
-        if !ours || entry.handed_out.load(Ordering::SeqCst) {
-            return false;
-        }
-        entries.remove(&entry.key);
-        self.delete(entry);
-        true
-    }
-
-    /// One consistent snapshot, rather than three locks that can disagree.
-    pub fn stats(&self) -> Stats {
-        let entries = self.entries.lock();
-        Stats {
-            tracks: entries.len(),
-            bytes: entries.values().map(|e| e.bytes).sum(),
-            max_bytes: self.max_bytes,
-        }
-    }
-
-    /// How often both rules are applied.
-    ///
-    /// A fifth of the deadline they enforce, derived rather than constant so a short
-    /// `--unfetched-ttl` keeps its meaning.
-    pub fn sweep_interval(&self) -> Duration {
-        (self.unfetched_ttl / SWEEPS_PER_TTL).clamp(MIN_SWEEP, MAX_SWEEP)
-    }
-
-    /// Write the shipped stems and make them visible under `key`.
-    pub fn publish(
-        &self,
-        key: &str,
-        mix: &Audio,
-        stems: &Stems,
-        output: Output,
-        separation_secs: f64,
-    ) -> Result<Arc<Entry>> {
-        // Converted before encoding, so an entry holds exactly the bytes a
-        // client is handed and a hit costs no further work.
-        let shipped = to_output_rate(mix, stems, &output)?;
-
-        let dir = self.root.join(key);
-        let staging = self.staging_dir(key)?;
-        let written = write_stems(&staging, &dir, &shipped, output.format)
-            .and_then(|files| install(&staging, &dir).map(|()| files));
-        let files = match written {
-            Ok(files) => files,
-            Err(err) => {
-                // A half-written entry would hold its bytes until the next start.
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(err);
-            }
-        };
-
-        let entry = Arc::new(Entry {
-            key: key.to_owned(),
-            bytes: files.iter().map(|f| f.bytes).sum(),
-            stems: files,
-            dir,
-            // The geometry a client receives: the stems' after conversion,
-            // not the mix's that produced them.
-            sample_rate: output.rate.hz(),
-            channels: mix.channels(),
-            frames: shipped.first().map_or(0, |(_, audio)| audio.frames()),
-            format: output.format,
-            model_residual_db: stems.model_residual_db,
-            derived: output.parts.derived(),
-            separation_secs,
-            evicted: AtomicBool::new(false),
-            handed_out: AtomicBool::new(false),
-            state: Mutex::new(State {
-                unfetched: shipped.iter().map(|(name, _)| (*name).to_owned()).collect(),
-                last_used: Instant::now(),
-            }),
-        });
-
-        let mut entries = self.entries.lock();
-        entries.insert(key.to_owned(), Arc::clone(&entry));
-        // Apply the cap now rather than waiting for the sweep: a burst of long
-        // tracks would otherwise sit over budget for a whole interval.
-        let (rotated, freed) = self.enforce_cap(&mut entries);
-        if rotated > 0 {
-            tracing::info!(
-                "cache over budget, rotated {rotated} entries ({:.0} MB)",
-                freed as f64 / 1e6
-            );
-        }
-        Ok(entry)
-    }
-
-    /// A fresh directory beside the final name.
-    ///
-    /// Written to and then renamed, so a kill mid-write cannot leave behind a
-    /// directory that looks like a complete entry.
-    fn staging_dir(&self, key: &str) -> Result<PathBuf> {
-        let staging = self.root.join(format!(
-            "{key}.{}.part",
-            self.seq.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&staging)
-            .with_context(|| format!("creating {}", staging.display()))?;
-        Ok(staging)
-    }
-
-    /// Apply both rules. Returns what it collected. Nothing is deleted while the
-    /// store fits.
-    pub fn reap(&self) -> Reaped {
-        let mut entries = self.entries.lock();
-        let now = Instant::now();
-        let mut reaped = Reaped::default();
-
-        // Rule 1: space is starting to matter, so give up the separations nobody
-        // came back for before rule 2 has to touch any that were wanted.
-        if self.under_pressure(&entries) {
-            entries.retain(|_, entry| {
-                let idle = now.duration_since(entry.last_used());
-                if entry.consumed() || idle <= self.unfetched_ttl {
-                    return true;
-                }
-                tracing::debug!(
-                    "reaping {} ({:.0} MB): separated {:.0}s ago, never pulled, \
-                     and the store is filling up",
-                    short(&entry.key),
-                    entry.bytes as f64 / 1e6,
-                    idle.as_secs_f64()
-                );
-                reaped.unfetched += 1;
-                reaped.bytes += entry.bytes;
-                self.delete(entry);
-                false
-            });
-        }
-
-        // Rule 2: still over budget.
-        let (rotated, freed) = self.enforce_cap(&mut entries);
-        reaped.rotated = rotated;
-        reaped.bytes += freed;
-        reaped
-    }
-
-    /// Is the store full enough that an uncollected entry is worth its space?
-    ///
-    /// Half the budget. [`Cache::publish`] enforces the cap on its way out and leaves
-    /// the store under it, so waiting for the cap would make rule 1 nearly
-    /// unreachable.
-    fn under_pressure(&self, entries: &HashMap<String, Arc<Entry>>) -> bool {
-        let total = total_bytes(entries);
-        total > self.budget(total) / 2
-    }
-
-    /// The cap, or less when the disk is short of [`crate::disk::FLOOR`].
-    fn budget(&self, total: u64) -> u64 {
-        if self.disk_aware.load(Ordering::Relaxed) {
-            crate::disk::budget(self.max_bytes, total, &self.root)
-        } else {
-            self.max_bytes
-        }
-    }
-
-    /// Hold to the cap alone, whatever the disk has free, so tests do not
-    /// depend on the machine running them.
-    #[cfg(test)]
-    pub fn ignore_disk(&self) {
-        self.disk_aware.store(false, Ordering::Relaxed);
-    }
-
-    /// The directory the stems live in.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Drop least-recently-used entries until the store fits.
-    fn enforce_cap(&self, entries: &mut HashMap<String, Arc<Entry>>) -> (usize, u64) {
-        let mut total = total_bytes(entries);
-        let budget = self.budget(total);
-        if total <= budget {
-            return (0, 0);
-        }
-
-        let mut order: Vec<(Instant, String)> = entries
-            .values()
-            .map(|e| (e.last_used(), e.key.clone()))
-            .collect();
-        order.sort_by_key(|(used, _)| *used);
-        // Never rotate the most recent entry: it is the one a job is most
-        // likely still holding, and a single track larger than the whole budget
-        // would otherwise be separated and discarded in the same breath.
-        order.pop();
-
-        let mut count = 0;
-        let mut freed = 0;
-        for (_, key) in order {
-            if total <= budget {
-                break;
-            }
-            if let Some(entry) = entries.remove(&key) {
-                total -= entry.bytes;
-                freed += entry.bytes;
-                count += 1;
-                self.delete(&entry);
-            }
-        }
-        (count, freed)
-    }
-
-    /// Remove an entry's directory and mark it evicted.
-    ///
-    /// Safe while a client is streaming one of its stems: the handler opens the file
-    /// first, and an unlinked file stays readable through an open descriptor. A fetch
-    /// that has not opened yet gets a 410.
-    fn delete(&self, entry: &Entry) {
-        entry.evicted.store(true, Ordering::SeqCst);
-        if let Err(err) = std::fs::remove_dir_all(&entry.dir) {
-            tracing::warn!("could not remove {}: {err}", entry.dir.display());
-        }
-    }
-}
-
-/// Delete everything inside `dir`, leaving the directory itself in place.
-fn clear_contents(dir: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.file_name().is_some_and(|name| name == LOCK_FILE) {
-            continue;
-        }
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
-
-/// The parts an entry stores, converted to the requested output rate.
-///
-/// The parts `output.parts` names, then the derived part when asked for. That one
-/// is computed here at the native rate as `mix` minus the shipped parts, which is
-/// exact and carries the model's residual, then put through the same filter as the
-/// others. Resampling is linear, so the set still sums to the resampled mix.
-///
-/// Separation runs at the model's rate and this is the only place the output rate
-/// is applied, so the cached bytes and the rate an entry reports cannot disagree.
-pub(crate) fn to_output_rate(
-    mix: &Audio,
-    stems: &Stems,
-    output: &Output,
-) -> Result<Vec<(&'static str, Audio)>> {
-    let mut parts: Vec<(&'static str, &Audio)> = Vec::new();
-    for name in output.parts.names() {
-        let audio = stems
-            .stem(name)
-            .with_context(|| format!("this separation has no {name}"))?;
-        parts.push((name, audio));
-    }
-    let derived = if output.derived {
-        output.parts.derived().map(|name| {
-            (
-                name,
-                stemd_core::stems::remainder(mix, parts.iter().map(|(_, audio)| *audio)),
-            )
-        })
-    } else {
-        None
-    };
-    let parts: Vec<(&'static str, &Audio)> = parts
-        .into_iter()
-        .chain(derived.iter().map(|(name, audio)| (*name, audio)))
-        .collect();
-
-    //  Concurrent for every rate rather than by case: the 48 kHz path does not
-    //  oversubscribe the way nesting suggests, the 96 kHz one is memory-bound and
-    //  gains nothing however it is arranged, and at the model's own rate this is a
-    //  clone. See `is_converting_three_stems_at_once_worth_it`.
-    std::thread::scope(|scope| {
-        let running: Vec<_> = parts
-            .iter()
-            .map(|(name, audio)| scope.spawn(|| one_rate(name, audio, output)))
-            .collect();
-        running
-            .into_iter()
-            .map(|thread| {
-                thread
-                    .join()
-                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
-            })
-            .collect()
-    })
-}
-
-fn one_rate(name: &'static str, audio: &Audio, output: &Output) -> Result<(&'static str, Audio)> {
-    let began = std::time::Instant::now();
-    let converted = output
-        .dsp
-        .convert(audio, output.rate.hz())
-        .with_context(|| format!("converting {name} to {} Hz", output.rate))?;
-    //  Timed because which of conversion and encode dominates depends on the format
-    //  asked for.
-    tracing::debug!(
-        "{name}: {} -> {} Hz in {:.2?}",
-        audio.sample_rate,
-        output.rate,
-        began.elapsed()
-    );
-    Ok((name, converted))
-}
-
-/// Encode each shipped stem into `staging`, described by its eventual path under
-/// `dir`.
-///
-/// One thread per stem, at most three, so the stage costs the longest encode
-/// rather than the sum. `scope` lets each thread borrow its stem instead of
-/// copying it.
-fn write_stems(
-    staging: &Path,
-    dir: &Path,
-    shipped: &[(&'static str, Audio)],
-    format: StemFormat,
-) -> Result<Vec<CachedStem>> {
-    std::thread::scope(|scope| {
-        let running: Vec<_> = shipped
-            .iter()
-            .map(|(name, audio)| scope.spawn(|| one_stem(staging, dir, name, audio, format)))
-            .collect();
-        running
-            .into_iter()
-            // A panic in an encoder is re-raised here rather than turned into an
-            // error: it is a bug, and the caller's `?` would file it under
-            // "could not write the stems".
-            .map(|thread| {
-                thread
-                    .join()
-                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
-            })
-            .collect()
-    })
-}
-
-fn one_stem(
-    staging: &Path,
-    dir: &Path,
-    name: &'static str,
-    audio: &Audio,
-    format: StemFormat,
-) -> Result<CachedStem> {
-    //  One traversal for both the peak the transfer gain needs and the non-finite
-    //  check. The stem is named here so the failure says which part diverged.
-    let peak = audio
-        .peak()
-        .with_context(|| format!("the separated {name} is not finite"))?;
-    let gain = transfer_gain(peak, format);
-    if gain < 1.0 {
-        tracing::debug!("{name} peaks at {peak:.3}, scaling by {gain:.4}");
-    }
-
-    let file = format!("{name}.{}", format.extension());
-    let began = std::time::Instant::now();
-    let bytes = stemd_core::encode_stem(audio, format, gain)?;
-    let encoded = began.elapsed();
-
-    let began = std::time::Instant::now();
-    std::fs::write(staging.join(&file), &bytes)
-        .with_context(|| format!("writing {} into {}", file, staging.display()))?;
-    // Fractional, because integer megabytes render every stem under one as
-    // "0 MB", which is most of them at 320 kbps.
-    tracing::debug!(
-        "{file}: encoded {:.1} MB in {:.2?}, wrote it in {:.2?}",
-        bytes.len() as f64 / 1_048_576.0,
-        encoded,
-        began.elapsed()
-    );
-
-    Ok(CachedStem {
-        name: name.to_owned(),
-        path: dir.join(&file),
-        bytes: bytes.len() as u64,
-        gain,
-    })
-}
-
-/// Scale that keeps a stem inside the output format's range.
-///
-/// A separated stem is not bounded by the mix: the model over-subtracts in places,
-/// so one peaking past full scale is scaled to fit. `f32le` has no ceiling and
-/// always ships at unity. Takes the peak rather than the buffer, which
-/// [`one_stem`] has already computed.
-const fn transfer_gain(peak: f32, format: StemFormat) -> f32 {
-    if format.has_headroom() || peak <= 1.0 {
-        1.0
-    } else {
-        1.0 / peak
-    }
-}
-
-/// Move a staged directory into place, replacing whatever was there.
-fn install(staging: &Path, dir: &Path) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).with_context(|| format!("replacing {}", dir.display()))?;
-    }
-    std::fs::rename(staging, dir)
-        .with_context(|| format!("publishing {} as {}", staging.display(), dir.display()))
-}
-
-/// A consistent view of what the cache is holding.
-#[derive(Debug, Clone, Copy)]
-pub struct Stats {
-    pub tracks: usize,
-    pub bytes: u64,
-    pub max_bytes: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::testkit::{cache, publish};
+    use stemd_core::{OutputRate, Parts};
 
     #[test]
-    fn a_second_lock_on_the_same_root_fails_and_survives_the_startup_clear() {
+    fn a_second_lock_on_the_same_root_fails() {
         let root = std::env::temp_dir().join(format!("stemd-lock-test-{}", std::process::id()));
         let held = lock(&root).unwrap();
         let err = lock(&root).unwrap_err();
         assert!(err.to_string().contains("already running"), "{err:#}");
-        clear_contents(&root).unwrap();
         assert!(root.join(LOCK_FILE).exists());
         drop(held);
         lock(&root).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A 200 must be followed by stems the client can actually download.
-    ///
-    /// The TTL is zero so every published entry is collectable at once; a nonzero one
-    /// would make the collision depend on scheduling. The sweeper yields rather than
-    /// spinning.
     #[test]
-    fn a_hit_is_never_handed_out_after_its_stems_are_gone() {
-        // A budget of one byte, so the store is always past the mark where
-        // uncollected entries are collectable. With `u64::MAX` the sweeper now
-        // correctly finds a store with room and deletes nothing, and there is no
-        // race left to run.
-        let cache = cache(1, Duration::ZERO);
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let sweeper = {
-            let cache = Arc::clone(&cache);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut collected = 0;
-                while !stop.load(Ordering::SeqCst) {
-                    collected += cache.reap().unfetched;
-                    std::thread::yield_now();
-                }
-                collected
-            })
-        };
-
-        for i in 0..300 {
-            let entry = publish(&cache, &format!("track-{i}"), 64, 1.0);
-            if let Some(hit) = cache.get(&entry.key) {
-                // Present, or tombstoned: never neither. `delete` raises
-                // `evicted` before it unlinks, so an entry whose stems have gone
-                // always says so. That is the guarantee a job depends on:
-                // whatever it is handed is either usable or admits it is gone.
-                assert!(
-                    hit.present() || hit.evicted(),
-                    "handed out {} with its stems deleted and no tombstone",
-                    short(&hit.key)
-                );
-            }
-        }
-
-        stop.store(true, Ordering::SeqCst);
-        let collected = sweeper.join().unwrap();
-        // Without this the test passes just as happily when the sweeper never
-        // ran, and the assertion above stops guarding anything.
-        assert!(collected > 0, "the sweeper collected nothing to race with");
+    fn a_file_key_seen_with_two_tracks_names_neither() {
+        let root = std::env::temp_dir().join(format!("stemd-files-test-{}", std::process::id()));
+        let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+        let (key, a, b) = ("aa".repeat(12), "11".repeat(12), "22".repeat(12));
+        assert_eq!(cache.file_track(&key), None);
+        cache.record_file(&key, &a).expect("recorded");
+        cache.record_file(&key, &a).expect("recorded again");
+        assert_eq!(cache.file_track(&key), Some(a.clone()));
+        cache.record_file(&key, &b).expect("recorded");
+        assert_eq!(cache.file_track(&key), None, "ambiguous");
+        cache.record_file(&key, &a).expect("recorded");
+        assert_eq!(cache.file_track(&key), None, "stays ambiguous");
+        let reopened = Cache::open(root.clone(), 1 << 20).expect("reopen");
+        assert_eq!(reopened.file_track(&key), None);
+        assert!(
+            track_dirs(&root).is_empty(),
+            "aliases are not track directories"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A diverged model must fail the job, not fill the cache with silence.
-    ///
-    /// NaN peaks at 0.0 and quantises to 0, so the entry would be a well-formed set of
-    /// stems that decode to nothing, cached under a key asserting they are what a
-    /// fresh separation would produce. The error names the stem, since only one half
-    /// diverged.
     #[test]
-    fn a_stem_of_nan_fails_the_job_instead_of_being_published() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let (mix, mut parts) = crate::testkit::stems(64);
-        // Only the vocals, so the assertion below is about *which* stem is
-        // named rather than about there being a name at all.
-        for (name, audio) in &mut parts.shipped {
-            if *name == "vocals" {
-                audio.data = audio.data.iter().map(|c| vec![f32::NAN; c.len()]).collect();
-            }
-        }
+    fn type_dir_names_every_setting_that_changes_the_bytes() {
+        let mut output = Output {
+            format: StemFormat::Flac,
+            rate: OutputRate::default(),
+            derived: false,
+            dsp: stemd_core::DspMode::General.into(),
+            parts: Parts::DEFAULT,
+        };
+        assert_eq!(
+            type_dir(&output, std::f32::consts::FRAC_1_SQRT_2),
+            "flac-44100-harmonics.vocals-g0.70710677"
+        );
+        output.dsp = stemd_core::DspMode::Mode1.into();
+        output.rate = OutputRate::Hz96000;
+        assert_eq!(
+            type_dir(&output, 1.0),
+            "flac-96000-dsp1-harmonics.vocals-g1"
+        );
+        output.derived = true;
+        assert_eq!(
+            type_dir(&output, 1.0),
+            "flac-96000-dsp1-harmonics.vocals-g1",
+            "the derived part is one more file, not another type"
+        );
 
-        let err = cache
-            .publish(
-                "diverged",
-                &mix,
-                &parts,
-                Output {
-                    format: StemFormat::Pcm16,
-                    rate: OutputRate::default(),
-                    derived: false,
-                    dsp: stemd_core::DspMode::default().into(),
-                    parts: Parts::DEFAULT,
-                },
-                1.0,
+        let body = crate::filters::encode(44_100, 96_000, &[1.0; 320]);
+        let id = crate::filters::id_of(&body);
+        output.dsp = crate::filters::Dsp::Fir(std::sync::Arc::new(crate::filters::Fir {
+            id: id.clone(),
+            poly: crate::filters::parse(&body).unwrap(),
+        }));
+        assert_eq!(
+            type_dir(&output, 1.0),
+            format!("flac-96000-fir{id}-harmonics.vocals-g1")
+        );
+    }
+
+    fn root() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "stemd-pieces-unit-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn a_reopened_store_keeps_its_pieces_and_drops_partial_writes() {
+        let root = root();
+        let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+        let dir = cache.verified_dir("model", "type", "track");
+        cache
+            .write_verified(&dir, "vocals", 0, "flac", &[1; 100])
+            .expect("write");
+        std::fs::write(dir.join("vocals").join("0001.flac.part"), [0; 50]).expect("partial");
+        drop(cache);
+
+        let reopened = Cache::open(root, 1 << 20).expect("reopen");
+        assert_eq!(reopened.bytes(), 100);
+        assert!(Cache::lookup(&dir, "vocals", 0, "flac").is_some());
+        assert!(!dir.join("vocals").join("0001.flac.part").exists());
+    }
+
+    /// Two pieces of 300 bytes for each of `tracks`, oldest first.
+    fn fill(cache: &Cache, tracks: &[&str]) {
+        for track in tracks {
+            let dir = cache.verified_dir("model", "type", track);
+            for stem in ["vocals", "harmonics"] {
+                cache
+                    .write_verified(&dir, stem, 0, "flac", &[0; 300])
+                    .expect("write");
+            }
+            // Distinct modification times.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn present(cache: &Cache, track: &str) -> Vec<&'static str> {
+        ["vocals", "harmonics"]
+            .into_iter()
+            .filter(|stem| {
+                cache
+                    .verified_dir("model", "type", track)
+                    .join(stem)
+                    .join(file(0, "flac"))
+                    .is_file()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn over_the_budget_the_least_recently_used_track_is_deleted() {
+        let cache = Cache::open(root(), 1300).expect("open");
+        fill(&cache, &["a", "b"]);
+        // Reading `a` makes `b` the least recently used.
+        assert!(
+            Cache::lookup(
+                &cache.verified_dir("model", "type", "a"),
+                "vocals",
+                0,
+                "flac"
             )
-            .expect_err("a stem of NaN must not publish");
-
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("vocals") && message.contains("not a finite"),
-            "the failure has to name the stem: {message}"
+            .is_some()
         );
-        //  Nothing indexed, so no later request can hit a half-written entry. The `.part`
-        //  staging directory survives, and `Cache::new` clears those at startup.
-        assert!(cache.get("diverged").is_none());
-        assert_eq!(cache.stats().tracks, 0);
-    }
-
-    /// What a drop does once its stems are copied out: that entry goes, others stay.
-    #[test]
-    fn discarding_takes_one_entry_and_its_stems() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let dropped = publish(&cache, "dropped", 64, 1.0);
-        let kept = publish(&cache, "kept", 32, 1.0);
-
-        assert!(cache.discard_unshared(&dropped));
-        assert!(!dropped.dir.exists() && dropped.evicted());
-        assert!(cache.get(&dropped.key).is_none());
-        assert!(kept.dir.exists() && cache.get(&kept.key).is_some());
-        assert_eq!(cache.stats().tracks, 1);
-    }
-
-    /// An entry someone was handed by a hit stays, whoever made it.
-    #[test]
-    fn an_entry_handed_out_is_not_discarded() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let made = publish(&cache, "shared", 64, 1.0);
-        let _hit = cache.get(&made.key).expect("a hit");
-        assert!(!cache.discard_unshared(&made));
-        assert!(made.dir.exists());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fill(&cache, &["c"]);
+        assert!(cache.bytes() <= 1300, "{} bytes kept", cache.bytes());
+        assert_eq!(present(&cache, "b"), Vec::<&str>::new());
+        assert_eq!(present(&cache, "a"), vec!["vocals", "harmonics"]);
+        assert_eq!(present(&cache, "c"), vec!["vocals", "harmonics"]);
     }
 
     #[test]
-    fn clearing_takes_the_index_and_the_stems_together() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let first = publish(&cache, "one", 64, 1.0);
-        let second = publish(&cache, "two", 32, 1.0);
+    fn eviction_skips_the_tracks_open_sessions_play() {
+        let cache = Cache::open(root(), 1300).expect("open");
+        cache.set_in_use(Box::new(|| HashSet::from(["a".to_owned()])));
+        fill(&cache, &["a", "b", "c"]);
+        assert_eq!(present(&cache, "a"), vec!["vocals", "harmonics"]);
+        assert_eq!(present(&cache, "b"), Vec::<&str>::new());
+    }
 
-        let (tracks, freed) = cache.clear();
-        assert_eq!(tracks, 2);
-        assert_eq!(freed, first.bytes + second.bytes);
-        assert_eq!(cache.stats().tracks, 0);
-        assert!(!first.dir.exists() && !second.dir.exists());
-        assert!(
-            first.evicted() && second.evicted(),
-            "a job still holding one has to be able to tell"
+    /// A track whose two stems are stored whole, 300 bytes each.
+    fn store_whole(cache: &Cache, track: &str) {
+        let task = Consolidation::at_44100(
+            cache.verified_dir("model", "type", track),
+            StemFormat::Pcm16,
+            150,
         );
-        assert!(cache.get(&first.key).is_none());
-    }
-
-    #[test]
-    fn an_entry_whose_files_vanished_is_a_miss_not_a_broken_hit() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let entry = publish(&cache, "wiped", 64, 1.0);
-        assert!(cache.get(&entry.key).is_some());
-
-        // What a second server does to the root on startup, before it finds
-        // out the port is taken.
-        std::fs::remove_dir_all(&entry.dir).unwrap();
-
-        assert!(
-            cache.get(&entry.key).is_none(),
-            "a hit here promises stems that would 410 on download"
-        );
-        assert!(entry.evicted(), "the job holding it must be told");
-        assert_eq!(cache.stats().tracks, 0, "the phantom must leave the index");
-    }
-
-    /// An expired TTL alone is not reason enough to collect: it threw away real
-    /// separations out of a store nowhere near its budget.
-    #[test]
-    fn an_entry_nobody_pulls_survives_while_there_is_room_for_it() {
-        let cache = cache(u64::MAX, Duration::from_millis(30));
-        let entry = publish(&cache, "abandoned", 64, 1.0);
-        assert!(entry.dir.exists());
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        assert_eq!(cache.reap().unfetched, 0, "the store is nowhere near full");
-        assert!(!entry.evicted());
-        assert!(entry.dir.exists(), "the stems are still worth having");
-    }
-
-    /// But it is still the first thing to give up once room starts to matter.
-    ///
-    /// An entry is 512 B, so a budget of 1500 holds both with room to spare: under the
-    /// cap, so rule 2 stays out of it, and over half, so rule 1 is awake.
-    #[test]
-    fn an_entry_nobody_pulls_is_the_first_to_go_once_room_matters() {
-        let cache = cache(1500, Duration::from_millis(30));
-        let wanted = publish(&cache, "wanted", 64, 1.0);
-        for stem in &wanted.stems {
-            wanted.mark_fetched(&stem.name);
+        for stem in ["vocals", "harmonics"] {
+            cache
+                .consolidate(&task, stem, &[0; 300], 150, Some(0))
+                .expect("store");
         }
-        let abandoned = publish(&cache, "abandoned", 64, 1.0);
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        let reaped = cache.reap();
-        assert_eq!(
-            reaped.unfetched, 1,
-            "the abandoned entry pays for the space"
-        );
-        assert!(abandoned.evicted(), "the job holding it must be told");
-        assert!(!abandoned.dir.exists(), "the stems must go with the entry");
-        assert!(!wanted.evicted(), "the entry somebody collected stays");
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    #[test]
-    fn an_entry_whose_stems_were_all_pulled_survives() {
-        let cache = cache(u64::MAX, Duration::from_millis(30));
-        let entry = publish(&cache, "wanted", 64, 1.0);
-        for stem in &entry.stems {
-            entry.mark_fetched(&stem.name);
-        }
-        assert!(entry.consumed());
-
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(cache.reap().unfetched, 0);
-        assert!(!entry.evicted());
+    fn exists(cache: &Cache, track: &str) -> bool {
+        cache.verified_dir("model", "type", track).is_dir()
     }
 
-    #[test]
-    fn a_partial_fetch_restarts_the_idle_clock() {
-        let cache = cache(u64::MAX, Duration::from_millis(60));
-        let entry = publish(&cache, "half", 64, 1.0);
-
-        // A deck that pulls one stem and is midway through the second must not
-        // have the entry deleted out from under it.
-        std::thread::sleep(Duration::from_millis(40));
-        entry.mark_fetched(&entry.stems[0].name);
-        std::thread::sleep(Duration::from_millis(40));
-
-        assert!(!entry.consumed(), "one stem is still outstanding");
-        assert_eq!(cache.reap().unfetched, 0, "the fetch reset the clock");
-        assert!(!entry.evicted());
-    }
-
-    #[test]
-    fn the_cap_rotates_the_least_recently_used_first() {
-        // Two stems of 64 frames x 2 ch x 2 bytes = 512 B per entry, so a
-        // budget of 1100 holds exactly two of the three.
-        let cache = cache(1100, Duration::from_secs(3600));
-        let old = publish(&cache, "oldest", 64, 1.0);
-        let mid = publish(&cache, "middle", 64, 1.0);
-        for entry in [&old, &mid] {
-            for stem in &entry.stems {
-                entry.mark_fetched(&stem.name);
-            }
-        }
-        // Re-use the older one so recency, not insertion order, decides.
-        std::thread::sleep(Duration::from_millis(2));
-        old.touch();
-        std::thread::sleep(Duration::from_millis(2));
-
-        let third = publish(&cache, "newest", 64, 1.0);
-        assert_eq!(old.bytes, 512, "the budget above assumes this size");
-        assert!(cache.stats().bytes <= 1100, "publish must apply the cap");
-        assert!(mid.evicted(), "least recently used goes first");
-        assert!(!old.evicted());
-        assert!(!third.evicted());
-        assert!(!mid.dir.exists());
-        assert!(third.dir.exists());
-    }
-
-    #[test]
-    fn the_newest_entry_survives_a_budget_it_alone_exceeds() {
-        let cache = cache(16, Duration::from_secs(3600));
-        let entry = publish(&cache, "huge", 512, 1.0);
-        assert!(
-            !entry.evicted(),
-            "separating and immediately discarding is worse than being over budget"
-        );
-        assert!(entry.dir.exists());
-    }
-
-    fn output(rate: OutputRate, derived: bool) -> Output {
-        Output {
-            format: StemFormat::Pcm16,
-            rate,
-            derived,
-            dsp: stemd_core::DspMode::default().into(),
-            parts: Parts::DEFAULT,
+    fn rules(max_bytes: u64, partial: u64, whole: u64) -> Rules {
+        Rules {
+            max_bytes,
+            partial_max_age: std::time::Duration::from_millis(partial),
+            whole_max_age: std::time::Duration::from_millis(whole),
+            unfetched_ttl: std::time::Duration::from_secs(60),
         }
     }
 
-    /// Two stems by default, at every rate. The rate does not decide what
-    /// ships: only the client's request does.
     #[test]
-    fn what_ships_is_the_request_not_the_rate() {
-        let (mix, stems) = crate::testkit::stems(4410);
-        for rate in OutputRate::ALL {
-            let parts = to_output_rate(&mix, &stems, &output(rate, false)).unwrap();
-            let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
-            assert_eq!(names, stemd_core::SHIPPED, "{rate} changed what ships");
+    fn a_track_unused_past_its_age_is_deleted_partial_and_whole_alike() {
+        let cache = Cache::open_with(root(), rules(1 << 20, 30, 3_600_000)).expect("open");
+        fill(&cache, &["partial"]);
+        store_whole(&cache, "whole");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        cache.clean();
+        assert!(!exists(&cache, "partial"), "a partial track past a day");
+        assert!(exists(&cache, "whole"), "a whole track inside 30 days");
 
-            let parts = to_output_rate(&mix, &stems, &output(rate, true)).unwrap();
-            let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
-            assert_eq!(
-                names.len(),
-                stemd_core::SHIPPED.len() + 1,
-                "{rate}: {names:?}"
-            );
-            assert_eq!(
-                names.last(),
-                Some(&stemd_core::DERIVED),
-                "{rate}: {names:?}"
-            );
-            for (name, audio) in &parts {
-                assert_eq!(audio.sample_rate, rate.hz(), "{name} at the wrong rate");
-            }
-        }
+        let cache = Cache::open_with(root(), rules(1 << 20, 3_600_000, 30)).expect("open");
+        store_whole(&cache, "whole");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        cache.clean();
+        assert!(!exists(&cache, "whole"));
+        assert_eq!(cache.bytes(), 0);
     }
 
-    /// A job's own parts ship in [`stemd_core::PART_NAMES`] order, the derived
-    /// part is what they leave out, and the set still sums to the mix.
     #[test]
-    fn a_parts_list_ships_those_parts_and_rebuilds_the_rest() {
-        let (mix, mut stems) = crate::testkit::stems(4410);
-        let harmonics = stems.stem("harmonics").unwrap().clone();
-        let bass = Audio::new(
-            harmonics
-                .data
-                .iter()
-                .map(|c| c.iter().map(|v| v * 0.25).collect())
-                .collect(),
-            harmonics.sample_rate,
-        );
-        let other = stemd_core::stems::minus(&harmonics, &bass);
-        stems.more = vec![("bass", bass), ("other", other)];
+    fn over_the_budget_partial_tracks_go_before_whole_ones() {
+        let cache = Cache::open(root(), 1 << 20).expect("open");
+        store_whole(&cache, "old-whole");
+        fill(&cache, &["new-partial"]);
+        store_whole(&cache, "newest-whole");
+        // Just over: deleting the partial track is enough.
+        let budget = cache.bytes() - 100;
+        let cache = Cache::open(cache.root().to_owned(), budget).expect("reopen");
+        assert!(!exists(&cache, "new-partial"), "partial goes first");
+        assert!(exists(&cache, "old-whole"));
+        assert!(exists(&cache, "newest-whole"));
+    }
 
+    #[test]
+    fn a_job_result_is_kept_until_every_stem_is_fetched() {
+        let cache = Cache::open(root(), 1300).expect("open");
+        store_whole(&cache, "held");
+        let dir = cache.verified_dir("model", "type", "held");
         let output = Output {
-            parts: Parts::parse("vocals,other,bass").unwrap(),
-            ..output(OutputRate::Hz44100, true)
+            format: StemFormat::Pcm16,
+            rate: OutputRate::default(),
+            derived: false,
+            dsp: stemd_core::DspMode::General.into(),
+            parts: Parts::parse("vocals,harmonics").unwrap(),
         };
-        let parts = to_output_rate(&mix, &stems, &output).unwrap();
-        let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["vocals", "bass", "other", "drums"]);
-
-        let sum = parts.iter().fold(mix.clone(), |rest, (_, audio)| {
-            stemd_core::stems::minus(&rest, audio)
-        });
-        let peak = sum.data.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
-        assert!(peak < 1e-5, "the parts miss the mix by {peak}");
-
-        let missing = Output {
-            parts: Parts::parse("drums,vocals").unwrap(),
-            ..output
-        };
-        let (_, plain) = crate::testkit::stems(4410);
-        assert!(
-            to_output_rate(&mix, &plain, &missing).is_err(),
-            "no drums estimate to ship"
-        );
+        let entry = Arc::new(Entry::stored(&dir, &output, 1.0, 2, None).expect("whole"));
+        cache.hold(&entry);
+        store_whole(&cache, "next");
+        assert!(exists(&cache, "held"), "kept while unfetched");
+        entry.mark_fetched("harmonics");
+        entry.mark_fetched("vocals");
+        store_whole(&cache, "last");
+        assert!(!exists(&cache, "held"), "fetched, so it goes first");
     }
 
-    /// Asking for the derived part must not be answerable from an entry that
-    /// does not hold it: the request changes the files, so it changes the key.
     #[test]
-    fn the_derived_request_is_its_own_entry() {
-        let base = Ingredients {
-            pcm: b"same samples",
-            sample_rate: 44100,
-            channels: 2,
-            in_format: PcmFormat::S16le,
-            out_format: StemFormat::Pcm16,
-            out_rate: OutputRate::Hz44100,
-            include_derived: false,
-            parts: Parts::DEFAULT,
-            dsp: &Dsp::default(),
-            model: "digest",
-        };
-        assert_ne!(
-            key(&base),
-            key(&Ingredients {
-                include_derived: true,
-                ..base
-            })
-        );
-        assert_ne!(
-            key(&base),
-            key(&Ingredients {
-                parts: Parts::parse("bass,other,vocals").unwrap(),
-                ..base
-            })
-        );
+    fn a_reopened_cache_drops_the_old_job_entries_and_keeps_tracks() {
+        let root = root();
+        let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+        store_whole(&cache, "kept");
+        let old = root.join("ab".repeat(32));
+        std::fs::create_dir_all(&old).expect("an old entry");
+        std::fs::write(old.join("vocals.flac"), [0; 10]).expect("an old stem");
+        std::fs::write(root.join(LOCK_FILE), []).expect("a lock file");
+        drop(cache);
+        let cache = Cache::open(root.clone(), 1 << 20).expect("reopen");
+        assert!(!old.exists());
+        assert!(exists(&cache, "kept"));
+        assert_eq!(cache.stats().tracks, 1);
+
+        cache.wipe();
+        assert!(!exists(&cache, "kept"));
+        assert!(root.join(LOCK_FILE).exists(), "the lock stays");
+        assert_eq!(cache.bytes(), 0);
     }
 
-    /// The rate has to survive into what is stored, not just into the key:
-    /// an entry reports its own geometry, and a client trusts it.
     #[test]
-    fn a_published_entry_reports_the_rate_it_was_converted_to() {
-        let cache = cache(u64::MAX, Duration::from_secs(60));
-        let (mix, stems) = crate::testkit::stems(44_100);
-        assert_eq!(mix.sample_rate, 44_100);
+    fn emptying_the_cache_keeps_the_tracks_sessions_play() {
+        let cache = Cache::open(root(), 1 << 20).expect("open");
+        cache.set_in_use(Box::new(|| HashSet::from(["playing".to_owned()])));
+        fill(&cache, &["playing", "idle"]);
+        assert_eq!(cache.clear().0, 1);
+        assert!(exists(&cache, "playing"));
+        assert!(!exists(&cache, "idle"));
+    }
 
-        for rate in OutputRate::ALL {
-            let entry = cache
-                .publish(
-                    &format!("track-{rate}"),
-                    &mix,
-                    &stems,
-                    output(rate, false),
-                    1.0,
-                )
-                .expect("publish");
+    #[test]
+    fn emptying_the_cache_frees_its_bytes_and_file_keys_and_keeps_held_results() {
+        let cache = Cache::open(root(), 1 << 20).expect("open");
+        store_whole(&cache, "held");
+        store_whole(&cache, "idle");
+        cache.record_file("key", "idle").expect("recorded");
+        let output = Output {
+            format: StemFormat::Pcm16,
+            rate: OutputRate::default(),
+            derived: false,
+            dsp: stemd_core::DspMode::General.into(),
+            parts: Parts::parse("vocals,harmonics").unwrap(),
+        };
+        let dir = cache.verified_dir("model", "type", "held");
+        let entry = Arc::new(Entry::stored(&dir, &output, 1.0, 2, None).expect("whole"));
+        cache.hold(&entry);
+        let before = cache.bytes();
+        let (tracks, freed) = cache.clear();
+        assert_eq!(tracks, 1);
+        assert!(exists(&cache, "held"));
+        assert!(!exists(&cache, "idle"));
+        assert_eq!(cache.bytes(), before - freed);
+        assert_eq!(cache.file_track("key"), None);
+    }
 
-            assert_eq!(entry.sample_rate, rate.hz(), "{rate} misreported");
-            // One second in, one second out, whatever the rate.
-            assert!(
-                (entry.duration_secs() - 1.0).abs() < 0.01,
-                "{rate}: {:.3}s",
-                entry.duration_secs()
-            );
-            // Frames follow the rate, so the bytes on disk do too.
-            let expected = rate.hz() as f64 / 44_100.0;
-            let ratio = entry.frames as f64 / 44_100.0;
-            assert!((ratio - expected).abs() < 0.01, "{rate}: {ratio:.3}");
+    #[test]
+    fn the_track_count_drops_as_soon_as_the_cache_is_emptied() {
+        let cache = Cache::open(root(), 1 << 20).expect("open");
+        fill(&cache, &["a", "b"]);
+        assert_eq!(cache.stats().tracks, 2);
+        cache.clear();
+        assert_eq!(cache.stats().tracks, 0);
+        fill(&cache, &["c"]);
+        cache.wipe();
+        assert_eq!(cache.stats().tracks, 0);
+    }
+
+    #[test]
+    fn a_track_without_a_used_file_counts_from_its_newest_piece() {
+        let root = root();
+        let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+        fill(&cache, &["a", "b"]);
+        for track in ["a", "b"] {
+            std::fs::remove_file(cache.verified_dir("model", "type", track).join(USED))
+                .expect("a used file");
         }
-    }
-
-    #[test]
-    fn the_key_separates_runs_that_would_return_different_bytes() {
-        let base = Ingredients {
-            pcm: b"the same samples",
-            sample_rate: 44100,
-            channels: 2,
-            in_format: PcmFormat::S16le,
-            out_format: StemFormat::Pcm16,
-            out_rate: OutputRate::Hz44100,
-            include_derived: false,
-            parts: Parts::DEFAULT,
-            dsp: &Dsp::default(),
-            model: "digest",
-        };
-        let reference = key(&base);
-
-        assert_eq!(
-            reference,
-            key(&Ingredients { ..base }),
-            "the key must be stable"
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                pcm: b"other samples!!!",
-                ..base
-            })
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                sample_rate: 48000,
-                ..base
-            })
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                channels: 1,
-                ..base
-            })
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                in_format: PcmFormat::F32le,
-                ..base
-            })
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                out_format: StemFormat::Pcm32,
-                ..base
-            })
-        );
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                model: "another",
-                ..base
-            })
-        );
-        // Two filters at one rate are two different sets of samples, so a hit on
-        // one must never answer for the other.
-        assert_ne!(
-            reference,
-            key(&Ingredients {
-                dsp: &Dsp::Mode(stemd_core::DspMode::Mode1),
-                ..base
-            })
-        );
-        // The one that would be least visible if it were missing: same bytes,
-        // same model, same container: different audio out.
-        for rate in OutputRate::ALL {
-            let keyed = key(&Ingredients {
-                out_rate: rate,
-                ..base
-            });
-            assert_eq!(
-                keyed == reference,
-                rate == OutputRate::Hz44100,
-                "{rate} Hz must have its own entry"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod resample_bench {
-    use stemd_core::{Audio, resample};
-
-    fn stem(secs: f64) -> Audio {
-        let n = (secs * 44100.0) as usize;
-        Audio::new(
-            (0..2)
-                .map(|c| {
-                    (0..n)
-                        .map(|i| ((i as f32 * 0.01) + c as f32).sin() * 0.3)
-                        .collect()
-                })
-                .collect(),
-            44_100,
-        )
-    }
-
-    /// Is converting three stems at once faster than one at a time? Not obviously:
-    /// the conversion can be memory-bound, and the 44.1 to 48 kHz path threads
-    /// internally already.
-    #[test]
-    #[ignore]
-    fn is_converting_three_stems_at_once_worth_it() {
-        let stems: Vec<Audio> = (0..3).map(|_| stem(120.0)).collect();
-        for target in [48_000u32, 96_000] {
-            for round in 0..3 {
-                let serial = std::time::Instant::now();
-                for s in &stems {
-                    std::hint::black_box(resample::to_rate(s, target).unwrap());
-                }
-                let serial = serial.elapsed();
-
-                let parallel = std::time::Instant::now();
-                std::thread::scope(|scope| {
-                    let running: Vec<_> = stems
-                        .iter()
-                        .map(|s| scope.spawn(move || resample::to_rate(s, target).unwrap()))
-                        .collect();
-                    for t in running {
-                        std::hint::black_box(t.join().unwrap());
-                    }
-                });
-                let parallel = parallel.elapsed();
-                println!(
-                    "  {target} Hz round {round}: serial {serial:>8.2?}  parallel {parallel:>8.2?}  \
-                     ({:.2}x)",
-                    serial.as_secs_f64() / parallel.as_secs_f64()
-                );
-            }
-        }
+        drop(cache);
+        let cache = Cache::open(root, 1300).expect("reopen");
+        fill(&cache, &["c"]);
+        assert_eq!(present(&cache, "a"), Vec::<&str>::new());
+        assert_eq!(present(&cache, "b"), vec!["vocals", "harmonics"]);
     }
 }

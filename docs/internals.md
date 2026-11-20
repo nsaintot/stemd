@@ -5,64 +5,73 @@ How the server is built. Nothing here is needed to use it: see
 
 ## Cache
 
-Stems live in `~/Library/Caches/stemd`, keyed by the uploaded samples plus
-everything else that changes the answer: declared rate and channels, both
-formats, the output rate, whether the derived part ships, and the model's
-identity. A hit is provably the bytes a miss would have produced; a cache that
-can return something *different* is worse than none. Re-tracing a preset changes
-its digest and invalidates its entries by itself.
+One cache for jobs, sessions and drops, in `~/Library/Caches/stemd`
+(`--cache-dir`), kept across restarts. Code: `cache.rs`.
 
-The model's identity is a `;`-separated `k=v` list, not just the artefact's
-digest: `m=<digest>;r=<recipe>;p=f16;o=0.25`. The recipe covers a preset that
-changes how it uses a file the file itself has not changed, and the last two are
-`--full-precision` and `--overlap`, which change the samples without touching a
-byte of the artefact. They were missing, which meant stems separated at f16 came
-back unchanged from a server restarted with `--full-precision`: the one thing
-the paragraph above says cannot happen. New fields go on the **end**, and every
-field after `m=` draws its value from a closed set with no `;` in it, so the
-split from the right stays unambiguous: `--demucs-model` is arbitrary operator
-input and sits in `m=`, and a free-form field placed anywhere but first could be
-spelled to look like another configuration.
+```text
+<cache id>/<type>/<track id>/<stem>/<k>.<ext>    a piece
+<cache id>/<type>/<track id>/<stem>.<ext>        a whole stem, described by <stem>.json
+<cache id>/<type>/<track id>/track.json          length and piece grid
+<cache id>/<type>/<track id>/.used               last use, as its modification time
+<cache id>/<type>/<track id>/.separation.json    a job's residual and separation time
+.files/<file key>                                the track id a file key names
+```
 
-Most of the value is not on disk. Two clients often ask for the same track within
-seconds of each other, while the first separation is still running, so a request
-matching a job already in flight **joins it** and both finish together. Without
-that, the disk cache would rarely fire for concurrent requests: by the time there
-is anything to hit, both separations have run.
+| Level | |
+| --- | --- |
+| cache id | `model_id` plus 8 hex of the full identity, such as `htdemucs-22c7f2c9-1f2e3d4c` |
+| type | format, rate, filter, parts and gain, such as `flac-44100-harmonics.vocals-g0.70710677` |
+| track id | the hash of the decoded mix, see [api.md](api.md#track-id) |
 
-The in-flight check runs *before* the cache lookup, which leaves no window,
-because the worker publishes stems before it marks a job done. A shared job counts
-its waiters, so one client cancelling does not take the separation from the other.
+- Every setting that changes the bytes is in the path, so a hit is the bytes a
+  miss would have produced.
+- The full identity is `m=<digest>;r=<recipe>;p=f16;o=0.25`: the weights, how
+  the preset uses them, `--full-precision` and `--overlap`. New fields go on the
+  end, and every field after `m=` draws from a closed set with no `;`, so the
+  split from the right stays unambiguous. `--demucs-model` is operator input
+  and sits in `m=`.
+- A job or a drop decodes the upload, hashes the track id, and looks for every
+  stem stored whole at its output, at any gain. A hit runs no model. A miss runs
+  the model and stores whole stems at the track's gain, `1/(peak·√2)`, which is
+  the gain a session sending `peak` gets.
+- A drop writes its folder at unity: a 16-bit stem stored below unity is decoded
+  and encoded again, and one that would clip is scaled and noted in
+  `stems.json`.
 
-### Two rules bound the disk
+### Deletion
 
-1. **A separation nobody pulls is deleted** after `--unfetched-ttl` (300 s). Every
-   stem fetched restarts the clock, so a client part-way through collecting is
-   never cut off, and an entry counts as consumed only once *all* its stems have
-   been read at least once.
-2. **The store stays under `--cache-max-gb`** (4 GB ≈ 80 tracks as FLAC, 37 as
-   `pcm16`) by
-   dropping least-recently-used entries. The most recent entry is never rotated,
-   so a track larger than the whole budget is not separated and discarded in the
-   same breath.
+| A track is | |
+| --- | --- |
+| in use | played by an open session, being written by a job, or a job result with a stem not fetched within `--unfetched-ttl` (300 s) of the job ending or the last fetch |
+| whole | every stem stored whole: no piece directory left |
+| partial | anything else |
 
-Both run on one sweep at a fifth of the TTL: sweeping at the same period as the
-deadline would let an abandoned separation sit for twice as long as configured.
+| Rule | When |
+| --- | --- |
+| a track in use is never deleted | always |
+| partial, unused for `--partial-max-hours` (24) | at start and hourly |
+| whole, unused for `--whole-max-days` (30) | at start and hourly |
+| over `--cache-max-gb` (8), or the free disk minus 2 GB: partial tracks first, oldest first, then whole tracks, least recently used first, down to 90% | after each write and every 5 s |
 
-Job handles are not a third policy: a job is dropped when the cache reaps the
-stems it points at, so there is one lifecycle rather than two that can disagree.
-Failures hold no stems and expire on the same clock.
+- Start also deletes `.part` files and the per-job directories of stemd 0.2.0,
+  named by 64 hex characters (`migrate.rs`, removed with protocol 1). `--ephemeral` empties the cache at start and at
+  quit.
+- Files are written to a `.part` and renamed. A whole stem counts once its
+  description is in place.
+- Deleting while a client streams is safe: the handler opens the file first,
+  and an unlinked file stays readable. A fetch that has not opened gets `410`.
+- A job handle is dropped `--unfetched-ttl` after the job ended or its last
+  stem fetch, or once its stems are gone; a failure after the same time.
 
-The index is in memory and cleared at startup: whether an entry was ever pulled
-is not recorded on disk, and rule 1 turns on exactly that. Inventing a
-classification for files that cannot be classified is worse than paying for the
-first separation again.
+### Joining
 
-Entries are published by writing to `{key}.part/` and renaming, so a kill
-mid-write cannot leave a directory that looks complete. Deleting an entry while a
-client is streaming from it is safe: the handler opens the file first, and an
-unlinked file stays readable through an open descriptor. A fetch that has not
-opened yet gets a `410`.
+Two clients often ask for the same track within seconds, while the first
+separation is still running, so a request matching a job in flight joins it and
+both finish together. The job key is the track id, the output and the cache id.
+The in-flight check runs before the cache lookup, which leaves no window,
+because the worker stores stems before it marks a job done. A shared job counts
+its waiters, so one client cancelling does not take the separation from the
+other.
 
 ## Queue
 
@@ -110,7 +119,7 @@ Why the contract in [api.md](api.md) is shaped as it is.
 - **`model_id`** is `<artefact>-<8 hex>` of a digest over the weights and the
   preset's recipe. A preset that changes how it uses an artefact changes the id,
   so stems made before the change stop matching. Precision and overlap stay out
-  of it: they go only into the server's internal cache key.
+  of it: they go only into the server's cache id.
 - **Numbered `dsp_mode`s and filters.** A client that rebuilds
   `drums = mix − harmonics − vocals` at another rate must resample its mix
   through the same filter as the stems. Two good resamplers agree to about
@@ -167,9 +176,9 @@ logged and ignored: a client with the address configured out of band still works
 
 ## Drops
 
-A file dropped on the window is the same job a `POST /v2/jobs` makes: same hash
-ingredients, same store, same worker. A drop and a client asking for the same
-track join one separation, and the same file twice is a cache hit. `drops.rs`
+A file dropped on the window is the same job a `POST /v2/jobs` makes: same track
+id, same job store, same worker, same cache. A drop and a client asking for the
+same track join one separation, and the same file twice is a cache hit. `drops.rs`
 differs at two points: the audio comes from a file, and it always asks for the
 derived part, because a folder of stems has no mix to rebuild it from.
 

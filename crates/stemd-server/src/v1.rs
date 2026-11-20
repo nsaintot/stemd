@@ -26,8 +26,10 @@ use serde_json::{Value, json};
 use stemd_core::Progress;
 
 use crate::api::{self, ApiError, AppState, CreateParams};
-use crate::cache::Entry;
-use crate::jobs::Job;
+use crate::jobs::{Entry, Job};
+
+/// The residual sent when the stems sum to the mix exactly, since JSON has no `-inf`.
+const FLOOR_DB: f64 = -200.0;
 
 /// The `Link` header on every protocol 1 answer.
 const LINK: &str = "<https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel=\"deprecation\"; type=\"text/html\"";
@@ -185,10 +187,15 @@ fn result_of(id: &str, result: crate::jobs::JobResult, entry: Option<&Entry>) ->
                 gain: stem.gain,
             })
             .collect(),
-        model_residual_db: result.model_residual_db,
+        model_residual_db: result.model_residual_db.unwrap_or(FLOOR_DB),
         derived_stem: result.output.derived,
         separation_secs: result.separation_secs,
-        realtime_factor: result.realtime_factor,
+        // JSON has no infinity, and 0.2.0 clients need a number.
+        realtime_factor: if result.realtime_factor.is_finite() {
+            result.realtime_factor
+        } else {
+            0.0
+        },
         cached: result.cached,
     }
 }
@@ -348,6 +355,60 @@ mod tests {
         let empty = call(&app, Method::POST, "/v1/jobs?format=s16le", Vec::new()).await;
         assert_eq!(empty.status, StatusCode::BAD_REQUEST);
         assert_eq!(empty.headers["deprecation"], "true");
+    }
+
+    #[tokio::test]
+    async fn a_job_on_stems_a_session_stored_reads_the_floor_residual() {
+        use crate::cache::{Consolidation, type_dir};
+        use stemd_core::Audio;
+        let state = state();
+        let app = api::router(Arc::clone(&state));
+        let frames = 4410;
+        let wave = |scale: f32| -> Vec<f32> {
+            (0..frames)
+                .map(|i| scale * (i as f32 * 0.01).sin())
+                .collect()
+        };
+        let mix = Audio::new(vec![wave(0.5), wave(0.4)], 44_100);
+        let id = crate::sessions::track_id(&mix);
+        let output = crate::testkit::output();
+        let dir =
+            state
+                .cache
+                .verified_dir(&state.switcher.cache_id(), &type_dir(&output, 1.0), &id);
+        let task = Consolidation::at_44100(dir, output.format, frames);
+        state.cache.write_info(&task.dir, &task.info).unwrap();
+        for (stem, scale) in [("harmonics", 0.2), ("vocals", 0.15), ("drums", 0.1)] {
+            let part = Audio::new(vec![wave(scale), wave(scale)], 44_100);
+            let bytes = stemd_core::encode_stem(&part, output.format, 1.0).unwrap();
+            state
+                .cache
+                .consolidate(&task, stem, &bytes, frames, Some(0))
+                .unwrap();
+        }
+        let body: Vec<u8> = (0..frames)
+            .flat_map(|i| [mix.data[0][i], mix.data[1][i]])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+
+        let answer = call(
+            &app,
+            Method::POST,
+            "/v1/jobs?format=f32le&output_format=pcm16",
+            body,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
+        let result = &answer.json["result"];
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["model_residual_db"].as_f64(), Some(FLOOR_DB));
+        assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
+
+        let id = answer.json["id"].as_str().unwrap();
+        let again = call(&app, Method::GET, &format!("/v1/jobs/{id}"), Vec::new()).await;
+        let result = &again.json["result"];
+        assert_eq!(result["model_residual_db"].as_f64(), Some(FLOOR_DB));
+        assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
     }
 
     #[tokio::test]

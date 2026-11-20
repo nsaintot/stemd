@@ -38,12 +38,12 @@ pub struct Args {
     #[arg(long, default_value = "0.0.0.0:8420")]
     pub bind: SocketAddr,
 
-    /// Where separated stems are kept. Defaults to a `stemd` directory under the
-    /// platform's cache directory.
+    /// Where separated stems are kept, across restarts. Defaults to a `stemd`
+    /// directory under the platform's cache directory.
     ///
-    /// Its contents are deleted at every start, so point it at a directory
-    /// stemd owns rather than one that holds anything else.
-    #[arg(long)]
+    /// Point it at a directory stemd owns: the cache deletes what it no longer
+    /// needs.
+    #[arg(long, alias = crate::migrate::PIECES_DIR)]
     pub cache_dir: Option<PathBuf>,
 
     /// How stems are written when a request does not say: `flac`, `s16le` or `f32le`.
@@ -81,27 +81,27 @@ pub struct Args {
     #[arg(long, default_value_t = 4)]
     pub max_sessions: usize,
 
-    /// Where session pieces are kept. Unlike --cache-dir, it survives restarts.
-    /// Defaults to `stemd-pieces` under the platform's cache directory.
-    #[arg(long)]
-    pub pieces_dir: Option<PathBuf>,
-
-    /// Disk the pieces may occupy, in gigabytes. Past this the least recently
-    /// used pieces are dropped.
-    #[arg(long, default_value_t = 8.0)]
-    pub pieces_max_gb: f64,
-
-    /// Disk the separated stems may occupy, in gigabytes. Past this the least
-    /// recently used tracks are dropped. A five-minute stereo track costs about
-    /// 106 MB at s16le and 212 MB at f32le.
-    #[arg(long, default_value_t = 4.0)]
+    /// Disk the cache may occupy, in gigabytes, and never more than the free
+    /// disk minus 2 GB. Past this, partial tracks go first, oldest first, then
+    /// whole tracks, least recently used first. A six-minute track costs about
+    /// 40 MB as 44.1 kHz FLAC with two parts and the derived one.
+    #[arg(long, alias = "pieces-max-gb", default_value_t = 8.0)]
     pub cache_max_gb: f64,
 
-    /// Seconds a separation nobody pulled must sit idle before it becomes the
-    /// first thing given up for space. It is not a delete timer: nothing is
-    /// evicted while the stem cache is under half full, however long this is.
-    /// The clock restarts on every stem fetched, so a client part-way through
-    /// collecting is never cut off.
+    /// Hours a partial track, with some stem not stored whole, is kept unused.
+    #[arg(long, default_value_t = 24.0)]
+    pub partial_max_hours: f64,
+
+    /// Days a whole track is kept unused.
+    #[arg(long, default_value_t = 30.0)]
+    pub whole_max_days: f64,
+
+    /// Empty the cache at start and at quit, for a borrowed machine.
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// Seconds a job's result is kept from deletion after it finished or after
+    /// its last stem fetch, until every stem has been fetched.
     #[arg(long, default_value_t = 300)]
     pub unfetched_ttl: u64,
 
@@ -172,5 +172,16 @@ impl Args {
     pub fn cache_max_bytes(&self) -> u64 {
         const BYTES_PER_GB: f64 = 1e9;
         (self.cache_max_gb.max(0.0) * BYTES_PER_GB) as u64
+    }
+
+    /// The cache's deletion rules.
+    pub fn cache_rules(&self) -> crate::cache::Rules {
+        let secs = |s: f64| std::time::Duration::from_secs_f64(s.max(0.0));
+        crate::cache::Rules {
+            max_bytes: self.cache_max_bytes(),
+            partial_max_age: secs(self.partial_max_hours * 3600.0),
+            whole_max_age: secs(self.whole_max_days * 86400.0),
+            unfetched_ttl: self.unfetched_ttl(),
+        }
     }
 }

@@ -63,8 +63,8 @@ fn report(info: &PanicHookInfo<'_>) {
 /// `file:line:column`, or a phrase saying there was none.
 ///
 /// A location is an `Option` because a panic raised through
-/// [`std::panic::resume_unwind`] carries none, which is exactly what
-/// `cache::write_stems` does to re-raise an encoder panic across a thread join.
+/// [`std::panic::resume_unwind`] carries none, which is what storing a job's
+/// stems does to re-raise an encoder panic across a thread join.
 fn at(location: Option<&Location<'_>>) -> String {
     location.map_or_else(
         || "an unknown location".to_owned(),

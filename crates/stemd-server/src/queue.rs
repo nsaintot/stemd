@@ -20,20 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
 use stemd_core::{
     Audio, BackendInfo, Cancelled, Pass, Progress, Segmenting, Separate, Stage, Stems, whole_track,
 };
 
-use crate::cache::Output;
-
-use crate::cache::Cache;
-use crate::jobs::Job;
-use crate::pieces::{Consolidation, Pieces, TrackInfo, stems_of, type_dir};
-use crate::sessions::{
-    Class, Session, Sessions, Track, View, excerpt, gain, output_index, track_id,
-};
+use crate::cache::{Cache, Consolidation, Separation, TrackInfo, stems_of, type_dir};
+use crate::jobs::{Entry, Job};
+use crate::output::Output;
+use crate::sessions::{Class, Session, Sessions, Track, View, gain, track_id};
 
 /// How a separator reaches the worker: as a recipe, never as a finished model.
 ///
@@ -48,14 +44,11 @@ pub struct QueuedWork {
     pub mix: Audio,
     /// Format, rate and part set the client asked for.
     pub output: Output,
-    /// The `model_id` the job was submitted under, for the pieces it writes.
+    /// The cache id the job was submitted under, which names the model's
+    /// directory in the cache.
     pub model_id: String,
-    /// Submitted over the API. Its stems are kept as session pieces too, and
-    /// turning the server off cancels it. Off for a drop, whose stems end up
-    /// only in its folder.
+    /// Submitted over the API: turning the server off cancels it. Off for a drop.
     pub from_api: bool,
-    /// The client's file key, recorded against the track id when the pieces are written.
-    pub file: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,7 +212,7 @@ impl Queue {
             info: Mutex::new(None),
             segmenting: Mutex::new(None),
             normalises: AtomicBool::new(false),
-            sessions: Arc::new(Sessions::default()),
+            sessions: Sessions::new(std::time::Duration::from_secs(30), 4, cache),
             speed: Mutex::new(Speed::default()),
             busy: AtomicBool::new(false),
             left: AtomicBool::new(false),
@@ -233,7 +226,7 @@ impl Queue {
                 // The first thing this thread does, and the reason it is handed
                 // a recipe rather than a model.
                 if let Some(separator) = worker_inner.build_here(build, &reply) {
-                    worker_loop(&worker_inner, separator, &cache);
+                    worker_loop(&worker_inner, separator);
                 }
                 worker_inner.left.store(true, Ordering::SeqCst);
                 loop {
@@ -296,7 +289,7 @@ impl Queue {
     }
 
     /// When background consolidation may run: always on a GPU, on a CPU while the worker idles.
-    pub fn consolidation_gate(&self) -> crate::pieces::Gate {
+    pub fn consolidation_gate(&self) -> crate::cache::Gate {
         let inner = Arc::downgrade(&self.inner);
         Box::new(move || {
             let Some(inner) = inner.upgrade() else {
@@ -651,7 +644,7 @@ impl Inner {
 /// that panics fails that track and a build that panics leaves the model already
 /// loaded in place. Whether the separator is still sound cannot be known from
 /// here, so it is reported at `error`.
-fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cache) {
+fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>) {
     // Each open track's partial output, on the device, by track uid. Held here
     // because MLX arrays belong to the thread that made them.
     let mut passes: HashMap<u64, Pass> = HashMap::new();
@@ -685,11 +678,11 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
             }
             Next::Job(claimed) => {
                 inner.busy.store(true, Ordering::SeqCst);
-                let pieces = inner.sessions.pieces();
+                let cache = inner.sessions.cache();
                 // The time between two calls is one job segment.
                 let mut last: Option<std::time::Instant> = None;
                 let separating = catch_unwind(AssertUnwindSafe(|| {
-                    separate_one(separator.as_mut(), &claimed, cache, pieces, &mut |sep| {
+                    separate_one(separator.as_mut(), &claimed, cache, &mut |sep| {
                         let now = std::time::Instant::now();
                         if let Some(at) = last {
                             inner.speed.lock().record((now - at).as_secs_f64());
@@ -710,7 +703,7 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                         .fail(format!("the separation panicked: {what}"));
                 }
                 *inner.running.lock() = None;
-                trim_after_job(cache);
+                trim_after_job(inner.sessions.cache());
             }
             Next::Segment(track, k) => {
                 inner.busy.store(true, Ordering::SeqCst);
@@ -785,20 +778,6 @@ fn run_segment(
     passes.remove(&track.uid);
 }
 
-/// Whether there is room to write a finished job's pieces: they hold a copy of
-/// the mix and stems in memory while they encode, and land on disk.
-fn pieces_affordable(pieces: &Pieces) -> bool {
-    if crate::disk::low(pieces.root()) {
-        tracing::info!("disk nearly full, not writing this job's pieces");
-        return false;
-    }
-    if crate::disk::memory_pressure() {
-        tracing::info!("memory is short, not writing this job's pieces");
-        return false;
-    }
-    true
-}
-
 /// Hand back MLX's allocator cache after a job if keeping it is a risk: when
 /// memory or disk is short, or it holds over half the machine's memory. Kept
 /// otherwise, so the next track in a queue starts warm.
@@ -820,79 +799,153 @@ fn trim_after_job(cache: &Cache) {
     }
 }
 
-/// Store a finished job's stems whole; a stem whose length is not the track's is written as pieces.
-fn write_job_pieces(
-    pieces: &Pieces,
-    model_id: &str,
+/// The parts `output.parts` names and the derived part, `mix` minus them, each at the output rate.
+fn to_output_rate(
     mix: &Audio,
     stems: &Stems,
-    output: Output,
-    stride: usize,
-    file: Option<String>,
-) -> Result<()> {
-    let id = track_id(mix);
-    if let Some(key) = file
-        && let Err(err) = pieces.record_file(&key, &id)
-    {
-        tracing::warn!("recording file key {key}: {err:#}");
+    output: &Output,
+) -> Result<Vec<(&'static str, Audio)>> {
+    let mut parts: Vec<(&'static str, &Audio)> = Vec::new();
+    for name in output.parts.names() {
+        let audio = stems
+            .stem(name)
+            .with_context(|| format!("this separation has no {name}"))?;
+        parts.push((name, audio));
     }
-    let gain = gain(&output, mix.peak().ok());
-    let name = type_dir(&output, gain);
-    let mut all = output.clone();
-    all.derived = true;
-    let converted = crate::cache::to_output_rate(mix, stems, &all)?;
-    let (model, out) = (u64::from(mix.sample_rate), u64::from(output.rate.hz()));
+    let derived = output.parts.derived().map(|name| {
+        (
+            name,
+            stemd_core::stems::remainder(mix, parts.iter().map(|(_, audio)| *audio)),
+        )
+    });
+    let parts: Vec<(&'static str, &Audio)> = parts
+        .into_iter()
+        .chain(derived.iter().map(|(name, audio)| (*name, audio)))
+        .collect();
+    // One thread per part, see `is_converting_three_stems_at_once_worth_it`.
+    std::thread::scope(|scope| {
+        let running: Vec<_> = parts
+            .iter()
+            .map(|(name, audio)| scope.spawn(|| one_rate(name, audio, output)))
+            .collect();
+        running
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
+            })
+            .collect()
+    })
+}
+
+fn one_rate(name: &'static str, audio: &Audio, output: &Output) -> Result<(&'static str, Audio)> {
+    let began = std::time::Instant::now();
+    let converted = output
+        .dsp
+        .convert(audio, output.rate.hz())
+        .with_context(|| format!("converting {name} to {} Hz", output.rate))?;
+    //  Timed because which of conversion and encode dominates depends on the format
+    //  asked for.
+    tracing::debug!(
+        "{name}: {} -> {} Hz in {:.2?}",
+        audio.sample_rate,
+        output.rate,
+        began.elapsed()
+    );
+    Ok((name, converted))
+}
+
+/// Store a finished job's stems whole at the track's gain, and return the result, held.
+fn store_whole(
+    cache: &Cache,
+    work: &QueuedWork,
+    stems: &Stems,
+    stride: usize,
+    separation: Separation,
+) -> Result<Arc<Entry>> {
+    let (mix, output) = (&work.mix, &work.output);
+    let converted = to_output_rate(mix, stems, output)?;
+    for (stem, audio) in &converted {
+        audio
+            .peak()
+            .with_context(|| format!("the separated {stem} is not finite"))?;
+    }
+    let id = track_id(mix);
+    let gain = gain(output, mix.peak().ok());
+    let name = type_dir(output, gain);
+    let dir = cache.verified_dir(&work.model_id, &name, &id);
+    let _writing = cache.writing(&dir);
     let frames = mix.frames();
-    let count = frames.div_ceil(stride);
     let info = TrackInfo {
         frames,
         sample_rate: mix.sample_rate,
-        channels: mix.data.len(),
+        channels: mix.channels(),
         stride,
-        pieces: count,
+        pieces: frames.div_ceil(stride),
     };
+    cache.write_info(&dir, &info)?;
     let task = Consolidation {
-        dir: pieces.verified_dir(model_id, &name, &id),
+        dir: dir.clone(),
         format: output.format,
         rate: output.rate.hz(),
         info,
-        stems: stems_of(&all),
+        stems: stems_of(output),
     };
-    let dir = &task.dir;
-    pieces.write_info(dir, &info)?;
     let expected = info.frames_at(output.rate.hz());
-    let mut whole = Vec::new();
-    for (stem, audio) in &converted {
-        if audio.frames() != expected {
-            continue;
-        }
-        let bytes = stemd_core::encode_stem(audio, output.format, gain)?;
-        let clipped = (!output.format.has_headroom()).then(|| {
-            audio
-                .data
-                .iter()
-                .flatten()
-                .filter(|v| (*v * gain).abs() > 1.0)
-                .count()
-        });
-        pieces.consolidate(&task, stem, &bytes, audio.frames(), clipped)?;
-        whole.push(*stem);
+    // One thread per stem, so storing costs the longest encode.
+    let encoded: Vec<Result<Encoded>> = std::thread::scope(|scope| {
+        let running: Vec<_> = converted
+            .iter()
+            .map(|(stem, audio)| {
+                scope.spawn(move || {
+                    let audio = fit(audio, expected);
+                    let bytes = stemd_core::encode_stem(&audio, output.format, gain)?;
+                    let clipped = (!output.format.has_headroom())
+                        .then(|| crate::whole::clipped(&audio, gain, false));
+                    Ok((*stem, bytes, clipped))
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    for stored in encoded {
+        let (stem, bytes, clipped) = stored?;
+        cache.consolidate(&task, stem, &bytes, expected, clipped)?;
     }
-    if whole.len() == converted.len() {
-        tracing::info!("track {id}: stored {} stems whole in {name}", whole.len());
-        return Ok(());
+    cache.write_separation(&dir, &separation)?;
+    let entry = Entry::stored(&dir, output, gain, mix.channels(), Some(separation))
+        .context("the stored stems are incomplete")?;
+    let entry = Arc::new(entry);
+    cache.hold(&entry);
+    tracing::info!(
+        "track {id}: stored {} stems whole in {name}",
+        converted.len()
+    );
+    Ok(entry)
+}
+
+/// A stem's name, its encoded bytes, and the samples clipped, absent for `f32le`.
+type Encoded<'a> = (&'a str, Vec<u8>, Option<usize>);
+
+/// `audio` cut or padded with silence to `frames`.
+fn fit(audio: &Audio, frames: usize) -> std::borrow::Cow<'_, Audio> {
+    if audio.frames() == frames {
+        return std::borrow::Cow::Borrowed(audio);
     }
-    for k in 0..count {
-        let (from, to) = (k * stride, ((k + 1) * stride).min(frames));
-        for (stem, audio) in converted.iter().filter(|(stem, _)| !whole.contains(stem)) {
-            let a = output_index(from, model, out).min(audio.frames());
-            let b = output_index(to, model, out).min(audio.frames());
-            let bytes = stemd_core::encode_stem(&excerpt(audio, a, b), output.format, gain)?;
-            pieces.write_verified(dir, stem, k, output.format.extension(), &bytes)?;
-        }
-    }
-    tracing::info!("track {id}: wrote {count} pieces of {name}");
-    Ok(())
+    let data = audio
+        .data
+        .iter()
+        .map(|channel| {
+            let mut channel = channel[..channel.len().min(frames)].to_vec();
+            channel.resize(frames, 0.0);
+            channel
+        })
+        .collect();
+    std::borrow::Cow::Owned(Audio::new(data, audio.sample_rate))
 }
 
 /// The ranges inside segment `k`'s output that are final now that it has run.
@@ -936,7 +989,6 @@ fn separate_one(
     separator: &mut dyn Separate,
     claimed: &Claimed,
     cache: &Cache,
-    pieces: Option<Arc<Pieces>>,
     between: &mut dyn FnMut(&mut dyn Separate) -> Result<()>,
 ) {
     let work = &claimed.work;
@@ -959,30 +1011,19 @@ fn separate_one(
     };
     match separated {
         Ok(stems) => {
-            publish(job, work, &stems, cache, started.elapsed().as_secs_f64());
-            // Off the worker: the job is done for its client, and the next one
-            // should not wait on encoding.
-            if let (Some(pieces), Some(segmenting)) = (pieces, segmenting)
-                && work.from_api
-                && work.output.format != stemd_core::StemFormat::Mp3
-                && pieces_affordable(&pieces)
-                && let Ok(grid) = segmenting.grid(work.mix.frames())
-            {
-                let (mix, output, model_id, file) = (
-                    work.mix.clone(),
-                    work.output.clone(),
-                    work.model_id.clone(),
-                    work.file.clone(),
-                );
-                let stride = grid.stride().unsigned_abs() as usize;
-                std::thread::spawn(move || {
-                    if let Err(err) =
-                        write_job_pieces(&pieces, &model_id, &mix, &stems, output, stride, file)
-                    {
-                        tracing::warn!("writing a job's pieces: {err:#}");
-                    }
+            let stride = segmenting
+                .and_then(|s| s.grid(work.mix.frames()).ok())
+                .map_or(work.mix.frames().max(1), |grid| {
+                    grid.stride().unsigned_abs() as usize
                 });
-            }
+            publish(
+                job,
+                work,
+                &stems,
+                cache,
+                stride,
+                started.elapsed().as_secs_f64(),
+            );
         }
         // Routine, not a failure: the client said so. Logged at info with what
         // it cost, so a client skipping repeatedly is visible in the log without
@@ -999,24 +1040,33 @@ fn separate_one(
     }
 }
 
-/// Write the finished stems into the cache and mark the job done.
-fn publish(job: &Job, work: &QueuedWork, stems: &Stems, cache: &Cache, elapsed: f64) {
+/// Store the finished stems in the cache and mark the job done.
+fn publish(
+    job: &Job,
+    work: &QueuedWork,
+    stems: &Stems,
+    cache: &Cache,
+    stride: usize,
+    elapsed: f64,
+) {
     job.set_progress(Progress::new(Stage::Writing));
     //  Timed and reported separately: `elapsed` stops before this runs, and
-    //  `separation_secs` is the model's cost by definition. Writing can cost more than
-    //  separating, and used to appear in no total anyone saw.
+    //  `separation_secs` is the model's cost by definition.
     let writing = std::time::Instant::now();
-    match cache.publish(&job.key, &work.mix, stems, work.output.clone(), elapsed) {
+    let separation = Separation {
+        model_residual_db: stems.model_residual_db,
+        separation_secs: elapsed,
+    };
+    match store_whole(cache, work, stems, stride, separation) {
         Ok(entry) => {
             tracing::info!(
                 job = %job.id,
                 "done in {elapsed:.2}s ({:.1}x realtime, model residual {:.1} dB), \
-                 {:.2}s writing {} stems, cached as {}",
+                 {:.2}s writing {} stems",
                 entry.realtime_factor(),
-                entry.model_residual_db,
+                stems.model_residual_db,
                 writing.elapsed().as_secs_f64(),
                 entry.stems.len(),
-                crate::cache::short(&entry.key)
             );
             job.complete(entry, false);
         }
@@ -1404,7 +1454,6 @@ mod tests {
                 },
                 model_id: "test".into(),
                 from_api: true,
-                file: None,
             })
             .expect("queue has room");
     }
@@ -1845,6 +1894,175 @@ mod tests {
             .expect("the surviving install must still be applied");
         assert_eq!(queue.info().model, "c");
     }
+
+    #[test]
+    fn a_stem_of_nan_fails_the_job_instead_of_being_published() {
+        let cache = cache(u64::MAX, Duration::from_secs(60));
+        let (mix, mut stems) = crate::testkit::stems(64);
+        for (name, audio) in &mut stems.shipped {
+            if *name == "vocals" {
+                audio.data = audio.data.iter().map(|c| vec![f32::NAN; c.len()]).collect();
+            }
+        }
+        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let work = QueuedWork {
+            job: jobs.create("diverged".into()),
+            mix,
+            output: crate::testkit::output(),
+            model_id: "model".into(),
+            from_api: true,
+        };
+        let separation = Separation {
+            model_residual_db: -30.0,
+            separation_secs: 1.0,
+        };
+        let err = store_whole(&cache, &work, &stems, 64, separation)
+            .expect_err("a stem of NaN must not be stored");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("vocals") && message.contains("not a finite"),
+            "the failure has to name the stem: {message}"
+        );
+        assert_eq!(cache.stats().tracks, 0, "nothing is stored");
+    }
+
+    /// A worker-less job on `mix` at `output`.
+    fn work_on(store: &crate::jobs::JobStore, mix: &Audio, output: Output) -> QueuedWork {
+        QueuedWork {
+            job: store.create(format!("{}-{}", output.rate, mix.frames())),
+            mix: mix.clone(),
+            output,
+            model_id: "model".into(),
+            from_api: false,
+        }
+    }
+
+    const SEPARATION: Separation = Separation {
+        model_residual_db: -30.0,
+        separation_secs: 1.0,
+    };
+
+    #[test]
+    fn a_hit_whose_files_vanished_is_a_miss() {
+        let cache = cache(1 << 30, Duration::from_secs(60));
+        let (mix, stems) = crate::testkit::stems(4410);
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let work = work_on(&store, &mix, crate::testkit::output());
+        store_whole(&cache, &work, &stems, mix.frames(), SEPARATION).expect("stored");
+        let id = track_id(&mix);
+        let hit = crate::api::cached_entry(&cache, "model", &work.output, &id).expect("a hit");
+        std::fs::remove_file(&hit.stem("vocals").unwrap().path).unwrap();
+        assert!(crate::api::cached_entry(&cache, "model", &work.output, &id).is_none());
+        assert!(!hit.present());
+    }
+
+    #[test]
+    fn a_fresh_result_over_the_budget_is_kept_until_fetched() {
+        let cache = cache(100, Duration::from_secs(60));
+        let (mix, stems) = crate::testkit::stems(64);
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let work = work_on(&store, &mix, crate::testkit::output());
+        publish(&work.job, &work, &stems, &cache, mix.frames(), 1.0);
+        assert_eq!(work.job.progress.lock().stage, Stage::Done);
+        let entry = work.job.entry.lock().clone().unwrap();
+        cache.clean();
+        assert!(entry.present(), "held while unfetched");
+        for stem in &entry.stems {
+            entry.mark_fetched(&stem.name);
+        }
+        cache.clean();
+        assert!(!entry.dir.exists(), "over the budget once fetched");
+    }
+
+    #[test]
+    fn a_stored_result_reports_the_rate_it_was_converted_to() {
+        let cache = cache(1 << 30, Duration::from_secs(60));
+        let (mix, stems) = crate::testkit::stems(44_100);
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        for rate in OutputRate::ALL {
+            let output = Output {
+                rate,
+                ..crate::testkit::output()
+            };
+            let work = work_on(&store, &mix, output);
+            let entry =
+                store_whole(&cache, &work, &stems, mix.frames(), SEPARATION).expect("stored");
+            assert_eq!(entry.output.rate, rate, "{rate}");
+            assert_eq!(
+                entry.frames,
+                crate::sessions::output_index(44_100, 44_100, u64::from(rate.hz())),
+                "{rate}"
+            );
+            assert!((entry.duration_secs() - 1.0).abs() < 0.01, "{rate}");
+        }
+    }
+
+    fn pcm16_at(rate: OutputRate) -> Output {
+        Output {
+            format: StemFormat::Pcm16,
+            rate,
+            derived: false,
+            dsp: stemd_core::DspMode::default().into(),
+            parts: stemd_core::Parts::DEFAULT,
+        }
+    }
+
+    #[test]
+    fn every_rate_converts_the_parts_then_the_derived_one() {
+        let (mix, stems) = crate::testkit::stems(4410);
+        for rate in OutputRate::ALL {
+            let parts = to_output_rate(&mix, &stems, &pcm16_at(rate)).unwrap();
+            let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
+            let mut expected = stemd_core::SHIPPED.to_vec();
+            expected.push(stemd_core::DERIVED);
+            assert_eq!(names, expected, "{rate}");
+            for (name, audio) in &parts {
+                assert_eq!(audio.sample_rate, rate.hz(), "{name} at the wrong rate");
+            }
+        }
+    }
+
+    /// A job's own parts ship in [`stemd_core::PART_NAMES`] order, the derived
+    /// part is what they leave out, and the set still sums to the mix.
+    #[test]
+    fn a_parts_list_ships_those_parts_and_rebuilds_the_rest() {
+        let (mix, mut stems) = crate::testkit::stems(4410);
+        let harmonics = stems.stem("harmonics").unwrap().clone();
+        let bass = Audio::new(
+            harmonics
+                .data
+                .iter()
+                .map(|c| c.iter().map(|v| v * 0.25).collect())
+                .collect(),
+            harmonics.sample_rate,
+        );
+        let other = stemd_core::stems::minus(&harmonics, &bass);
+        stems.more = vec![("bass", bass), ("other", other)];
+
+        let output = Output {
+            parts: stemd_core::Parts::parse("vocals,other,bass").unwrap(),
+            ..pcm16_at(OutputRate::Hz44100)
+        };
+        let parts = to_output_rate(&mix, &stems, &output).unwrap();
+        let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["vocals", "bass", "other", "drums"]);
+
+        let sum = parts.iter().fold(mix.clone(), |rest, (_, audio)| {
+            stemd_core::stems::minus(&rest, audio)
+        });
+        let peak = sum.data.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 1e-5, "the parts miss the mix by {peak}");
+
+        let missing = Output {
+            parts: stemd_core::Parts::parse("drums,vocals").unwrap(),
+            ..output
+        };
+        let (_, plain) = crate::testkit::stems(4410);
+        assert!(
+            to_output_rate(&mix, &plain, &missing).is_err(),
+            "no drums estimate to ship"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1852,7 +2070,7 @@ mod session_tests {
     use super::*;
 
     const KEY: &str = "0123456789abcdef01234567";
-    use crate::sessions::{Region, Request, Session, TrackSpec, WindowRequest};
+    use crate::sessions::{Region, Request, Session, TrackSpec, WindowRequest, excerpt};
     use crate::testkit::cache;
     use std::time::Duration;
     use stemd_core::toy::Toy;
@@ -1888,31 +2106,21 @@ mod session_tests {
         }
     }
 
-    fn start(toy: Toy) -> Queue {
+    fn start(toy: Toy, cache: Arc<Cache>) -> Queue {
         let build: BuildSeparator = Box::new(move || Ok(Box::new(toy) as Box<dyn Separate>));
-        Queue::start(build, 8, cache(1 << 30, Duration::from_secs(60)))
-            .expect("the toy builds")
-            .0
+        Queue::start(build, 8, cache).expect("the toy builds").0
     }
 
-    /// A piece store no other test touches.
-    fn with_pieces(queue: &Queue) -> Arc<Pieces> {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "stemd-pieces-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let pieces = Pieces::open(root, 1 << 30).expect("a piece store");
-        queue.sessions().set_pieces(Arc::clone(&pieces));
-        pieces
+    /// A cache no other test touches.
+    fn fresh_cache() -> Arc<Cache> {
+        cache(1 << 30, Duration::from_secs(60))
     }
 
-    /// A piece store whose stems are never stored whole in the background.
-    fn with_held_pieces(queue: &Queue) -> Arc<Pieces> {
-        let pieces = with_pieces(queue);
-        pieces.set_gate(Box::new(|| false));
-        pieces
+    /// A cache whose stems are never stored whole in the background.
+    fn held_cache() -> Arc<Cache> {
+        let cache = fresh_cache();
+        cache.set_gate(Box::new(|| false));
+        cache
     }
 
     fn open_as(
@@ -1993,7 +2201,7 @@ mod session_tests {
             .separate(&mix, Parts::DEFAULT, &Silent)
             .expect("separating");
 
-        let queue = start(Toy::new(SEGMENT, 0.25));
+        let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
         let session = open(&queue, frames, None);
         session.set_window(&whole(&session)).expect("open");
         // Last piece first, so segments wait on their input and on the whole
@@ -2030,7 +2238,7 @@ mod session_tests {
         let mix = track(frames, 2);
         let toy = Toy::new(SEGMENT, 0.25);
         let runs = Arc::clone(&toy.runs);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
         let session = open(&queue, frames, None);
         session.set_window(&whole(&session)).expect("open");
         upload(&queue, &session, 0, &excerpt(&mix, 0, 30_000));
@@ -2048,7 +2256,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 400_000;
         let mix = track(frames, 3);
-        let queue = start(Toy::new(SEGMENT, 0.25));
+        let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
         let session = open(&queue, frames, Some(Normalisation::of(&mix)));
         let needle = 200_000;
         session
@@ -2078,7 +2286,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(20);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
 
         let store = crate::jobs::JobStore::new(Duration::from_secs(60));
         let job = store.create("long".into());
@@ -2090,7 +2298,6 @@ mod session_tests {
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
                 from_api: true,
-                file: None,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(100));
@@ -2131,7 +2338,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(20);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
 
         let store = crate::jobs::JobStore::new(Duration::from_secs(60));
         let submit = |key: &str, from_api: bool| {
@@ -2143,7 +2350,6 @@ mod session_tests {
                     output: output(StemFormat::Pcm32),
                     model_id: "toy-00000000".into(),
                     from_api,
-                    file: None,
                 })
                 .expect("room");
             job
@@ -2178,7 +2384,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(20);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
 
         let store = crate::jobs::JobStore::new(Duration::from_secs(60));
         let submit = |key: &str, from_api: bool| {
@@ -2190,7 +2396,6 @@ mod session_tests {
                     output: output(StemFormat::Pcm32),
                     model_id: "toy-00000000".into(),
                     from_api,
-                    file: None,
                 })
                 .expect("room");
             job
@@ -2219,7 +2424,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(10);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
 
         let store = crate::jobs::JobStore::new(Duration::from_secs(60));
         let job = store.create("long".into());
@@ -2230,7 +2435,6 @@ mod session_tests {
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
                 from_api: true,
-                file: None,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(50));
@@ -2255,7 +2459,7 @@ mod session_tests {
     #[test]
     fn a_model_switch_closes_every_session() {
         let _gpu = GPU.lock();
-        let queue = start(Toy::new(SEGMENT, 0.25));
+        let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
         let session = open(&queue, 20_000, None);
         queue
             .install(Box::new(|| {
@@ -2273,7 +2477,7 @@ mod session_tests {
         let mix = track(frames, 8);
         let toy = Toy::new(SEGMENT, 0.25);
         let runs = Arc::clone(&toy.runs);
-        let queue = start(toy);
+        let queue = start(toy, fresh_cache());
 
         let a = open_as(&queue, frames, None, StemFormat::Pcm32);
         a.set_window(&whole(&a)).expect("open");
@@ -2304,8 +2508,8 @@ mod session_tests {
         let id = crate::sessions::track_id(&mix);
         let toy = Toy::new(SEGMENT, 0.25);
         let runs = Arc::clone(&toy.runs);
-        let queue = start(toy);
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(toy, Arc::clone(&cache));
 
         let first = open_as(&queue, frames, None, StemFormat::Flac);
         first.set_window(&whole(&first)).expect("open");
@@ -2316,8 +2520,8 @@ mod session_tests {
         let type_name = type_dir(&first.output, first.gain);
         let stems = ["harmonics", "vocals", "drums"];
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let dir = pieces.verified_dir("toy-00000000", &type_name, &id);
-        while Pieces::cached(&dir, &stems, "flac", count).len() < count {
+        let dir = cache.verified_dir("toy-00000000", &type_name, &id);
+        while Cache::cached(&dir, &stems, "flac", count).len() < count {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the pieces were never written"
@@ -2454,8 +2658,8 @@ mod session_tests {
     ) -> [(u16, Vec<String>, Vec<u8>); 4] {
         let frames = 40_000;
         let mix = track(frames, seed);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_held_pieces(&queue);
+        let cache = held_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
         let stems = ["harmonics", "vocals", "drums"];
 
         let fresh = open_at(&queue, frames, format, rate);
@@ -2464,7 +2668,7 @@ mod session_tests {
         queue.wake();
         assert!(ready_within(&fresh, 0, frames, Duration::from_secs(20)));
         assert!(stored_within(&queue, &fresh, Duration::from_secs(10)));
-        let dir = pieces.verified_dir(
+        let dir = cache.verified_dir(
             "toy-00000000",
             &type_dir(&fresh.output, fresh.gain),
             &crate::sessions::track_id(&mix),
@@ -2628,8 +2832,8 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 30_000;
         let mix = track(frames, 14);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_held_pieces(&queue);
+        let cache = held_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
 
         let first = open_as(&queue, frames, None, StemFormat::Flac);
         first.set_window(&whole(&first)).expect("open");
@@ -2646,7 +2850,7 @@ mod session_tests {
 
         let second = open_as(&queue, frames, None, StemFormat::Flac);
         upload(&queue, &second, 0, &mix);
-        let dir = pieces.verified_dir(
+        let dir = cache.verified_dir(
             "toy-00000000",
             &type_dir(&second.output, second.gain),
             &crate::sessions::track_id(&mix),
@@ -2672,11 +2876,11 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 30_000;
         let mix = track(frames, 15);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::clone(&open);
-        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        cache.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
         let stems = ["harmonics", "vocals", "drums"];
 
         let first = open_as(&queue, frames, None, StemFormat::Flac);
@@ -2694,7 +2898,7 @@ mod session_tests {
             ))
         };
         let from_memory = range(&first);
-        let dir = pieces.verified_dir(
+        let dir = cache.verified_dir(
             "toy-00000000",
             &type_dir(&first.output, first.gain),
             &crate::sessions::track_id(&mix),
@@ -2704,7 +2908,7 @@ mod session_tests {
             stems.iter().all(|s| dir.join(s).is_dir()),
             "stored whole while the gate was shut"
         );
-        assert!(pieces.is_consolidating(&dir));
+        assert!(cache.is_consolidating(&dir));
 
         open.store(true, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2715,7 +2919,7 @@ mod session_tests {
             assert!(std::time::Instant::now() < deadline, "never stored whole");
             thread::sleep(POLL_INTERVAL);
         }
-        while pieces.is_consolidating(&dir) {
+        while cache.is_consolidating(&dir) {
             thread::sleep(POLL_INTERVAL);
         }
         for stem in stems {
@@ -2740,22 +2944,17 @@ mod session_tests {
     }
 
     /// Wait until every stem of `output` for `mix` is stored whole.
-    fn whole_within(
-        pieces: &Pieces,
-        mix: &Audio,
-        output: &Output,
-        gain: f32,
-    ) -> std::path::PathBuf {
-        let dir = pieces.verified_dir(
+    fn whole_within(cache: &Cache, mix: &Audio, output: &Output, gain: f32) -> std::path::PathBuf {
+        let dir = cache.verified_dir(
             "toy-00000000",
             &type_dir(output, gain),
             &crate::sessions::track_id(mix),
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while crate::pieces::stems_of(output)
+        while crate::cache::stems_of(output)
             .iter()
             .any(|s| crate::whole::find(&dir, s, output.format.extension()).is_none())
-            || pieces.is_consolidating(&dir)
+            || cache.is_consolidating(&dir)
         {
             assert!(std::time::Instant::now() < deadline, "never stored whole");
             thread::sleep(POLL_INTERVAL);
@@ -2770,13 +2969,14 @@ mod session_tests {
         let frames = 30_000;
         let mix = track(frames, 16);
         let id = crate::sessions::track_id(&mix);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::clone(&open);
-        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        cache.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
         let flac = output(StemFormat::Flac);
-        let held = || lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id);
+        let held = || lookup(&cache, queue.sessions(), &jobs, "toy-00000000", &flac, &id);
         assert!(held().is_none());
 
         let session = open_as(&queue, frames, None, StemFormat::Flac);
@@ -2792,7 +2992,7 @@ mod session_tests {
         assert_eq!(held().expect("stored").state, Held::Consolidating);
 
         open.store(true, Ordering::SeqCst);
-        let dir = whole_within(&pieces, &mix, &flac, session.gain);
+        let dir = whole_within(&cache, &mix, &flac, session.gain);
         let now = held().expect("stored");
         assert_eq!(now.state, Held::Stored);
         assert_eq!(now.output.gain, Some(session.gain));
@@ -2825,13 +3025,14 @@ mod session_tests {
         let frames = 30_000;
         let mix = track(frames, 23);
         let id = crate::sessions::track_id(&mix);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_held_pieces(&queue);
+        let cache = held_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
         let flac = output(StemFormat::Flac);
         let session = open_as(&queue, frames, None, StemFormat::Flac);
         upload(&queue, &session, 0, &mix);
         queue.sessions().remove(&session.id, "ended by the client");
-        assert!(lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id).is_none());
+        assert!(lookup(&cache, queue.sessions(), &jobs, "toy-00000000", &flac, &id).is_none());
     }
 
     #[test]
@@ -2841,11 +3042,12 @@ mod session_tests {
         let frames = 30_000;
         let mix = track(frames, 24);
         let id = crate::sessions::track_id(&mix);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::clone(&open);
-        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        cache.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
         let flac = output(StemFormat::Flac);
         let session = open_as(&queue, frames, None, StemFormat::Flac);
         session.set_window(&whole(&session)).expect("open");
@@ -2854,7 +3056,7 @@ mod session_tests {
         assert!(stored_within(&queue, &session, Duration::from_secs(20)));
         queue.sessions().remove(&session.id, "ended by the client");
 
-        let dir = pieces.verified_dir("toy-00000000", &type_dir(&flac, session.gain), &id);
+        let dir = cache.verified_dir("toy-00000000", &type_dir(&flac, session.gain), &id);
         let piece = std::fs::read_dir(dir.join("harmonics"))
             .expect("pieces")
             .flatten()
@@ -2863,13 +3065,13 @@ mod session_tests {
             .path();
         std::fs::write(&piece, b"not flac").expect("writing");
         open.store(true, Ordering::SeqCst);
-        while pieces.is_consolidating(&dir) {
+        while cache.is_consolidating(&dir) {
             thread::sleep(POLL_INTERVAL);
         }
-        assert!(pieces.consolidation_failed(&dir));
-        let held = lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id);
+        assert!(cache.consolidation_failed(&dir));
+        let held = lookup(&cache, queue.sessions(), &jobs, "toy-00000000", &flac, &id);
         assert_eq!(held.expect("partial").state, Held::Partial);
-        assert!(!pieces.is_consolidating(&dir), "queued again");
+        assert!(!cache.is_consolidating(&dir), "queued again");
     }
 
     #[test]
@@ -2877,12 +3079,14 @@ mod session_tests {
         use crate::separations::{Held, derive, lookup};
         let _gpu = GPU.lock();
         let frames = 30_000;
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
         let find = |out: &Output, mix: &Audio| {
             lookup(
-                Some(&pieces),
+                &cache,
                 queue.sessions(),
+                &jobs,
                 "toy-00000000",
                 out,
                 &crate::sessions::track_id(mix),
@@ -2890,9 +3094,9 @@ mod session_tests {
         };
         let derive_from = |out: &Output, mix: &Audio, source: &Output, gain: f32| {
             let id = crate::sessions::track_id(mix);
-            let dir = pieces.verified_dir("toy-00000000", &type_dir(source, gain), &id);
+            let dir = cache.verified_dir("toy-00000000", &type_dir(source, gain), &id);
             let source = crate::separations::Found {
-                info: Pieces::info(&dir).expect("a track.json"),
+                info: Cache::info(&dir).expect("a track.json"),
                 dir,
                 output: source.clone(),
                 gain,
@@ -2902,7 +3106,7 @@ mod session_tests {
                 .output
                 .gain
                 .expect("a gain");
-            derive(&pieces, "toy-00000000", &id, &source, out, to_gain).expect("derived")
+            derive(&cache, "toy-00000000", &id, &source, out, to_gain).expect("derived")
         };
 
         // flac to wav: the same 16-bit samples in another container.
@@ -2912,7 +3116,7 @@ mod session_tests {
         upload(&queue, &session, 0, &mix);
         queue.wake();
         let flac = output(StemFormat::Flac);
-        let flac_dir = whole_within(&pieces, &mix, &flac, session.gain);
+        let flac_dir = whole_within(&cache, &mix, &flac, session.gain);
         let wav = output(StemFormat::Wav);
         let now = find(&wav, &mix).expect("derivable");
         assert_eq!(now.state, Held::Derivable);
@@ -2923,7 +3127,7 @@ mod session_tests {
             let decoded = |dir: &std::path::Path, format: StemFormat| {
                 let path = dir.join(format!("{stem}.{}", format.extension()));
                 let bytes = std::fs::read(path).expect("a whole file");
-                bits(&crate::pieces::decode(bytes, format, 2, 44_100).expect("decodes"))
+                bits(&crate::cache::decode(bytes, format, 2, 44_100).expect("decodes"))
             };
             assert_eq!(
                 decoded(&wav_dir, StemFormat::Wav),
@@ -2940,7 +3144,7 @@ mod session_tests {
         upload(&queue, &session, 0, &mix);
         queue.wake();
         let pcm32 = output(StemFormat::Pcm32);
-        whole_within(&pieces, &mix, &pcm32, 1.0);
+        whole_within(&cache, &mix, &pcm32, 1.0);
         let to_gain = gain(&flac, None);
         let want = stemd_core::encode_stem(
             &session.read("vocals", 0, frames).expect("ready").audio,
@@ -2965,8 +3169,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 30_000;
         let mix = track(frames, 20);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        with_held_pieces(&queue);
+        let queue = start(Toy::new(SEGMENT, 0.25), held_cache());
         let session = open_as(&queue, frames, None, StemFormat::Flac);
         let mut changes = queue.sessions().subscribe();
         changes.borrow_and_update();
@@ -3010,8 +3213,7 @@ mod session_tests {
         let mix = track(frames, 21);
         let toy = Toy::new(SEGMENT, 0.25);
         let runs = Arc::clone(&toy.runs);
-        let queue = start(toy);
-        with_held_pieces(&queue);
+        let queue = start(toy, held_cache());
         let first = open_as(&queue, frames, None, StemFormat::Flac);
         upload(&queue, &first, 0, &mix);
         let id = crate::sessions::track_id(&mix);
@@ -3047,8 +3249,7 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 30_000;
         let mix = track(frames, 22);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        with_held_pieces(&queue);
+        let queue = start(Toy::new(SEGMENT, 0.25), held_cache());
         let first = open(&queue, frames, None);
         upload(&queue, &first, 0, &mix);
         let id = crate::sessions::track_id(&mix);
@@ -3089,7 +3290,7 @@ mod session_tests {
     fn session_segments_set_the_segment_time() {
         let _gpu = GPU.lock();
         let frames = 30_000;
-        let queue = start(Toy::new(SEGMENT, 0.25));
+        let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
         let session = open(&queue, frames, None);
         session.set_window(&whole(&session)).expect("open");
         upload(&queue, &session, 0, &track(frames, 22));
@@ -3101,8 +3302,7 @@ mod session_tests {
     #[test]
     fn a_whole_track_read_before_any_separation_is_refused() {
         let _gpu = GPU.lock();
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        with_pieces(&queue);
+        let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
         let frames = 20_000;
         let session = open_at(&queue, frames, StemFormat::Flac, OutputRate::default());
         upload(&queue, &session, 0, &track(frames, 12));
@@ -3118,12 +3318,8 @@ mod session_tests {
     #[test]
     fn a_job_leaves_its_pieces_for_sessions() {
         let _gpu = GPU.lock();
-        if crate::disk::memory_pressure() {
-            eprintln!("skipped: under memory pressure a job writes no pieces");
-            return;
-        }
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_pieces(&queue);
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
         let frames = 25_000;
         let mix = track(frames, 10);
         let id = crate::sessions::track_id(&mix);
@@ -3136,7 +3332,6 @@ mod session_tests {
                 output: output(StemFormat::Flac),
                 model_id: "toy-00000000".into(),
                 from_api: true,
-                file: Some(KEY.into()),
             })
             .expect("room");
         let name = type_dir(
@@ -3144,7 +3339,7 @@ mod session_tests {
             gain(&output(StemFormat::Flac), mix.peak().ok()),
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let dir = pieces.verified_dir("toy-00000000", &name, &id);
+        let dir = cache.verified_dir("toy-00000000", &name, &id);
         let stems = ["harmonics", "vocals", "drums"];
         // A whole file is published before its pieces are removed.
         let stored = |stem: &&str| {
@@ -3164,11 +3359,44 @@ mod session_tests {
             );
             assert!(!dir.join(stem).exists(), "{stem} kept its pieces");
         }
-        assert_eq!(
-            pieces.file_track(KEY),
-            Some(id),
-            "the file key names the track"
-        );
+    }
+
+    #[test]
+    fn a_jobs_stems_answer_a_later_job_after_a_restart() {
+        let _gpu = GPU.lock();
+        let cache = fresh_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+        let mix = track(25_000, 11);
+        let id = crate::sessions::track_id(&mix);
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let job = store.create("first".into());
+        queue
+            .submit(QueuedWork {
+                job: Arc::clone(&job),
+                mix,
+                output: output(StemFormat::Flac),
+                model_id: "toy-00000000".into(),
+                from_api: true,
+            })
+            .expect("room");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !job.progress.lock().stage.is_terminal() {
+            assert!(std::time::Instant::now() < deadline, "the job never ended");
+            thread::sleep(POLL_INTERVAL);
+        }
+        let first = job.entry.lock().clone().expect("stems");
+        assert!(first.model_residual_db.is_some());
+
+        let reopened = Cache::open(cache.root().to_owned(), 1 << 30).expect("reopen");
+        let again =
+            crate::api::cached_entry(&reopened, "toy-00000000", &output(StemFormat::Flac), &id)
+                .expect("found after a restart");
+        assert_eq!(again.dir, first.dir);
+        assert_eq!(again.separation_secs, first.separation_secs);
+        assert_eq!(again.model_residual_db, first.model_residual_db);
+        let names: Vec<&str> = again.stems.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["harmonics", "vocals", "drums"]);
+        assert!(again.present());
     }
 
     #[test]
@@ -3176,21 +3404,72 @@ mod session_tests {
         let _gpu = GPU.lock();
         let frames = 30_000;
         let mix = track(frames, 25);
-        let queue = start(Toy::new(SEGMENT, 0.25));
-        let pieces = with_held_pieces(&queue);
+        let cache = held_cache();
+        let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
         let session = open(&queue, frames, None);
         session.set_file(Some(KEY.into()));
         upload(&queue, &session, 0, &excerpt(&mix, 0, frames / 2));
-        assert_eq!(pieces.file_track(KEY), None, "recorded before the hash");
+        assert_eq!(cache.file_track(KEY), None, "recorded before the hash");
         upload(
             &queue,
             &session,
             frames / 2,
             &excerpt(&mix, frames / 2, frames),
         );
-        assert_eq!(
-            pieces.file_track(KEY),
-            Some(crate::sessions::track_id(&mix))
-        );
+        assert_eq!(cache.file_track(KEY), Some(crate::sessions::track_id(&mix)));
+    }
+}
+
+#[cfg(test)]
+mod resample_bench {
+    use stemd_core::{Audio, resample};
+
+    fn stem(secs: f64) -> Audio {
+        let n = (secs * 44100.0) as usize;
+        Audio::new(
+            (0..2)
+                .map(|c| {
+                    (0..n)
+                        .map(|i| ((i as f32 * 0.01) + c as f32).sin() * 0.3)
+                        .collect()
+                })
+                .collect(),
+            44_100,
+        )
+    }
+
+    /// Is converting three stems at once faster than one at a time? Not obviously:
+    /// the conversion can be memory-bound, and the 44.1 to 48 kHz path threads
+    /// internally already.
+    #[test]
+    #[ignore]
+    fn is_converting_three_stems_at_once_worth_it() {
+        let stems: Vec<Audio> = (0..3).map(|_| stem(120.0)).collect();
+        for target in [48_000u32, 96_000] {
+            for round in 0..3 {
+                let serial = std::time::Instant::now();
+                for s in &stems {
+                    std::hint::black_box(resample::to_rate(s, target).unwrap());
+                }
+                let serial = serial.elapsed();
+
+                let parallel = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    let running: Vec<_> = stems
+                        .iter()
+                        .map(|s| scope.spawn(move || resample::to_rate(s, target).unwrap()))
+                        .collect();
+                    for t in running {
+                        std::hint::black_box(t.join().unwrap());
+                    }
+                });
+                let parallel = parallel.elapsed();
+                println!(
+                    "  {target} Hz round {round}: serial {serial:>8.2?}  parallel {parallel:>8.2?}  \
+                     ({:.2}x)",
+                    serial.as_secs_f64() / parallel.as_secs_f64()
+                );
+            }
+        }
     }
 }

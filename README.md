@@ -138,11 +138,12 @@ Method and notes: [docs/evaluation.md](docs/evaluation.md#every-preset-per-part)
 | ------ | ------------------------------------------------------ |
 | stems  | `<track>-stems/`, beside the track                     |
 | models | the user data directory, downloaded once               |
-| cache  | recent results, capped at 4 GB, emptied at every start |
+| cache  | every separation, capped at 8 GB, kept across restarts |
 
 
-Repeating a track already separated returns the cached result: entries are keyed
-by the audio and by everything else that changes the output.
+Repeating a track already separated returns the cached result: stems are kept
+by track, model and output, and dropped after 30 days unused or when the cache
+is full.
 
 ## Build from source
 

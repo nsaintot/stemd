@@ -16,7 +16,7 @@ use stemd_core::{
 };
 
 use crate::api::AppState;
-use crate::cache::{self, Cache};
+use crate::cache::Cache;
 use crate::cli::Args;
 use crate::jobs::JobStore;
 use crate::launch::{Launch, Stage};
@@ -65,8 +65,6 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
     }
     let settings = Arc::new(open_settings(args)?);
     let (stems, cache_summary) = open_stem_cache(args)?;
-    // Failures hold no stems, so the cache cannot decide when to forget them.
-    // The same clock that reaps an uncollected separation is the right one.
     let store = Arc::new(JobStore::new(args.unfetched_ttl()));
 
     let (model, queue, info) = load_model(args, &settings, &stems, precisions, launch)?;
@@ -74,9 +72,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
         std::time::Duration::from_secs(args.session_idle_secs),
         args.max_sessions,
     );
-    let pieces = open_pieces(args)?;
-    pieces.set_gate(queue.consolidation_gate());
-    queue.sessions().set_pieces(pieces);
+    stems.set_gate(queue.consolidation_gate());
     spawn_session_reaper(Arc::clone(&queue));
     let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
     log_model(&info, precisions, args.max_track_secs(), max_upload);
@@ -126,6 +122,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
             max_track_secs: args.max_track_secs(),
             serving,
             filters,
+            ephemeral: args.ephemeral,
         }),
         max_upload,
         cache_summary,
@@ -475,14 +472,20 @@ fn joined(dirs: &[PathBuf]) -> String {
 }
 
 fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
-    let root = cache::root(args)?;
-    let max_bytes = args.cache_max_bytes();
-    let cache = Cache::new(root.clone(), max_bytes, args.unfetched_ttl())
+    let root = crate::cache::root(args)?;
+    let rules = args.cache_rules();
+    let cache = Cache::open_with(root.clone(), rules)
         .with_context(|| format!("preparing the stem cache in {}", root.display()))?;
+    if args.ephemeral {
+        cache.wipe();
+    }
+    let stats = cache.stats();
     let summary = format!(
-        "{} capped at {:.1} GB",
+        "{}: {} tracks, {:.0} MB of {:.1} GB",
         root.display(),
-        max_bytes as f64 / 1e9
+        stats.tracks,
+        stats.bytes as f64 / 1e6,
+        rules.max_bytes as f64 / 1e9
     );
     Ok((cache, summary))
 }
@@ -501,26 +504,6 @@ fn open_filters() -> Result<Arc<crate::filters::Filters>> {
     Ok(filters)
 }
 
-/// Open the piece store, which keeps pieces across restarts.
-fn open_pieces(args: &Args) -> Result<Arc<crate::pieces::Pieces>> {
-    let root = match args.pieces_dir.clone() {
-        Some(dir) => dir,
-        None => dirs::cache_dir()
-            .context("no cache directory for this platform")?
-            .join("stemd-pieces"),
-    };
-    let max_bytes = (args.pieces_max_gb * 1e9) as u64;
-    let pieces = crate::pieces::Pieces::open(root.clone(), max_bytes)
-        .with_context(|| format!("preparing the piece store in {}", root.display()))?;
-    tracing::info!(
-        "pieces in {}: {:.0} MB of {:.1} GB",
-        root.display(),
-        pieces.bytes() as f64 / 1e6,
-        max_bytes as f64 / 1e9
-    );
-    Ok(pieces)
-}
-
 /// The name and port to announce over mDNS, unless asked not to.
 fn announce(args: &Args, port: u16) -> Option<(String, u16)> {
     if args.no_mdns {
@@ -530,10 +513,11 @@ fn announce(args: &Args, port: u16) -> Option<(String, u16)> {
     Some((args.instance.clone(), port))
 }
 
-/// Run the cache rules on a timer, drop job handles they invalidate, and hand
-/// MLX's allocator cache back once the server has been idle for [`IDLE_RELEASE`].
+/// Apply the cache's age rules every [`crate::cache::CLEAN_EVERY`], its
+/// budget every tick, drop stale job handles, and hand MLX's allocator cache
+/// back once the server has been idle for [`IDLE_RELEASE`].
 fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
-    let interval = cache.sweep_interval();
+    let interval = crate::cache::CLEAN_EVERY;
     std::thread::Builder::new()
         .name("stemd-reaper".into())
         .spawn(move || {
@@ -544,24 +528,15 @@ fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
                 std::thread::sleep(IDLE_TICK);
                 if swept.elapsed() >= interval {
                     swept = Instant::now();
-                    let reaped = cache.reap();
-                    let pruned = store.prune();
-                    if reaped.any() {
-                        tracing::info!(
-                            "reaped {} uncollected and rotated {} for space ({:.0} MB), \
-                             dropped {pruned} job handles",
-                            reaped.unfetched,
-                            reaped.rotated,
-                            reaped.bytes as f64 / 1e6
-                        );
-                    }
+                    cache.clean();
                 }
-
-                // Writes stop when the disk is low, so eviction has to run
-                // from here too, or the store never gives space back.
-                if let Some(pieces) = queue.sessions().pieces() {
-                    pieces.evict();
+                let pruned = store.prune();
+                if pruned > 0 {
+                    tracing::debug!("dropped {pruned} job handles");
                 }
+                // Writes stop when the disk is low, so the budget has to apply
+                // from here too, or the cache never gives space back.
+                cache.evict();
 
                 let busy =
                     queue.running().is_some() || queue.depth() > 0 || !queue.sessions().is_empty();

@@ -10,6 +10,7 @@ POST   /v2/jobs                                    separate a whole track
 GET    /v2/jobs/{id}                               progress, then the result
 GET    /v2/jobs/{id}/stems/{name}                  one stem of a finished job
 DELETE /v2/jobs/{id}                               release or cancel the job
+POST   /v2/jobs/{id}/join                          claim a running job found by lookup
 PUT    /v2/filters/{id}                            upload a conversion filter
 GET    /v2/filters/{id}                            summary of a stored filter
 POST   /v2/sessions                                open a session
@@ -66,7 +67,7 @@ its window.
  "sample_rate": 44100, "channels": 2, "preset": "Fast",
  "model_id": "htdemucs-22c7f2c9",
  "completed_jobs": 0, "queue_depth": 0,
- "cached_tracks": 0, "cached_bytes": 0, "cache_max_bytes": 4000000000,
+ "cached_tracks": 0, "cached_bytes": 0, "cache_max_bytes": 8000000000,
  "max_track_seconds": 600.0,
  "output_sample_rates": [24000, 44100, 48000, 96000],
  "dsp_modes": [0, 1], "dsp_mode_pairs": {"1": [44100, 96000]},
@@ -84,7 +85,9 @@ its window.
 | `sample_rate`, `channels` | The model's rate and channel count. Positions in sessions are samples at this rate. |
 | `preset` | `Fast`, `Balanced` or `Quality`; absent for a custom model. |
 | `model_id` | What produced the stems. Key a cache on it, see [Identifiers](#identifiers). |
+| `completed_jobs` | Jobs the server still answers for, finished or not. |
 | `running_job` | The job id running now; absent when idle. |
+| `cached_tracks`, `cached_bytes`, `cache_max_bytes` | What the [cache](#cache) holds on disk, and its cap. |
 | `max_track_seconds` | Longest accepted track. Longer is `413`. |
 | `output_sample_rates` | Values `output_sample_rate` accepts. |
 | `dsp_modes`, `dsp_mode_pairs` | Values `dsp_mode` accepts, and the one rate pair each numbered mode covers. |
@@ -110,9 +113,30 @@ Job results, session views and lookups describe their stems with one shape:
 | --- | --- |
 | `format` | `flac`, `wav`, `mp3`, `pcm16` or `pcm32`. |
 | `sample_rate` | Output rate. |
-| `gain` | Multiply every sample by `1.0 / gain`. Absent in job results, where each stem carries its own, and for an open track. |
+| `gain` | Multiply every sample by `1.0 / gain`. Absent in job results, where each stem carries it, and for an open track. |
 | `parts` | The parts shipped. |
 | `derived` | The part the client rebuilds as `mix` minus the parts, or `null` when nothing is left out. |
+
+### Cache
+
+The server keeps every separation, from jobs, sessions and window drops, in one
+cache across restarts: per model, output and track id. A job finds stems a
+session stored, and the reverse.
+
+| A track is | |
+| --- | --- |
+| in use | played by an open session, or a job result with a stem not fetched within `--unfetched-ttl` (300 s) of the job ending or the last fetch |
+| whole | every stem stored as one file |
+| partial | some stem still in pieces |
+
+| Rule | Default |
+| --- | --- |
+| A track in use is never deleted. | |
+| A partial track unused for `--partial-max-hours` is deleted. | 24 |
+| A whole track unused for `--whole-max-days` is deleted. | 30 |
+| Over `--cache-max-gb`, or the free disk minus 2 GB, partial tracks go first, oldest first, then whole tracks, least recently used first. | 8 |
+
+`--ephemeral` empties the cache at start and at quit.
 
 ## Identifiers
 
@@ -130,9 +154,8 @@ is safe as a path component.
 - **`model_id`** covers the weights and how the preset uses them. Two presets on
   one artefact, or one preset that changes its arrangement, have different ids.
   It does not cover precision or segment overlap. Treat it as opaque.
-- **Job `id`**: the first half is the cache key, the same for every request
-  with the same audio and output; the attempt number keeps two clients' jobs
-  apart.
+- **Job `id`**: the first half is the start of the track id; the attempt
+  number keeps two clients' jobs apart.
 
 ### Track id
 
@@ -265,12 +288,12 @@ POST /v2/jobs?sample_rate=44100&channels=2&format=s16le     body: the whole trac
 | `include_derived` | `false` | `true` ships the derived part too. |
 | `dsp_mode` | `0` | The output rate converter. `0` handles any pair; numbered modes are deprecated. |
 | `dsp_filter` | none | Id of an [uploaded filter](#filters) to convert with instead. |
-| `file` | none | The client's [file key](#file-key), recorded when the job's stems are stored. |
+| `file` | none | The client's [file key](#file-key), recorded once the upload is hashed. |
 
 | Status | |
 | --- | --- |
 | `202` | Accepted; poll the job. A request matching a job already running returns that job. |
-| `200` | Cached: the job is already done. |
+| `200` | Cached: the job is already done, no model ran. |
 | `400` | A bad parameter, named in `error`. |
 | `404` | `unknown_filter`. |
 | `413` | Longer than `max_track_seconds`, or a body over the upload limit. |
@@ -288,9 +311,9 @@ GET /v2/jobs/{id}
               "parts": ["harmonics", "vocals"], "derived": "drums"},
    "channels": 2, "frames": 1323000,
    "stems": [{"name": "harmonics", "url": "/v2/jobs/a8e29ff15c16-1/stems/harmonics",
-              "bytes": 2216440, "gain": 1.0},
+              "bytes": 2216440, "gain": 0.7255},
              {"name": "vocals", "url": "/v2/jobs/a8e29ff15c16-1/stems/vocals",
-              "bytes": 1120333, "gain": 1.0}],
+              "bytes": 1120333, "gain": 0.7255}],
    "model_residual_db": -35.2, "separation_secs": 1.39, "realtime_factor": 21.6,
    "cached": false}}
 ```
@@ -300,14 +323,17 @@ GET /v2/jobs/{id}
 - `fraction` runs 0 to 1; separation covers 0.10 to 0.90. While `queued`,
   `completed` and `total` are the queue position and `detail` says so (`next`,
   `2 ahead`).
-- `result` is present once `done`. `frames` is at the output rate. Each stem has
-  its own `gain`.
+- `result` is present once `done`. `frames` is at the output rate. Every stem
+  has the same `gain`: 3 dB over the mix's peak, as a session with `peak` (see
+  [Gain](#gain)), or the gain the stems were stored at when the job was answered
+  from the cache.
 - `model_residual_db` is diagnostic: `mix − sum(model sources)`. Around −30 dB
   on `Fast`, where it lands in the rebuilt `drums`; about −160 dB on `Balanced`
   and `Quality`, which build one part as the remainder. Do not compare it
   across presets.
 - `separation_secs` is the cost of the run that made the stems, an earlier one
-  for a cached answer.
+  for a cached answer. For stems a session stored, `separation_secs` is `0` and
+  `model_residual_db` is `null`.
 
 ### Download and release
 
@@ -318,13 +344,27 @@ GET /v2/jobs/{id}
 | `200` | The stem. |
 | `404` | No such job or stem. |
 | `409` | The job has not finished. |
-| `410` | The stems were evicted: submit again. |
+| `410` | The stems left the cache: submit again. |
 
 `DELETE /v2/jobs/{id}` releases the job (`204`). The last client to release a
-running job cancels it.
+running job cancels it. A finished job answers for `--unfetched-ttl` (300 s)
+after it ended or after its last stem fetch, then `404`; submitting again finds
+the stems in the cache.
 
 A finished job also stores its stems for [lookups](#separations) and sessions on
 the same track.
+
+### Join
+
+`POST /v2/jobs/{id}/join`, no body, makes the caller one more client of a job,
+such as the one a [lookup](#separations) answers `separating` for. Another
+client's `DELETE` then leaves the job running. Release it with `DELETE` like a
+job you submitted.
+
+| Status | |
+| --- | --- |
+| `200` | The job, as `GET /v2/jobs/{id}` answers it, at any stage. |
+| `404` | No such job. |
 
 ### Filters
 
@@ -587,12 +627,10 @@ Read the values from `grid`.
 
 ### Storage
 
-- Pieces are stored per track id, model and output, under `--pieces-dir`.
+- Pieces are stored in the [cache](#cache), per track id, model and output.
 - Once every piece of a track is stored, the server rewrites each stem as one
   whole file in the background and deletes its pieces. A whole-track job or a
   whole-stem read does the same right away.
-- Past `--pieces-max-gb` the least recently used track is evicted. A track an
-  open session plays is never evicted.
 - A piece missing from disk shows in `stems` and turns `complete` to `false`;
   send the window again to run it.
 
@@ -631,13 +669,14 @@ unknown_separation` for a key the server has not recorded or found ambiguous.
 | `stored` | every stem whole | fetches the stems or the bundle |
 | `derivable` | every stem whole in another 16-bit container, or in `pcm32` at the default gain; `from` is that output block | fetches: the server converts once, stores, sends |
 | `consolidating` | every piece; whole files are being written | asks again shortly, or joins with a session |
+| `separating` | a job for this output is running; `job` is its id | posts `/v2/jobs/<job>/join`, follows the job, fetches its stems when done, deletes it when leaving; on 404, 410, `failed` or `cancelled`, looks up again |
 | `open` | the mix, in a session | opens a session with `track=<id>` |
 | `partial` | some pieces or whole files | opens a session and uploads |
 
 `404 unknown_separation` means nothing is held for this output.
 
 - `frames` and `sample_rate` are at the model's rate.
-- `output.gain` is the stored gain, any gain matches; it is absent for `open`.
+- `output.gain` is the stored gain, any gain matches; it is absent for `open` and `separating`.
 - For `derivable`, every `stems[].stored` is `none`.
 - A track whose whole files fail to write reads as `partial` and is retried
   after 10 minutes.
@@ -685,7 +724,8 @@ A player skips an entry whose `sources` holds a bit it does not know.
 1. Compute the [file key](#file-key). With `model_id`, the key and the output in
    the client's own cache, stop here.
 2. `GET /v2/separations?file=<key>&<output>`. On `stored` or `derivable`, fetch
-   the bundle and stop. On `open`, open a session with `track=<track>`.
+   the bundle and stop. On `separating`, join `/v2/jobs/<job>` and follow it. On
+   `open`, open a session with `track=<track>`.
 3. Otherwise open a session with `file=<key>` and the method `/v2/health`
    allows, send a window, long-poll the view, read ranges near the needle.
 4. When the view says `complete`, fetch each stem whole, or the bundle once the
@@ -735,7 +775,7 @@ window's Clients list marks those jobs `protocol 1`.
 | Route | Protocol 1 |
 | --- | --- |
 | `GET /v1/health` | `stems`, `default_output_format`, `default_output_sample_rate`, `derived_stem` and `default_parts` in place of `default_output`. No `features`, `session` or `segment_run_seconds`. |
-| `POST /v1/jobs`, `GET /v1/jobs/{id}` | The result has `sample_rate`, `format` and `derived_stem` in place of `output`, and each stem has its server-local `path`. No `file=`. |
+| `POST /v1/jobs`, `GET /v1/jobs/{id}` | The result has `sample_rate`, `format` and `derived_stem` in place of `output`, and each stem has its server-local `path`. `model_residual_db` is always a number: for stems a session stored, it is `-200` and `realtime_factor` is `0`. No `file=`. |
 | `GET /v1/jobs/{id}/stems/{name}`, `DELETE /v1/jobs/{id}`, `GET /v1/logs` | As under `/v2`. |
 | `/v1/sessions` and every path below it | `410` with code `protocol_1`. Sessions are protocol 2 only: use `/v2/sessions`. |
 

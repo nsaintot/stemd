@@ -11,8 +11,8 @@
 //! Then the process leaves without running that teardown at all. Nothing here
 //! needs it: stems and the settings file are both installed by rename, so what is
 //! on disk is already complete, and the only thing that has to be told is the
-//! network, which [`now`] does itself. Those destructors free memory the kernel is
-//! about to reclaim anyway.
+//! network, which [`now`] does itself. Those destructors free memory the kernel
+//! is about to reclaim anyway. With `--ephemeral` it also empties the cache.
 
 use std::io::Write;
 
@@ -61,6 +61,10 @@ pub fn now(state: &AppState, reason: &str) -> ! {
     // server that is gone.
     state.serving.withdraw();
     let withdrawn = began.elapsed();
+
+    if state.ephemeral {
+        state.cache.wipe();
+    }
 
     // Quitting is meant to look instant. It is the last thing anyone sees the
     // program do, and a window that vanishes while the process lingers reads as

@@ -2,10 +2,10 @@
 //!
 //! A job is a handle, not storage: the stems it points at belong to
 //! [`crate::cache`], which is the only thing that governs disk. Two jobs can
-//! therefore share one separation, and a job nobody collects costs a hash-map
-//! entry rather than a gigabyte.
+//! therefore share one separation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use stemd_core::{Progress, Stage};
 
-use crate::cache::Entry;
+use crate::cache::Separation;
+use crate::output::Output;
 
 /// One separated stem, as the client sees it.
 #[derive(Debug, Clone, Serialize)]
@@ -23,11 +24,7 @@ pub struct StemFile {
     /// Relative endpoint that streams the stem.
     pub url: String,
     pub bytes: u64,
-    /// Scale already applied to this stem so it fits the output format.
-    /// Multiply by `1.0 / gain` to restore the original level.
-    ///
-    /// Per stem rather than shared: a quiet stem quantised against the loudest
-    /// stem's peak throws away bits for nothing.
+    /// Scale applied before encoding, one per track; multiply by `1.0 / gain` to restore the level.
     pub gain: f32,
 }
 
@@ -40,10 +37,11 @@ pub struct JobResult {
     pub frames: usize,
     pub stems: Vec<StemFile>,
     /// Level of `mix - sum(model sources)`, in dB relative to the mix.
-    /// Diagnostic: what the model failed to explain about the track.
-    pub model_residual_db: f64,
+    /// Diagnostic: what the model failed to explain about the track. `None`
+    /// for stems a session stored.
+    pub model_residual_db: Option<f64>,
     /// What the separation cost when it ran, which for a cache hit was some
-    /// earlier job.
+    /// earlier job; 0 for stems a session stored.
     pub separation_secs: f64,
     pub realtime_factor: f64,
     /// True when these stems were already on disk and nothing was separated.
@@ -56,20 +54,8 @@ impl JobResult {
     /// The URLs are per job, so they are built here rather than stored: two
     /// decks sharing one entry each poll their own id.
     pub fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
-        let parts = entry
-            .stems
-            .iter()
-            .map(|stem| stem.name.clone())
-            .filter(|name| Some(name.as_str()) != entry.derived)
-            .collect();
         Self {
-            output: crate::separations::OutputView {
-                format: entry.format.to_string(),
-                sample_rate: entry.sample_rate,
-                gain: None,
-                parts,
-                derived: entry.derived,
-            },
+            output: crate::separations::OutputView::of(&entry.output, None),
             channels: entry.channels,
             frames: entry.frames,
             stems: entry
@@ -79,7 +65,7 @@ impl JobResult {
                     name: stem.name.clone(),
                     url: format!("/v2/jobs/{job_id}/stems/{}", stem.name),
                     bytes: stem.bytes,
-                    gain: stem.gain,
+                    gain: entry.gain,
                 })
                 .collect(),
             model_residual_db: entry.model_residual_db,
@@ -102,18 +88,18 @@ pub struct JobView {
 
 pub struct Job {
     pub id: String,
-    /// Cache entry this job will produce. Also what a second deck matches on to
-    /// join a separation already under way instead of starting its own.
+    /// The track and output this job produces, see [`job_key`]; a second deck joins on it.
     pub key: String,
     pub progress: Mutex<Progress>,
     pub result: Mutex<Option<JobResult>>,
     pub error: Mutex<Option<String>>,
-    /// Where this job's stems live, once it has any. Shared with the cache and
-    /// with any other job that asked for the same track.
+    /// Where this job's stems live in the cache, once it has any.
     pub entry: Mutex<Option<Arc<Entry>>>,
     /// One per deck waiting on this job. See [`Job::release`].
     waiters: Mutex<usize>,
     pub created: Instant,
+    /// The mix being separated, at the model's rate.
+    pub mix: MixShape,
     /// Set once a protocol 1 client created or joined the job.
     protocol_1: AtomicBool,
 }
@@ -187,6 +173,34 @@ impl Job {
     }
 }
 
+/// The length and layout of a job's mix, as a lookup reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MixShape {
+    pub frames: usize,
+    pub sample_rate: u32,
+    pub channels: usize,
+}
+
+impl MixShape {
+    pub fn of(mix: &stemd_core::Audio) -> Self {
+        Self {
+            frames: mix.frames(),
+            sample_rate: mix.sample_rate,
+            channels: mix.channels(),
+        }
+    }
+}
+
+impl From<crate::cache::TrackInfo> for MixShape {
+    fn from(info: crate::cache::TrackInfo) -> Self {
+        Self {
+            frames: info.frames,
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+        }
+    }
+}
+
 /// Jobs indexed both ways: by id for lookups, and by cache key so
 /// [`JobStore::claim`] is a lookup rather than a scan over every live job.
 #[derive(Default)]
@@ -223,8 +237,8 @@ impl Registry {
 
 pub struct JobStore {
     jobs: Mutex<Registry>,
-    /// How long a job that produced no entry, one that failed, stays
-    /// readable. Successful jobs live as long as their stems instead.
+    /// How long a failed job stays readable, and a finished one after it
+    /// finished or after its last stem fetch.
     retain_failed: Duration,
     /// Distinguishes attempts at the same track. See [`JobStore::claim`].
     attempts: AtomicU64,
@@ -241,7 +255,8 @@ impl JobStore {
 
     #[cfg(test)]
     pub fn create(&self, key: String) -> Arc<Job> {
-        self.claim(&key).unwrap_or_else(|existing| existing)
+        self.claim(&key, MixShape::default())
+            .unwrap_or_else(|existing| existing)
     }
 
     /// Claim `key`, or join whoever already holds it.
@@ -250,7 +265,7 @@ impl JobStore {
     /// `Err` is an existing one the caller has been added to as a waiter. Registering
     /// happens under the same lock as the lookup, which makes concurrent submissions
     /// of one track collapse to a single separation.
-    pub fn claim(&self, key: &str) -> Result<Arc<Job>, Arc<Job>> {
+    pub fn claim(&self, key: &str, mix: MixShape) -> Result<Arc<Job>, Arc<Job>> {
         let mut jobs = self.jobs.lock();
         if let Some(job) = jobs.in_flight(key) {
             job.join();
@@ -265,10 +280,16 @@ impl JobStore {
             entry: Mutex::new(None),
             waiters: Mutex::new(1),
             created: Instant::now(),
+            mix,
             protocol_1: AtomicBool::new(false),
         });
         jobs.insert(&job);
         Ok(job)
+    }
+
+    /// The job working towards `key`, unless it has ended.
+    pub fn running(&self, key: &str) -> Option<Arc<Job>> {
+        self.jobs.lock().in_flight(key).cloned()
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -283,12 +304,8 @@ impl JobStore {
         self.jobs.lock().by_id.len()
     }
 
-    /// Drop handles that can no longer serve anyone.
-    ///
-    /// A job outlives its usefulness the moment the cache reaps its stems, so
-    /// the entry's own tombstone decides rather than a second age limit: one
-    /// lifecycle, not two that can disagree. Jobs still queued or separating are
-    /// never touched, and neither are failures until their message goes stale.
+    /// Drop finished jobs unused for `retain_failed`, or whose stems are gone,
+    /// and failed ones older than `retain_failed`.
     pub fn prune(&self) -> usize {
         let mut jobs = self.jobs.lock();
         let now = Instant::now();
@@ -300,7 +317,9 @@ impl JobStore {
                     return false;
                 }
                 match job.entry.lock().as_ref() {
-                    Some(entry) => entry.evicted(),
+                    Some(entry) => {
+                        !entry.present() || entry.last_used().elapsed() > self.retain_failed
+                    }
                     None => now.duration_since(job.created) > self.retain_failed,
                 }
             })
@@ -314,25 +333,157 @@ impl JobStore {
     }
 }
 
-/// A job id: the leading characters of the cache key, then the attempt number.
+/// What a job for track `id` at `output` is claimed under: the track id first,
+/// so a job id starts with it.
+pub fn job_key(id: &str, output: &Output, cache_id: &str) -> String {
+    format!(
+        "{id}/{}{}/{cache_id}",
+        crate::cache::type_prefix(output),
+        if output.ships_derived() {
+            "/derived"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Characters of a key worth putting in a log line.
+const SHORT_KEY: usize = 12;
+
+/// The leading `SHORT_KEY` characters of a key, for logging.
+pub fn short(key: &str) -> &str {
+    &key[..key.len().min(SHORT_KEY)]
+}
+
+/// A job id: the leading characters of the job key, then the attempt number.
 ///
 /// The same `name-discriminator` shape as `model_id`, and the leading half is what
-/// [`crate::cache::short`] prints in the logs, so a log line and a URL match by
-/// eye.
+/// [`short`] prints in the logs, so a log line and a URL match by eye.
 ///
 /// The attempt suffix keeps ids unique. Without it two clients asking for the same
 /// track at different times share an id, and a `DELETE` from one would cancel the
 /// other's separation.
 fn job_id(key: &str, attempt: u64) -> String {
-    format!("{}-{attempt}", crate::cache::short(key))
+    format!("{}-{attempt}", short(key))
+}
+
+/// One stem file of a job result.
+#[derive(Debug, Clone)]
+pub struct CachedStem {
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug)]
+struct State {
+    /// Stems no client has fetched yet.
+    unfetched: HashSet<String>,
+    last_used: Instant,
+}
+
+/// A job's result: whole stems in one track directory of the cache.
+#[derive(Debug)]
+pub struct Entry {
+    pub dir: PathBuf,
+    pub stems: Vec<CachedStem>,
+    /// The output the stems are stored as.
+    pub output: Output,
+    /// Scale applied to every stem before encoding; multiply by `1.0 / gain` to restore the level.
+    pub gain: f32,
+    pub channels: usize,
+    /// Samples per channel at the output rate.
+    pub frames: usize,
+    /// Absent for stems a session stored.
+    pub model_residual_db: Option<f64>,
+    /// What the separation cost when it ran; 0 for stems a session stored.
+    pub separation_secs: f64,
+    state: Mutex<State>,
+}
+
+impl Entry {
+    /// The stems `output` serves from `dir`, every one stored whole at `gain`.
+    pub fn stored(
+        dir: &Path,
+        output: &Output,
+        gain: f32,
+        channels: usize,
+        separation: Option<Separation>,
+    ) -> Option<Self> {
+        let extension = output.format.extension();
+        let mut stems = Vec::new();
+        let mut frames = 0;
+        for name in crate::sessions::served(output) {
+            let whole = crate::whole::find(dir, name, extension)?;
+            frames = whole.meta.frames;
+            stems.push(CachedStem {
+                name: name.to_owned(),
+                bytes: std::fs::metadata(&whole.path).ok()?.len(),
+                path: whole.path,
+            });
+        }
+        Some(Self {
+            dir: dir.to_owned(),
+            state: Mutex::new(State {
+                unfetched: stems.iter().map(|s| s.name.clone()).collect(),
+                last_used: Instant::now(),
+            }),
+            stems,
+            output: output.clone(),
+            gain,
+            channels,
+            frames,
+            model_residual_db: separation.map(|s| s.model_residual_db),
+            separation_secs: separation.map_or(0.0, |s| s.separation_secs),
+        })
+    }
+
+    pub fn last_used(&self) -> Instant {
+        self.state.lock().last_used
+    }
+
+    /// True while the cache must keep the stems: some stem is unfetched and the
+    /// result was made or last fetched less than `ttl` ago.
+    pub fn held(&self, ttl: Duration) -> bool {
+        let state = self.state.lock();
+        !state.unfetched.is_empty() && state.last_used.elapsed() < ttl
+    }
+
+    /// Record that `name` was fetched, and restart the clock.
+    pub fn mark_fetched(&self, name: &str) {
+        let mut state = self.state.lock();
+        state.unfetched.remove(name);
+        state.last_used = Instant::now();
+    }
+
+    pub fn stem(&self, name: &str) -> Option<&CachedStem> {
+        self.stems.iter().find(|s| s.name == name)
+    }
+
+    /// Whether every stem is still on disk.
+    pub fn present(&self) -> bool {
+        self.stems.iter().all(|stem| stem.path.exists())
+    }
+
+    pub fn duration_secs(&self) -> f64 {
+        self.frames as f64 / f64::from(self.output.rate.hz())
+    }
+
+    /// How much faster than realtime the separation ran; infinite for stems a
+    /// session stored.
+    pub fn realtime_factor(&self) -> f64 {
+        if self.separation_secs > 0.0 {
+            self.duration_secs() / self.separation_secs
+        } else {
+            f64::INFINITY
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Ingredients;
     use crate::testkit::{cache, publish};
-    use stemd_core::PcmFormat;
 
     #[test]
     fn a_result_names_its_output_and_no_server_path() {
@@ -354,35 +505,34 @@ mod tests {
         assert!(json.get("sample_rate").is_none());
     }
 
-    /// The budget is one byte so the store counts as full and its uncollected
-    /// entry is collectable. What is under test is the handle following the
-    /// stems out; the reaping is only how they leave.
     #[test]
-    fn a_job_is_pruned_once_its_stems_are_reaped() {
-        let cache = cache(1, Duration::from_millis(20));
-        let store = JobStore::new(Duration::from_secs(3600));
-
+    fn a_finished_job_is_pruned_once_unused_or_once_its_stems_are_gone() {
+        let cache = cache(u64::MAX, Duration::from_secs(3600));
+        let store = JobStore::new(Duration::from_millis(30));
         let job = store.create("track".into());
         job.complete(publish(&cache, "track", 32, 2.0), false);
-        assert_eq!(store.prune(), 0, "the entry is still there");
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.prune(), 0, "just finished");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(store.prune(), 1, "unused for its retention");
 
-        std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(cache.reap().unfetched, 1);
+        let store = JobStore::new(Duration::from_secs(3600));
+        let job = store.create("gone".into());
+        let entry = publish(&cache, "gone", 32, 2.0);
+        std::fs::remove_dir_all(&entry.dir).expect("stems deleted");
+        job.complete(entry, false);
         assert_eq!(store.prune(), 1, "the handle points at nothing now");
-        assert_eq!(store.len(), 0);
     }
 
     #[test]
-    fn two_jobs_can_share_one_entry_and_are_pruned_together() {
-        // Full, for the reason the test above gives.
-        let cache = cache(1, Duration::from_millis(20));
+    fn two_jobs_can_share_one_result_with_their_own_urls() {
+        let cache = cache(u64::MAX, Duration::from_secs(3600));
         let store = JobStore::new(Duration::from_secs(3600));
 
         // A second request for a track already separated gets its own handle
         // onto the same stems. Two handles only ever coexist once the first is
         // terminal, while it is running, `claim` joins it instead.
         let entry = publish(&cache, "doubles", 32, 2.0);
+        let dir = entry.dir.clone();
         let first = store.create("doubles".into());
         first.complete(Arc::clone(&entry), false);
         let second = store.create("doubles".into());
@@ -390,15 +540,11 @@ mod tests {
         assert_ne!(first.id, second.id);
 
         let first_url = &first.result.lock().clone().unwrap().stems[0].url;
-        assert!(
-            first_url.contains(&first.id),
-            "urls are per job, not per entry"
-        );
+        assert!(first_url.contains(&first.id), "urls are per job");
         assert!(second.result.lock().clone().unwrap().cached);
 
-        std::thread::sleep(Duration::from_millis(40));
-        cache.reap();
-        assert_eq!(store.prune(), 2);
+        std::fs::remove_dir_all(&dir).expect("stems deleted");
+        assert_eq!(store.prune(), 2, "both handles go with the stems");
     }
 
     #[test]
@@ -445,7 +591,7 @@ mod tests {
         let first = store.create("same-track".into());
         first.set_progress(Progress::new(Stage::Separating));
 
-        let Err(joined) = store.claim("same-track") else {
+        let Err(joined) = store.claim("same-track", MixShape::default()) else {
             panic!("second claim should join, not create");
         };
         assert_eq!(joined.id, first.id, "one separation, not two");
@@ -468,7 +614,7 @@ mod tests {
                 let created = Arc::clone(&created);
                 std::thread::spawn(move || {
                     start.wait();
-                    if let Ok(job) = store.claim("one-track") {
+                    if let Ok(job) = store.claim("one-track", MixShape::default()) {
                         created.lock().push(job.id.clone());
                     }
                 })
@@ -502,7 +648,7 @@ mod tests {
         assert_eq!(job_id(key, 3), "a8e29ff15c16-3");
         assert_eq!(
             job_id(key, 3).split('-').next().unwrap(),
-            crate::cache::short(key),
+            short(key),
             "a log line and a URL must be matchable by eye"
         );
     }
@@ -560,7 +706,7 @@ mod tests {
         second.set_progress(Progress::new(Stage::Separating));
 
         store.remove(&first.id);
-        let Err(joined) = store.claim("track") else {
+        let Err(joined) = store.claim("track", MixShape::default()) else {
             panic!("the running attempt should be joined, not replaced");
         };
         assert_eq!(joined.id, second.id);
@@ -572,7 +718,7 @@ mod tests {
         let job = store.create("track-a".into());
         job.set_progress(Progress::new(Stage::Separating));
         assert!(
-            store.claim("track-b").is_ok(),
+            store.claim("track-b", MixShape::default()).is_ok(),
             "a different key gets its own job"
         );
     }
@@ -587,7 +733,7 @@ mod tests {
         job.complete(publish(&cache, "done-track", 32, 2.0), false);
 
         assert!(
-            store.claim("done-track").is_ok(),
+            store.claim("done-track", MixShape::default()).is_ok(),
             "a finished job is left to the cache"
         );
     }
@@ -598,7 +744,7 @@ mod tests {
         let job = store.create("doomed".into());
         job.fail("model exploded");
         assert!(
-            store.claim("doomed").is_ok(),
+            store.claim("doomed", MixShape::default()).is_ok(),
             "a second client should get a fresh attempt, not someone else's failure"
         );
     }
@@ -609,7 +755,7 @@ mod tests {
         let job = store.create("skipped".into());
         job.cancelled();
         assert!(
-            store.claim("skipped").is_ok(),
+            store.claim("skipped", MixShape::default()).is_ok(),
             "cueing the track again must start a fresh separation, not join the abandoned one"
         );
     }
@@ -619,7 +765,10 @@ mod tests {
         let store = JobStore::new(Duration::from_secs(3600));
         let job = store.create("shared".into());
         job.set_progress(Progress::new(Stage::Separating));
-        assert!(store.claim("shared").is_err(), "second client joins");
+        assert!(
+            store.claim("shared", MixShape::default()).is_err(),
+            "second client joins"
+        );
 
         assert_eq!(job.release(), 1, "the other deck is still waiting");
         assert_eq!(job.release(), 0, "now nobody is");
@@ -634,21 +783,36 @@ mod tests {
     }
 
     #[test]
-    fn the_ingredients_are_what_the_key_covers() {
-        // Guards the field list: adding one to Ingredients without adding it to
-        // `key` would leave two different separations sharing an entry.
-        let base = Ingredients {
-            pcm: b"samples",
-            sample_rate: 44100,
-            channels: 2,
-            in_format: PcmFormat::S16le,
-            out_format: stemd_core::StemFormat::Pcm32,
-            out_rate: stemd_core::OutputRate::default(),
-            include_derived: false,
-            parts: stemd_core::Parts::DEFAULT,
-            dsp: &crate::filters::Dsp::default(),
-            model: "digest",
+    fn a_job_key_starts_with_the_track_and_tells_outputs_apart() {
+        let output = crate::testkit::output();
+        let key = job_key("a8e29ff15c16d4f2e0b1aaaa", &output, "model-1");
+        assert!(key.starts_with("a8e29ff15c16"), "{key}");
+        let derived = Output {
+            derived: true,
+            ..output.clone()
         };
-        assert_eq!(crate::cache::key(&base).len(), 64);
+        assert_ne!(
+            key,
+            job_key("a8e29ff15c16d4f2e0b1aaaa", &derived, "model-1")
+        );
+        let parts = Output {
+            parts: stemd_core::Parts::parse("vocals,bass,other").unwrap(),
+            ..output.clone()
+        };
+        assert_ne!(key, job_key("a8e29ff15c16d4f2e0b1aaaa", &parts, "model-1"));
+        assert_ne!(key, job_key("a8e29ff15c16d4f2e0b1aaaa", &output, "model-2"));
+    }
+
+    #[test]
+    fn a_partial_fetch_restarts_the_hold() {
+        let ttl = std::time::Duration::from_millis(200);
+        let cache = crate::testkit::cache(u64::MAX, ttl);
+        let entry = crate::testkit::publish(&cache, "half", 64, 1.0);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        entry.mark_fetched(&entry.stems[0].name);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(entry.held(ttl), "the fetch restarted the clock");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!entry.held(ttl), "past the ttl");
     }
 }
