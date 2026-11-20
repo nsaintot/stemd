@@ -40,6 +40,7 @@ mod switch;
 mod testkit;
 mod ui;
 mod update;
+mod v1;
 
 use anyhow::Result;
 use tracing_subscriber::Layer;

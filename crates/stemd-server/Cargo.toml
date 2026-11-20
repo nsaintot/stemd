@@ -33,6 +33,7 @@ dirs = "6"
 
 [dev-dependencies]
 stemd-core = { path = "../stemd-core", features = ["toy"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 # winit is eframe's window layer and otherwise an implementation detail. It is
 # named here for a single call: asking for the X11 backend, which is the only
