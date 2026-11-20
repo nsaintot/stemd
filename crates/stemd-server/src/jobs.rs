@@ -1,4 +1,4 @@
-//! Job store and the result objects it hands back.
+//! The table of live jobs and the result objects it hands back.
 //!
 //! A job is a handle, not storage: the stems it points at belong to
 //! [`crate::cache`], which is the only thing that governs disk. Two jobs can
@@ -159,7 +159,7 @@ impl Job {
     ///
     /// Terminal like [`Job::fail`], but with no error attached: nothing went
     /// wrong, so there is nothing for a client to read back. It keeps a job that
-    /// outlives its removal from the store from looking like it is still
+    /// outlives its removal from the table from looking like it is still
     /// separating, which would let `claim` join it forever.
     pub fn cancelled(&self) {
         self.set_progress(Progress::new(Stage::Cancelled));
@@ -201,8 +201,7 @@ impl From<crate::cache::TrackInfo> for MixShape {
     }
 }
 
-/// Jobs indexed both ways: by id for lookups, and by cache key so
-/// [`JobStore::claim`] is a lookup rather than a scan over every live job.
+/// Jobs indexed by id, and by cache key for [`Jobs::claim`].
 #[derive(Default)]
 struct Registry {
     by_id: HashMap<String, Arc<Job>>,
@@ -235,16 +234,16 @@ impl Registry {
     }
 }
 
-pub struct JobStore {
+pub struct Jobs {
     jobs: Mutex<Registry>,
     /// How long a failed job stays readable, and a finished one after it
     /// finished or after its last stem fetch.
     retain_failed: Duration,
-    /// Distinguishes attempts at the same track. See [`JobStore::claim`].
+    /// Distinguishes attempts at the same track. See [`Jobs::claim`].
     attempts: AtomicU64,
 }
 
-impl JobStore {
+impl Jobs {
     pub fn new(retain_failed: Duration) -> Self {
         Self {
             jobs: Mutex::new(Registry::default()),
@@ -508,34 +507,34 @@ mod tests {
     #[test]
     fn a_finished_job_is_pruned_once_unused_or_once_its_stems_are_gone() {
         let cache = cache(u64::MAX, Duration::from_secs(3600));
-        let store = JobStore::new(Duration::from_millis(30));
-        let job = store.create("track".into());
+        let jobs = Jobs::new(Duration::from_millis(30));
+        let job = jobs.create("track".into());
         job.complete(publish(&cache, "track", 32, 2.0), false);
-        assert_eq!(store.prune(), 0, "just finished");
+        assert_eq!(jobs.prune(), 0, "just finished");
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(store.prune(), 1, "unused for its retention");
+        assert_eq!(jobs.prune(), 1, "unused for its retention");
 
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("gone".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("gone".into());
         let entry = publish(&cache, "gone", 32, 2.0);
         std::fs::remove_dir_all(&entry.dir).expect("stems deleted");
         job.complete(entry, false);
-        assert_eq!(store.prune(), 1, "the handle points at nothing now");
+        assert_eq!(jobs.prune(), 1, "the handle points at nothing now");
     }
 
     #[test]
     fn two_jobs_can_share_one_result_with_their_own_urls() {
         let cache = cache(u64::MAX, Duration::from_secs(3600));
-        let store = JobStore::new(Duration::from_secs(3600));
+        let jobs = Jobs::new(Duration::from_secs(3600));
 
         // A second request for a track already separated gets its own handle
         // onto the same stems. Two handles only ever coexist once the first is
         // terminal, while it is running, `claim` joins it instead.
         let entry = publish(&cache, "doubles", 32, 2.0);
         let dir = entry.dir.clone();
-        let first = store.create("doubles".into());
+        let first = jobs.create("doubles".into());
         first.complete(Arc::clone(&entry), false);
-        let second = store.create("doubles".into());
+        let second = jobs.create("doubles".into());
         second.complete(entry, true);
         assert_ne!(first.id, second.id);
 
@@ -544,37 +543,37 @@ mod tests {
         assert!(second.result.lock().clone().unwrap().cached);
 
         std::fs::remove_dir_all(&dir).expect("stems deleted");
-        assert_eq!(store.prune(), 2, "both handles go with the stems");
+        assert_eq!(jobs.prune(), 2, "both handles go with the stems");
     }
 
     #[test]
     fn a_running_job_is_never_pruned() {
-        let store = JobStore::new(Duration::from_millis(1));
-        let job = store.create("key".into());
+        let jobs = Jobs::new(Duration::from_millis(1));
+        let job = jobs.create("key".into());
         job.set_progress(Progress::new(Stage::Separating));
 
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(store.prune(), 0);
-        assert_eq!(store.len(), 1);
+        assert_eq!(jobs.prune(), 0);
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]
     fn a_failure_is_kept_readable_then_dropped() {
-        let store = JobStore::new(Duration::from_millis(30));
-        let job = store.create("key".into());
+        let jobs = Jobs::new(Duration::from_millis(30));
+        let job = jobs.create("key".into());
         job.fail("model exploded");
 
-        assert_eq!(store.prune(), 0, "the client has not read the error yet");
+        assert_eq!(jobs.prune(), 0, "the client has not read the error yet");
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(store.prune(), 1);
+        assert_eq!(jobs.prune(), 1);
     }
 
     #[test]
     fn a_cache_hit_reports_the_original_separation_cost() {
         let cache = cache(u64::MAX, Duration::from_secs(3600));
-        let store = JobStore::new(Duration::from_secs(3600));
+        let jobs = Jobs::new(Duration::from_secs(3600));
         let entry = publish(&cache, "timing", 32, 2.0);
-        let job = store.create("key".into());
+        let job = jobs.create("key".into());
         job.complete(entry, true);
 
         let result = job.result.lock().clone().unwrap();
@@ -587,15 +586,15 @@ mod tests {
 
     #[test]
     fn a_second_deck_joins_a_separation_already_running() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let first = store.create("same-track".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let first = jobs.create("same-track".into());
         first.set_progress(Progress::new(Stage::Separating));
 
-        let Err(joined) = store.claim("same-track", MixShape::default()) else {
+        let Err(joined) = jobs.claim("same-track", MixShape::default()) else {
             panic!("second claim should join, not create");
         };
         assert_eq!(joined.id, first.id, "one separation, not two");
-        assert_eq!(store.len(), 1, "joining must not create a second job");
+        assert_eq!(jobs.len(), 1, "joining must not create a second job");
     }
 
     #[test]
@@ -603,18 +602,18 @@ mod tests {
         // The reason `claim` registers under the lock that looks up. With the
         // lookup and the insert apart, every thread here finds nothing in
         // flight and starts its own separation.
-        let store = Arc::new(JobStore::new(Duration::from_secs(3600)));
+        let jobs = Arc::new(Jobs::new(Duration::from_secs(3600)));
         let start = Arc::new(std::sync::Barrier::new(8));
         let created = Arc::new(Mutex::new(Vec::new()));
 
         let threads: Vec<_> = (0..8)
             .map(|_| {
-                let store = Arc::clone(&store);
+                let jobs = Arc::clone(&jobs);
                 let start = Arc::clone(&start);
                 let created = Arc::clone(&created);
                 std::thread::spawn(move || {
                     start.wait();
-                    if let Ok(job) = store.claim("one-track", MixShape::default()) {
+                    if let Ok(job) = jobs.claim("one-track", MixShape::default()) {
                         created.lock().push(job.id.clone());
                     }
                 })
@@ -625,7 +624,7 @@ mod tests {
         }
 
         assert_eq!(created.lock().len(), 1, "exactly one claim may create");
-        assert_eq!(store.len(), 1);
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]
@@ -656,10 +655,10 @@ mod tests {
     #[test]
     fn a_second_attempt_at_one_track_gets_its_own_id() {
         // Two ids for one key is what stops the DELETE below from aliasing.
-        let store = JobStore::new(Duration::from_secs(3600));
-        let first = store.create("same".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let first = jobs.create("same".into());
         first.fail("model exploded");
-        let second = store.create("same".into());
+        let second = jobs.create("same".into());
 
         assert_ne!(first.id, second.id);
         assert!(first.id.starts_with("same-") && second.id.starts_with("same-"));
@@ -671,18 +670,18 @@ mod tests {
         // then DELETEs must not release the waiter of, and so cancel, the
         // fresh separation someone else just started for the same track.
         let cache = cache(u64::MAX, Duration::from_secs(3600));
-        let store = JobStore::new(Duration::from_secs(3600));
+        let jobs = Jobs::new(Duration::from_secs(3600));
 
-        let finished = store.create("shared-track".into());
+        let finished = jobs.create("shared-track".into());
         finished.complete(publish(&cache, "shared-track", 32, 2.0), false);
 
-        let retry = store.create("shared-track".into());
+        let retry = jobs.create("shared-track".into());
         retry.set_progress(Progress::new(Stage::Separating));
 
         // The late DELETE from the first client, by the id it was given.
-        let targeted = store.get(&finished.id).expect("its own handle");
+        let targeted = jobs.get(&finished.id).expect("its own handle");
         assert_eq!(targeted.release(), 0);
-        store.remove(&finished.id);
+        jobs.remove(&finished.id);
 
         assert_eq!(
             *retry.waiters.lock(),
@@ -690,7 +689,7 @@ mod tests {
             "the running attempt lost a waiter it never had"
         );
         assert!(
-            store.get(&retry.id).is_some(),
+            jobs.get(&retry.id).is_some(),
             "the running attempt was removed by someone else's delete"
         );
     }
@@ -699,14 +698,14 @@ mod tests {
     fn claiming_finds_the_live_attempt_after_earlier_ones_are_removed() {
         // Guards the by_key index: a removed job must not leave a pointer that
         // hides the attempt actually in flight.
-        let store = JobStore::new(Duration::from_secs(3600));
-        let first = store.create("track".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let first = jobs.create("track".into());
         first.fail("boom");
-        let second = store.create("track".into());
+        let second = jobs.create("track".into());
         second.set_progress(Progress::new(Stage::Separating));
 
-        store.remove(&first.id);
-        let Err(joined) = store.claim("track", MixShape::default()) else {
+        jobs.remove(&first.id);
+        let Err(joined) = jobs.claim("track", MixShape::default()) else {
             panic!("the running attempt should be joined, not replaced");
         };
         assert_eq!(joined.id, second.id);
@@ -714,11 +713,11 @@ mod tests {
 
     #[test]
     fn a_different_track_never_joins() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("track-a".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("track-a".into());
         job.set_progress(Progress::new(Stage::Separating));
         assert!(
-            store.claim("track-b", MixShape::default()).is_ok(),
+            jobs.claim("track-b", MixShape::default()).is_ok(),
             "a different key gets its own job"
         );
     }
@@ -728,45 +727,45 @@ mod tests {
         // Once a job is terminal its stems are published, so joining it would
         // hand back a handle when the cache can answer outright.
         let cache = cache(u64::MAX, Duration::from_secs(3600));
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("done-track".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("done-track".into());
         job.complete(publish(&cache, "done-track", 32, 2.0), false);
 
         assert!(
-            store.claim("done-track", MixShape::default()).is_ok(),
+            jobs.claim("done-track", MixShape::default()).is_ok(),
             "a finished job is left to the cache"
         );
     }
 
     #[test]
     fn a_failed_job_is_not_joined_either() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("doomed".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("doomed".into());
         job.fail("model exploded");
         assert!(
-            store.claim("doomed", MixShape::default()).is_ok(),
+            jobs.claim("doomed", MixShape::default()).is_ok(),
             "a second client should get a fresh attempt, not someone else's failure"
         );
     }
 
     #[test]
     fn a_cancelled_job_is_not_joined_either() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("skipped".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("skipped".into());
         job.cancelled();
         assert!(
-            store.claim("skipped", MixShape::default()).is_ok(),
+            jobs.claim("skipped", MixShape::default()).is_ok(),
             "cueing the track again must start a fresh separation, not join the abandoned one"
         );
     }
 
     #[test]
     fn one_deck_giving_up_does_not_cancel_the_other() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("shared".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("shared".into());
         job.set_progress(Progress::new(Stage::Separating));
         assert!(
-            store.claim("shared", MixShape::default()).is_err(),
+            jobs.claim("shared", MixShape::default()).is_err(),
             "second client joins"
         );
 
@@ -776,8 +775,8 @@ mod tests {
 
     #[test]
     fn releasing_more_than_once_cannot_go_negative() {
-        let store = JobStore::new(Duration::from_secs(3600));
-        let job = store.create("twice".into());
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let job = jobs.create("twice".into());
         assert_eq!(job.release(), 0);
         assert_eq!(job.release(), 0, "a repeated delete must not underflow");
     }

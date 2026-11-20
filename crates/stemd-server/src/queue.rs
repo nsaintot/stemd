@@ -1214,14 +1214,14 @@ mod tests {
         true
     }
 
-    fn job(store: &crate::jobs::JobStore) -> Arc<Job> {
-        job_for(store, "test-key")
+    fn job(jobs: &crate::jobs::Jobs) -> Arc<Job> {
+        job_for(jobs, "test-key")
     }
 
     /// Two jobs in one test need two keys: `claim` collapses a repeated key into
     /// the separation already in flight, which is the whole point of it.
-    fn job_for(store: &crate::jobs::JobStore, key: &str) -> Arc<Job> {
-        store.create(key.into())
+    fn job_for(jobs: &crate::jobs::Jobs, key: &str) -> Arc<Job> {
+        jobs.create(key.into())
     }
 
     #[derive(Default)]
@@ -1368,9 +1368,9 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         );
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
 
-        let first = job_for(&store, "first");
+        let first = job_for(&jobs, "first");
         submit(&queue, Arc::clone(&first));
         assert!(
             wait_until(&state, Duration::from_secs(5), |s| s.started == 1),
@@ -1385,7 +1385,7 @@ mod tests {
         );
 
         // And the queue is still a queue.
-        let second = job_for(&store, "second");
+        let second = job_for(&jobs, "second");
         submit(&queue, Arc::clone(&second));
         assert!(
             wait_until(&state, Duration::from_secs(5), |s| s.started == 2),
@@ -1472,8 +1472,8 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         );
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        submit(&queue, job(&store));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        submit(&queue, job(&jobs));
         assert!(
             wait_until(&state, Duration::from_secs(5), |s| s.started == 1),
             "the worker never picked the job up"
@@ -1509,8 +1509,8 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         );
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = job(&store);
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = job(&jobs);
         submit(&queue, Arc::clone(&job));
         assert!(
             wait_until(&state, Duration::from_secs(5), |s| s.started == 1),
@@ -1579,8 +1579,8 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         );
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = job(&store);
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = job(&jobs);
         let id = job.id.clone();
         submit(&queue, Arc::clone(&job));
 
@@ -1625,10 +1625,10 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         );
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
 
-        let skipped = job_for(&store, "skipped");
-        let cued = job_for(&store, "cued");
+        let skipped = job_for(&jobs, "skipped");
+        let cued = job_for(&jobs, "cued");
         let (skipped_id, cued_id) = (skipped.id.clone(), cued.id.clone());
         submit(&queue, skipped);
         submit(&queue, cued);
@@ -1672,7 +1672,7 @@ mod tests {
     #[test]
     fn a_job_after_an_install_runs_on_the_model_that_was_installed() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let queue = start(
             Stub {
                 name: "first",
@@ -1681,7 +1681,7 @@ mod tests {
             cache(u64::MAX, Duration::from_secs(60)),
         );
 
-        submit(&queue, job_for(&store, "one"));
+        submit(&queue, job_for(&jobs, "one"));
         assert!(ran(&seen, 1), "the worker never ran the first job");
 
         // Returns once the swap has happened, on an idle queue as well as a busy
@@ -1696,7 +1696,7 @@ mod tests {
             .expect("a stub always builds");
         assert_eq!(queue.info().model, "second");
 
-        submit(&queue, job_for(&store, "two"));
+        submit(&queue, job_for(&jobs, "two"));
         assert!(ran(&seen, 2), "the worker never ran the second job");
         assert_eq!(&*seen.lock(), &["first", "second"]);
     }
@@ -1707,7 +1707,7 @@ mod tests {
     /// Asserted as an arrangement rather than as a backend error, so it needs no GPU.
     #[test]
     fn the_thread_that_builds_a_model_is_the_thread_that_runs_it() {
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let threads: Threads = Arc::default();
 
         let (queue, _) = Queue::start(
@@ -1716,11 +1716,11 @@ mod tests {
             cache(u64::MAX, Duration::from_secs(60)),
         )
         .expect("a stub always builds");
-        submit(&queue, job_for(&store, "one"));
+        submit(&queue, job_for(&jobs, "one"));
         queue
             .install(traced(&threads))
             .expect("a stub always builds");
-        submit(&queue, job_for(&store, "two"));
+        submit(&queue, job_for(&jobs, "two"));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while threads.lock().len() < 4 {
@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn an_install_that_fails_keeps_the_model_that_was_running() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let queue = start(
             Stub {
                 name: "first",
@@ -1787,7 +1787,7 @@ mod tests {
         assert!(format!("{err:#}").contains("no such weights"), "{err:#}");
 
         assert_eq!(queue.info().model, "first", "the old model was unpublished");
-        submit(&queue, job_for(&store, "after"));
+        submit(&queue, job_for(&jobs, "after"));
         assert!(ran(&seen, 1), "the worker stopped running jobs");
         assert_eq!(&*seen.lock(), &["first"]);
     }
@@ -1806,8 +1806,8 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         ));
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        submit(&queue, job(&store));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        submit(&queue, job(&jobs));
         assert!(
             wait_until(&state, Duration::from_secs(5), |s| s.started == 1),
             "the worker never picked the job up"
@@ -1852,8 +1852,8 @@ mod tests {
             },
             cache(u64::MAX, Duration::from_secs(60)),
         ));
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = job(&store);
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = job(&jobs);
         let id = job.id.clone();
         submit(&queue, job);
         assert!(
@@ -1904,7 +1904,7 @@ mod tests {
                 audio.data = audio.data.iter().map(|c| vec![f32::NAN; c.len()]).collect();
             }
         }
-        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let work = QueuedWork {
             job: jobs.create("diverged".into()),
             mix,
@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     /// A worker-less job on `mix` at `output`.
-    fn work_on(store: &crate::jobs::JobStore, mix: &Audio, output: Output) -> QueuedWork {
+    fn work_on(store: &crate::jobs::Jobs, mix: &Audio, output: Output) -> QueuedWork {
         QueuedWork {
             job: store.create(format!("{}-{}", output.rate, mix.frames())),
             mix: mix.clone(),
@@ -1946,7 +1946,7 @@ mod tests {
     fn a_hit_whose_files_vanished_is_a_miss() {
         let cache = cache(1 << 30, Duration::from_secs(60));
         let (mix, stems) = crate::testkit::stems(4410);
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let store = crate::jobs::Jobs::new(Duration::from_secs(60));
         let work = work_on(&store, &mix, crate::testkit::output());
         store_whole(&cache, &work, &stems, mix.frames(), SEPARATION).expect("stored");
         let id = track_id(&mix);
@@ -1960,7 +1960,7 @@ mod tests {
     fn a_fresh_result_over_the_budget_is_kept_until_fetched() {
         let cache = cache(100, Duration::from_secs(60));
         let (mix, stems) = crate::testkit::stems(64);
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let store = crate::jobs::Jobs::new(Duration::from_secs(60));
         let work = work_on(&store, &mix, crate::testkit::output());
         publish(&work.job, &work, &stems, &cache, mix.frames(), 1.0);
         assert_eq!(work.job.progress.lock().stage, Stage::Done);
@@ -1978,7 +1978,7 @@ mod tests {
     fn a_stored_result_reports_the_rate_it_was_converted_to() {
         let cache = cache(1 << 30, Duration::from_secs(60));
         let (mix, stems) = crate::testkit::stems(44_100);
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let store = crate::jobs::Jobs::new(Duration::from_secs(60));
         for rate in OutputRate::ALL {
             let output = Output {
                 rate,
@@ -2288,8 +2288,8 @@ mod session_tests {
         toy.delay = Duration::from_millis(20);
         let queue = start(toy, fresh_cache());
 
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = store.create("long".into());
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = jobs.create("long".into());
         queue
             .submit(QueuedWork {
                 job: Arc::clone(&job),
@@ -2340,9 +2340,9 @@ mod session_tests {
         toy.delay = Duration::from_millis(20);
         let queue = start(toy, fresh_cache());
 
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let submit = |key: &str, from_api: bool| {
-            let job = store.create(key.into());
+            let job = jobs.create(key.into());
             queue
                 .submit(QueuedWork {
                     job: Arc::clone(&job),
@@ -2386,9 +2386,9 @@ mod session_tests {
         toy.delay = Duration::from_millis(20);
         let queue = start(toy, fresh_cache());
 
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let submit = |key: &str, from_api: bool| {
-            let job = store.create(key.into());
+            let job = jobs.create(key.into());
             queue
                 .submit(QueuedWork {
                     job: Arc::clone(&job),
@@ -2426,8 +2426,8 @@ mod session_tests {
         toy.delay = Duration::from_millis(10);
         let queue = start(toy, fresh_cache());
 
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = store.create("long".into());
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = jobs.create("long".into());
         queue
             .submit(QueuedWork {
                 job: Arc::clone(&job),
@@ -2971,7 +2971,7 @@ mod session_tests {
         let id = crate::sessions::track_id(&mix);
         let cache = fresh_cache();
         let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
-        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::clone(&open);
         cache.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
@@ -3027,7 +3027,7 @@ mod session_tests {
         let id = crate::sessions::track_id(&mix);
         let cache = held_cache();
         let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
-        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let flac = output(StemFormat::Flac);
         let session = open_as(&queue, frames, None, StemFormat::Flac);
         upload(&queue, &session, 0, &mix);
@@ -3044,7 +3044,7 @@ mod session_tests {
         let id = crate::sessions::track_id(&mix);
         let cache = fresh_cache();
         let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
-        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::clone(&open);
         cache.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
@@ -3081,7 +3081,7 @@ mod session_tests {
         let frames = 30_000;
         let cache = fresh_cache();
         let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
-        let jobs = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
         let find = |out: &Output, mix: &Audio| {
             lookup(
                 &cache,
@@ -3323,8 +3323,8 @@ mod session_tests {
         let frames = 25_000;
         let mix = track(frames, 10);
         let id = crate::sessions::track_id(&mix);
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = store.create("for-pieces".into());
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = jobs.create("for-pieces".into());
         queue
             .submit(QueuedWork {
                 job: Arc::clone(&job),
@@ -3368,8 +3368,8 @@ mod session_tests {
         let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
         let mix = track(25_000, 11);
         let id = crate::sessions::track_id(&mix);
-        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
-        let job = store.create("first".into());
+        let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
+        let job = jobs.create("first".into());
         queue
             .submit(QueuedWork {
                 job: Arc::clone(&job),

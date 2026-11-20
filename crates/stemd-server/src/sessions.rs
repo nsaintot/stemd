@@ -273,6 +273,14 @@ pub struct TrackSpec {
     pub parts: Parts,
 }
 
+impl TrackSpec {
+    /// Bytes a track holds from its open: the mix and one buffer per part, as f32.
+    pub fn memory(&self) -> u64 {
+        let buffers = 1 + self.parts.names().count();
+        (buffers * self.channels * self.frames * std::mem::size_of::<f32>()) as u64
+    }
+}
+
 impl From<&TrackSpec> for TrackInfo {
     fn from(spec: &TrackSpec) -> Self {
         Self {
@@ -1045,6 +1053,30 @@ const fn gcd(a: u32, b: u32) -> u32 {
 #[error("{0} sessions are open, the most this server allows")]
 pub struct TooMany(pub usize);
 
+/// Why a session could not open on a track of its own.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error(transparent)]
+    TooMany(#[from] TooMany),
+    #[error(
+        "this track needs {:.1} GB of memory; open tracks may hold {:.1} GB",
+        gb(*.need),
+        gb(*.budget)
+    )]
+    TooLarge { need: u64, budget: u64 },
+    #[error(
+        "open tracks hold {:.1} of {:.1} GB of memory; this track needs {:.1} GB",
+        gb(*.held),
+        gb(*.budget),
+        gb(*.need)
+    )]
+    Full { need: u64, held: u64, budget: u64 },
+}
+
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
 /// Why a session could not join a track.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
@@ -1073,6 +1105,8 @@ pub struct Sessions {
     /// Tracks whose whole upload has been hashed, by id and part set.
     by_id: Mutex<BTreeMap<String, u64>>,
     limits: Mutex<(Duration, usize)>,
+    /// Bytes the open tracks may hold together, by [`TrackSpec::memory`].
+    memory_budget: AtomicU64,
     cache: Arc<Cache>,
     /// The last [`ENDED_KEPT`] sessions to end, oldest first.
     ended: Mutex<VecDeque<Ended>>,
@@ -1089,6 +1123,7 @@ impl Sessions {
             tracks: Mutex::new(BTreeMap::new()),
             by_id: Mutex::new(BTreeMap::new()),
             limits: Mutex::new((idle, max)),
+            memory_budget: AtomicU64::new(crate::disk::physical_memory().unwrap_or(8 << 30) / 2),
             cache,
             ended: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
@@ -1171,6 +1206,11 @@ impl Sessions {
         *self.limits.lock() = (idle, max);
     }
 
+    #[cfg(test)]
+    pub fn set_memory_budget(&self, bytes: u64) {
+        self.memory_budget.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn idle_timeout(&self) -> Duration {
         self.limits.lock().0
     }
@@ -1206,11 +1246,20 @@ impl Sessions {
     }
 
     /// Open a session on a track of its own.
-    pub fn open(&self, request: Request) -> Result<Arc<Session>, TooMany> {
+    pub fn open(&self, request: Request) -> Result<Arc<Session>, OpenError> {
         let max = self.limits.lock().1;
         let mut sessions = self.sessions.lock();
         if sessions.len() >= max {
-            return Err(TooMany(sessions.len()));
+            return Err(TooMany(sessions.len()).into());
+        }
+        let need = request.track.memory();
+        let budget = self.memory_budget.load(Ordering::Relaxed);
+        if need > budget {
+            return Err(OpenError::TooLarge { need, budget });
+        }
+        let held: u64 = self.tracks.lock().values().map(|t| t.spec.memory()).sum();
+        if held + need > budget {
+            return Err(OpenError::Full { need, held, budget });
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -1918,6 +1967,32 @@ mod tests {
             Some(Verdict::Verified(id)) => sessions.settle(&track, &id),
             other => panic!("the upload came to {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_open_past_the_memory_budget_is_refused_until_a_track_ends() {
+        let sessions = sessions(Duration::from_secs(30));
+        let one = spec().memory();
+        sessions.set_memory_budget(2 * one);
+        let a = sessions.open(request()).expect("open");
+        let b = sessions.open(request()).expect("open");
+        assert!(matches!(
+            sessions.open(request()),
+            Err(OpenError::Full { .. })
+        ));
+        sessions
+            .join(output(StemFormat::Pcm32), PcmFormat::F32le, None, b.track())
+            .expect("a join reserves nothing");
+        sessions.remove(&a.id, "ended by the client");
+        sessions
+            .open(request())
+            .expect("the ended track's memory is free");
+
+        sessions.set_memory_budget(one - 1);
+        assert!(matches!(
+            sessions.open(request()),
+            Err(OpenError::TooLarge { .. })
+        ));
     }
 
     #[test]

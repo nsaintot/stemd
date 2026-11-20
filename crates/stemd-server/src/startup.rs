@@ -4,7 +4,6 @@
 //! mounted": locating and loading the model, opening the stem cache, starting
 //! the worker and the reaper, and advertising over mDNS.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,20 +17,18 @@ use stemd_core::{
 use crate::api::AppState;
 use crate::cache::Cache;
 use crate::cli::Args;
-use crate::jobs::JobStore;
+use crate::jobs::Jobs;
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::models::{self, DEFAULT_PRESET, Preset};
 use crate::precision::Precisions;
 use crate::queue::{BuildSeparator, Queue};
-use crate::settings::{self, SettingsStore};
+use crate::settings::{self, SettingsFile};
 use crate::switch::{self, Switcher};
 
 /// A server wired up and ready to bind.
 pub struct Server {
     pub state: Arc<AppState>,
-    /// Largest request body axum will buffer, derived from `--max-track-minutes`.
-    pub max_upload: usize,
     /// One line describing where stems go, for the startup log.
     pub cache_summary: String,
 }
@@ -41,9 +38,15 @@ pub struct Server {
 /// The stem cache is opened before the model because the worker that loads the
 /// model needs it. See [`crate::queue::BuildSeparator`].
 ///
-/// `addr` is where the listener is already bound, not where it was asked to be, so
-/// it is the real port under `--bind :0`. Progress is reported through `launch`.
-pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) -> Result<Server> {
+/// `endpoint` holds where the listener is already bound, which is the real port
+/// under `--bind :0`. Progress is reported through `launch`.
+pub fn prepare(
+    args: &Args,
+    logs: LogBuffer,
+    settings: Arc<SettingsFile>,
+    endpoint: crate::endpoint::Endpoint,
+    launch: &Launch,
+) -> Result<Server> {
     // Asked once. The accelerator cannot change under a running server, and
     // every model loaded from here on is chosen against the same answer.
     let precisions = Precisions::detect(args.forced_precision());
@@ -63,9 +66,8 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
             );
         }
     }
-    let settings = Arc::new(open_settings(args)?);
-    let (stems, cache_summary) = open_stem_cache(args)?;
-    let store = Arc::new(JobStore::new(args.unfetched_ttl()));
+    let (stems, cache_summary) = open_stem_cache(args, &settings.get())?;
+    let jobs = Arc::new(Jobs::new(args.unfetched_ttl()));
 
     let (model, queue, info) = load_model(args, &settings, &stems, precisions, launch)?;
     queue.sessions().set_limits(
@@ -74,14 +76,21 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
     );
     stems.set_gate(queue.consolidation_gate());
     spawn_session_reaper(Arc::clone(&queue));
-    let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
-    log_model(&info, precisions, args.max_track_secs(), max_upload);
+    let longest = crate::disk::longest_track_minutes();
+    let saved = settings.get().max_track_minutes;
+    if saved > f64::from(longest) {
+        tracing::warn!(
+            "a {saved:.0}-minute track does not fit this machine's memory; \
+             accepting up to {longest} minutes"
+        );
+    }
+    log_model(&info, precisions, settings.get().max_track_secs(longest));
 
     // Built before the app state so every exit path can reach it. Headless
     // there is no switch to turn it back on, so it always serves.
     let serving = crate::serving::Serving::new(
         args.headless || settings.get().serving,
-        announce(args, addr.port()),
+        announce(args, endpoint.port()),
         &info.model,
     );
 
@@ -107,24 +116,23 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
         switcher.published_identity()
     );
 
-    spawn_reaper(Arc::clone(&stems), Arc::clone(&store), Arc::clone(&queue));
+    spawn_reaper(Arc::clone(&stems), Arc::clone(&jobs), Arc::clone(&queue));
     let filters = open_filters()?;
 
     Ok(Server {
         state: Arc::new(AppState {
-            store,
+            jobs,
             cache: stems,
             queue,
             switcher,
             logs,
             drops: Arc::default(),
             settings,
-            max_track_secs: args.max_track_secs(),
             serving,
             filters,
             ephemeral: args.ephemeral,
+            endpoint,
         }),
-        max_upload,
         cache_summary,
     })
 }
@@ -134,7 +142,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
 /// The flags are parsed here rather than where they are used so a typo fails at
 /// launch with the flag quoted, instead of on the first request that would have
 /// needed it.
-fn open_settings(args: &Args) -> Result<SettingsStore> {
+pub fn open_settings(args: &Args) -> Result<SettingsFile> {
     let path = match args.settings.clone() {
         Some(path) => path,
         None => settings::default_path()?,
@@ -158,7 +166,10 @@ fn open_settings(args: &Args) -> Result<SettingsStore> {
         })
         .transpose()?;
 
-    Ok(SettingsStore::open(path).pin(format, rate))
+    Ok(SettingsFile::open(path)
+        .pin(format, rate)
+        .pin_cache(args.cache_max_gb, args.whole_max_days)
+        .pin_server(args.bind.map(|addr| addr.port()), args.max_track_minutes))
 }
 
 /// Where the model was found, and what the switcher needs to replace it later.
@@ -188,7 +199,7 @@ struct LoadedModel {
 /// get one.
 fn load_model(
     args: &Args,
-    settings: &SettingsStore,
+    settings: &SettingsFile,
     stems: &Arc<Cache>,
     precisions: Precisions,
     launch: &Launch,
@@ -471,13 +482,20 @@ fn joined(dirs: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
+fn open_stem_cache(
+    args: &Args,
+    settings: &crate::settings::Settings,
+) -> Result<(Arc<Cache>, String)> {
     let root = crate::cache::root(args)?;
-    let rules = args.cache_rules();
+    let rules = args.cache_rules(settings);
     let cache = Cache::open_with(root.clone(), rules)
         .with_context(|| format!("preparing the stem cache in {}", root.display()))?;
     if args.ephemeral {
         cache.wipe();
+    }
+    // Only beside the default root: `--cache-dir` may name that old directory.
+    if args.cache_dir.is_none() {
+        crate::migrate::remove_old_pieces_dir();
     }
     let stats = cache.stats();
     let summary = format!(
@@ -494,7 +512,7 @@ fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
 fn open_filters() -> Result<Arc<crate::filters::Filters>> {
     let dir = models::support_dir()?.join("filters");
     let filters = crate::filters::Filters::open(dir.clone(), crate::filters::MAX_FILTERS)
-        .with_context(|| format!("preparing the filter store in {}", dir.display()))?;
+        .with_context(|| format!("preparing the filters directory in {}", dir.display()))?;
     tracing::info!(
         "filters in {}: {} of {}",
         dir.display(),
@@ -516,7 +534,7 @@ fn announce(args: &Args, port: u16) -> Option<(String, u16)> {
 /// Apply the cache's age rules every [`crate::cache::CLEAN_EVERY`], its
 /// budget every tick, drop stale job handles, and hand MLX's allocator cache
 /// back once the server has been idle for [`IDLE_RELEASE`].
-fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
+fn spawn_reaper(cache: Arc<Cache>, jobs: Arc<Jobs>, queue: Arc<Queue>) {
     let interval = crate::cache::CLEAN_EVERY;
     std::thread::Builder::new()
         .name("stemd-reaper".into())
@@ -530,7 +548,7 @@ fn spawn_reaper(cache: Arc<Cache>, store: Arc<JobStore>, queue: Arc<Queue>) {
                     swept = Instant::now();
                     cache.clean();
                 }
-                let pruned = store.prune();
+                let pruned = jobs.prune();
                 if pruned > 0 {
                     tracing::debug!("dropped {pruned} job handles");
                 }
@@ -595,7 +613,7 @@ const IDLE_TICK: Duration = Duration::from_secs(5);
 /// upload arrives at whatever rate the client holds and is converted here. Above
 /// that rate the body is refused by length; the duration limit still applies
 /// underneath it, so this only decides how far past 44.1 kHz an upload may go.
-fn max_body_bytes(max_track_secs: f64, sample_rate: u32, channels: usize) -> usize {
+pub fn max_body_bytes(max_track_secs: f64, sample_rate: u32, channels: usize) -> usize {
     let per_second =
         f64::from(sample_rate) * channels as f64 * PcmFormat::F32le.bytes_per_sample() as f64;
     (max_track_secs * per_second) as usize
@@ -603,7 +621,7 @@ fn max_body_bytes(max_track_secs: f64, sample_rate: u32, channels: usize) -> usi
 
 /// The highest rate `output_sample_rate` names, and the highest an upload can
 /// carry within the body limit.
-fn highest_rate() -> u32 {
+pub fn highest_rate() -> u32 {
     stemd_core::OutputRate::ALL
         .iter()
         .map(|rate| rate.hz())
@@ -611,12 +629,7 @@ fn highest_rate() -> u32 {
         .unwrap_or(96_000)
 }
 
-fn log_model(
-    info: &stemd_core::BackendInfo,
-    precisions: Precisions,
-    max_track_secs: f64,
-    max_upload: usize,
-) {
+fn log_model(info: &stemd_core::BackendInfo, precisions: Precisions, max_track_secs: f64) {
     // The backend by name rather than `info.device`'s coarse "gpu": on a
     // cross-platform build the difference between metal, cuda and a CPU
     // fallback is the first thing worth knowing, and it decides the precision
@@ -630,11 +643,9 @@ fn log_model(
         info.channels,
     );
     tracing::info!(
-        "accepting tracks up to {:.0} minutes at any rate up to {} Hz ({:.0} MB \
-         at f32le)",
+        "accepting tracks up to {:.0} minutes at any rate up to {} Hz",
         max_track_secs / 60.0,
         highest_rate(),
-        max_upload as f64 / 1e6
     );
     tracing::info!(
         "output: {} stems [{}]",

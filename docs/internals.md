@@ -50,9 +50,13 @@ One cache for jobs, sessions and drops, in `~/Library/Caches/stemd`
 | --- | --- |
 | a track in use is never deleted | always |
 | partial, unused for `--partial-max-hours` (24) | at start and hourly |
-| whole, unused for `--whole-max-days` (30) | at start and hourly |
+| whole, unused for `--whole-max-days` (30, 0 never) | at start and hourly |
 | over `--cache-max-gb` (8), or the free disk minus 2 GB: partial tracks first, oldest first, then whole tracks, least recently used first, down to 90% | after each write and every 5 s |
 
+- The size and the whole-track age are settings: the window's Settings sheet
+  changes them, applies them at once, and saves them in `settings.json` as
+  `cache_max_gb` and `whole_max_days`. A flag overrides one for the run and
+  greys its control.
 - Start also deletes `.part` files and the per-job directories of stemd 0.2.0,
   named by 64 hex characters (`migrate.rs`, removed with protocol 1). `--ephemeral` empties the cache at start and at
   quit.
@@ -177,7 +181,7 @@ logged and ignored: a client with the address configured out of band still works
 ## Drops
 
 A file dropped on the window is the same job a `POST /v2/jobs` makes: same track
-id, same job store, same worker, same cache. A drop and a client asking for the
+id, same job table, same worker, same cache. A drop and a client asking for the
 same track join one separation, and the same file twice is a cache hit. `drops.rs`
 differs at two points: the audio comes from a file, and it always asks for the
 derived part, because a folder of stems has no mix to rebuild it from.
@@ -201,12 +205,13 @@ too. `RUST_LOG` overrides both at once.
 
 ## Settings
 
-The model, output format and output sample rate persist to
+The model, output format, output sample rate, port, longest track and the
+cache's size and age persist to
 `~/Library/Application Support/stemd/settings.json`. Every field is optional and
 stored as the string the matching flag would take, so the file stays
 hand-editable and one unreadable field costs that field rather than the file.
 
-A flag is for one run, so the store keeps two copies: what the file says and
+A flag is for one run, so `SettingsFile` keeps two copies: what the file says and
 what this run is using. A write serializes the whole document, so without the
 second copy a change to the rate would also save a `--output-format` flag.
 
@@ -214,7 +219,20 @@ Format and rate are a pair, and a pair that cannot exist is reconciled rather
 than attempted: `mp3` has no 96 kHz mode, and LAME does not refuse one it lacks:
 it turns on its own resampler and spends eighteen seconds a stem producing a
 48 kHz file nobody asked for. Flags, the settings UI, a hand-edited file and an
-older file can all produce an invalid pair, so the store enforces it.
+older file can all produce an invalid pair, so `SettingsFile` enforces it.
+
+The Settings sheet applies its changes while the server runs:
+
+| setting | applied by |
+| --- | --- |
+| port | binding the new port, handing it to the serve loop, and moving the mDNS advertisement; the old listener stops accepting and its open requests finish |
+| longest track | each request reading it; the body cap is computed per request from it |
+| cache size and age | `Cache::set_limits`, which deletes what the new limits exclude |
+
+The longest track never passes what memory holds: a separation peaks at about
+1.8 GB plus 155 MB per audio minute, and the cap keeps that within three
+quarters of physical memory. That is 29 minutes on 8 GB, 71 on 16 GB and 320
+on 64 GB. A saved length or a flag past it is cut to it, with a warning.
 
 ## Shutdown
 

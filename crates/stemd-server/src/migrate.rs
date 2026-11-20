@@ -1,6 +1,7 @@
 //! What stemd 0.2.0 left behind: its cache layout and its flag names.
 //!
-//! Removed together with protocol 1.
+//! Removed together with protocol 1, along with the `--pieces-max-gb` alias of
+//! `--cache-max-gb` in cli.rs.
 
 use std::path::Path;
 
@@ -23,4 +24,19 @@ pub fn remove_old_layout(root: &Path) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Delete `stemd-pieces` under the platform's cache directory, where stemd
+/// 0.2.0 kept session pieces, on a background thread.
+pub fn remove_old_pieces_dir() {
+    let Some(old) = dirs::cache_dir().map(|dir| dir.join("stemd-pieces")) else {
+        return;
+    };
+    if !old.is_dir() {
+        return;
+    }
+    std::thread::spawn(move || match std::fs::remove_dir_all(&old) {
+        Ok(()) => tracing::info!("deleted stemd 0.2.0's piece cache in {}", old.display()),
+        Err(err) => tracing::warn!("could not delete {}: {err}", old.display()),
+    });
 }

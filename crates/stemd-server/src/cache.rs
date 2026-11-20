@@ -208,7 +208,7 @@ fn file(k: usize, extension: &str) -> String {
 
 pub struct Cache {
     root: PathBuf,
-    rules: Rules,
+    rules: Mutex<Rules>,
     bytes: AtomicU64,
     /// Job results, in use until fetched; see [`Entry::held`].
     holds: Mutex<Vec<Weak<Entry>>>,
@@ -257,7 +257,7 @@ impl Cache {
         }
         let cache = Arc::new(Self {
             root,
-            rules,
+            rules: Mutex::new(rules),
             bytes: AtomicU64::new(bytes),
             holds: Mutex::new(Vec::new()),
             writing: Mutex::new(HashSet::new()),
@@ -274,6 +274,21 @@ impl Cache {
         });
         cache.clean();
         Ok(cache)
+    }
+
+    /// Change the byte cap and the whole-track age, and apply them. Returns the
+    /// tracks and bytes deleted.
+    pub fn set_limits(&self, max_bytes: u64, whole_max_age: Duration) -> (usize, u64) {
+        {
+            let mut rules = self.rules.lock();
+            rules.max_bytes = max_bytes;
+            rules.whole_max_age = whole_max_age;
+        }
+        self.clean()
+    }
+
+    fn rules(&self) -> Rules {
+        *self.rules.lock()
     }
 
     /// Keep `entry`'s track directory while [`Entry::held`] says so.
@@ -303,7 +318,7 @@ impl Cache {
             holds
                 .iter()
                 .filter_map(Weak::upgrade)
-                .filter(|entry| entry.held(self.rules.unfetched_ttl))
+                .filter(|entry| entry.held(self.rules().unfetched_ttl))
                 .map(|entry| entry.dir.clone()),
         );
         dirs
@@ -338,7 +353,7 @@ impl Cache {
         Stats {
             tracks,
             bytes: self.bytes(),
-            max_bytes: self.rules.max_bytes,
+            max_bytes: self.rules().max_bytes,
         }
     }
 
@@ -393,17 +408,19 @@ impl Cache {
         }
     }
 
-    /// Apply the age rules, then the budget.
-    pub fn clean(&self) {
+    /// Apply the age rules, then the budget. Returns the tracks and bytes
+    /// deleted.
+    pub fn clean(&self) -> (usize, u64) {
+        let rules = self.rules();
         let now = SystemTime::now();
         let held = self.lock.lock();
         let in_use = self.in_use();
         let (mut count, mut freed) = (0usize, 0u64);
         for track in track_dirs(&self.root) {
             let max_age = if track.whole {
-                self.rules.whole_max_age
+                rules.whole_max_age
             } else {
-                self.rules.partial_max_age
+                rules.partial_max_age
             };
             let unused = now.duration_since(track.used).unwrap_or_default();
             if unused > max_age
@@ -424,7 +441,8 @@ impl Cache {
                 freed as f64 / 1e6
             );
         }
-        self.evict();
+        let (evicted, evicted_bytes) = self.evict();
+        (count + evicted, freed + evicted_bytes)
     }
 
     /// Set how eviction learns which tracks are in use.
@@ -786,10 +804,11 @@ impl Cache {
 
     /// Delete track directories until the cache is under budget: partial ones
     /// first, oldest first, then whole ones, least recently used first.
-    pub fn evict(&self) {
-        let budget = crate::disk::budget(self.rules.max_bytes, self.bytes(), &self.root);
+    /// Returns the tracks and bytes deleted.
+    pub fn evict(&self) -> (usize, u64) {
+        let budget = crate::disk::budget(self.rules().max_bytes, self.bytes(), &self.root);
         if self.bytes() <= budget {
-            return;
+            return (0, 0);
         }
         let _held = self.lock.lock();
         let in_use = self.in_use();
@@ -819,6 +838,7 @@ impl Cache {
         if self.bytes() > target && kept > 0 {
             tracing::warn!("cache still over budget: {kept} tracks in use were kept");
         }
+        (deleted, freed)
     }
 }
 

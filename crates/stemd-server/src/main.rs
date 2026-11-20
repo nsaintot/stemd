@@ -19,6 +19,7 @@ mod cuda;
 mod discovery;
 mod disk;
 mod drops;
+mod endpoint;
 mod filters;
 mod ident;
 mod jobs;
@@ -66,11 +67,15 @@ fn main() -> Result<()> {
     }
     // Before `prepare`, which clears the cache root. Held until the process ends.
     let _instance = cache::lock(&cache::root(&args)?)?;
-    let listener = serve::bind(args.bind)?;
+    let settings = std::sync::Arc::new(startup::open_settings(&args)?);
+    let (listener, taken) = match args.bind {
+        Some(addr) => (serve::bind(addr)?, None),
+        None => serve::bind_saved(settings.get().port)?,
+    };
     if args.headless {
-        serve::headless(&args, logs, listener)
+        serve::headless(&args, logs, settings, listener, taken)
     } else {
-        serve::windowed(args, logs, listener)
+        serve::windowed(args, logs, settings, listener, taken)
     }
 }
 

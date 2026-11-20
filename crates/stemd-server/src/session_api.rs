@@ -28,7 +28,7 @@ use stemd_core::{Audio, Normalisation, StemFormat};
 use crate::api::{ApiError, AppState, CreateParams, default_channels, default_rate, parse_output};
 use crate::cache::Cache;
 use crate::sessions::{
-    JoinError, Request, Session, Sessions, TooMany, TrackSpec, UploadError, WindowRequest,
+    JoinError, OpenError, Request, Session, Sessions, TrackSpec, UploadError, WindowRequest,
     output_index, served,
 };
 use crate::whole::Whole;
@@ -186,13 +186,14 @@ async fn open(
         return Err(ApiError::bad_request("frames must be at least 1"));
     };
     let secs = frames as f64 / f64::from(model_rate);
-    if secs > state.max_track_secs {
+    let max_secs = state.max_track_secs();
+    if secs > max_secs {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "track is {:.1} minutes; this server accepts up to {:.0}",
                 secs / 60.0,
-                state.max_track_secs / 60.0
+                max_secs / 60.0
             ),
         ));
     }
@@ -246,7 +247,13 @@ async fn open(
             peak: params.peak,
             model_id: state.switcher.cache_id(),
         })
-        .map_err(|e: TooMany| ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")))?;
+        .map_err(|e| {
+            let status = match e {
+                OpenError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                OpenError::TooMany(_) | OpenError::Full { .. } => StatusCode::TOO_MANY_REQUESTS,
+            };
+            ApiError::new(status, format!("{e}"))
+        })?;
     session.set_file(params.file.clone());
     tracing::info!(
         session = %session.id,
@@ -654,6 +661,35 @@ mod tests {
         };
         let err = open_whole(&whole).await.expect_err("no such file");
         assert_eq!(err.into_response().status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn an_open_past_the_memory_budget_is_413_alone_and_429_beside_others() {
+        let state = state();
+        let app = crate::api::router(std::sync::Arc::clone(&state));
+        let uri = "/v2/sessions?frames=30000";
+        let sessions = state.queue.sessions();
+        let first = call(&app, Method::POST, uri, Vec::new()).await;
+        assert_eq!(first.status, StatusCode::CREATED, "{}", first.json);
+        let id = first.json["id"].as_str().unwrap();
+        let one = sessions.get(id).unwrap().track().spec.memory();
+
+        sessions.set_memory_budget(2 * one - 1);
+        let beside = call(&app, Method::POST, uri, Vec::new()).await;
+        assert_eq!(
+            beside.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            beside.json
+        );
+        sessions.set_memory_budget(one - 1);
+        let alone = call(&app, Method::POST, uri, Vec::new()).await;
+        assert_eq!(
+            alone.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            alone.json
+        );
     }
 
     #[tokio::test]

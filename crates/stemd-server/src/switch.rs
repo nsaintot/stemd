@@ -22,7 +22,7 @@ use crate::ident;
 use crate::models::{self, Preset};
 use crate::precision::Precisions;
 use crate::queue::Queue;
-use crate::settings::SettingsStore;
+use crate::settings::SettingsFile;
 
 /// Live state of a model switch, shared between the window and the thread doing
 /// the work.
@@ -82,7 +82,7 @@ pub struct Switcher {
     /// window simply shows nothing selected rather than claiming otherwise.
     current: Mutex<Option<Preset>>,
     queue: Arc<Queue>,
-    settings: Arc<SettingsStore>,
+    settings: Arc<SettingsFile>,
     config: SwitchConfig,
 }
 
@@ -90,7 +90,7 @@ impl Switcher {
     pub fn new(
         current: Option<Preset>,
         queue: Arc<Queue>,
-        settings: Arc<SettingsStore>,
+        settings: Arc<SettingsFile>,
         config: SwitchConfig,
     ) -> Self {
         Self {
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     #[ignore]
     fn separating_works_across_a_preset_switch() {
-        use crate::jobs::JobStore;
+        use crate::jobs::Jobs;
         use crate::output::Output;
         use crate::queue::{Queue, QueuedWork};
         use stemd_core::{Audio, DspMode, OutputRate, StemFormat};
@@ -351,7 +351,7 @@ mod tests {
         };
         let dir = PathBuf::from(dir);
         let cache = crate::testkit::cache(u64::MAX, std::time::Duration::from_secs(600));
-        let store = JobStore::new(std::time::Duration::from_secs(600));
+        let jobs = Jobs::new(std::time::Duration::from_secs(600));
 
         //  Eight seconds of tone and noise: long enough to cross a segment boundary,
         //  short enough that Quality is not a coffee break. A bass note, a chord, a
@@ -384,7 +384,7 @@ mod tests {
         let mix = Audio::new(vec![left, right], hz as u32);
 
         let separate = |queue: &Queue, key: &str| {
-            let job = store.create(key.to_owned());
+            let job = jobs.create(key.to_owned());
             queue
                 .submit(QueuedWork {
                     job: Arc::clone(&job),
@@ -439,7 +439,7 @@ mod tests {
         let queue = Arc::new(queue);
         separate(&queue, "before-the-switch");
 
-        let settings = Arc::new(crate::settings::SettingsStore::open(
+        let settings = Arc::new(crate::settings::SettingsFile::open(
             std::env::temp_dir().join(format!("stemd-switch-test-{}.json", std::process::id())),
         ));
         let switcher = Arc::new(Switcher::new(

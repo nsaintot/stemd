@@ -27,7 +27,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::api::{ApiError, AppState, CreateParams, parse_output};
 use crate::cache::{Cache, Consolidation, TrackInfo, stems_of, type_dir, type_prefix};
-use crate::jobs::{JobStore, MixShape, job_key};
+use crate::jobs::{Jobs, MixShape, job_key};
 use crate::output::Output;
 use crate::session_api::{open_whole, send_whole};
 use crate::sessions::{Sessions, TRACK_ID_LEN, gain, served};
@@ -268,7 +268,7 @@ fn derivable(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Option
 pub fn lookup(
     cache: &Arc<Cache>,
     sessions: &Sessions,
-    jobs: &JobStore,
+    jobs: &Jobs,
     model_id: &str,
     output: &Output,
     id: &str,
@@ -538,7 +538,7 @@ async fn answer_for(
     let output = output_of(state, params)?;
     let model_id = state.switcher.cache_id();
     let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
-    let jobs = Arc::clone(&state.store);
+    let jobs = Arc::clone(&state.jobs);
     let found = tokio::task::spawn_blocking(move || {
         lookup(&cache, &sessions, &jobs, &model_id, &output, &id).ok_or_else(|| unknown(&id))
     })
@@ -561,7 +561,7 @@ async fn resolve(
     let output = output_of(state, params)?;
     let model_id = state.switcher.cache_id();
     let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
-    let jobs = Arc::clone(&state.store);
+    let jobs = Arc::clone(&state.jobs);
     tokio::task::spawn_blocking(move || {
         if let Some(best) = whole_dir(&cache, &model_id, &output, &id) {
             return Ok(best);
@@ -745,7 +745,7 @@ mod tests {
             sample_rate: 44_100,
             channels: 2,
         };
-        let Ok(job) = state.store.claim(&key, mix) else {
+        let Ok(job) = state.jobs.claim(&key, mix) else {
             panic!("a job already holds {key}");
         };
         state.cache.record_file(FILE, TRACK).expect("recorded");

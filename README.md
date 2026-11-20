@@ -65,7 +65,8 @@ a cache hit the next time, from a drop or a client.
 - `model_id` in `/v2/health` names the exact weights and settings behind the
 stems, so a client can key its own stem cache on it.
 - The server switch in the status bar turns the API off without closing the
-app.
+app. The gear beside it opens the settings: the longest track, the port, and
+the cache.
 - `stemd-cli` is the reference client:
   ```bash
   stemd-cli path/to/track.wav
@@ -134,11 +135,11 @@ Method and notes: [docs/evaluation.md](docs/evaluation.md#every-preset-per-part)
 ## Where things go
 
 
-|        |                                                        |
-| ------ | ------------------------------------------------------ |
-| stems  | `<track>-stems/`, beside the track                     |
-| models | the user data directory, downloaded once               |
-| cache  | every separation, capped at 8 GB, kept across restarts |
+|        |                                                                |
+| ------ | -------------------------------------------------------------- |
+| stems  | `<track>-stems/`, beside the track                             |
+| models | the user data directory, downloaded once                       |
+| cache  | every separation, 8 GB and 30 days by default, set in Settings |
 
 
 Repeating a track already separated returns the cached result: stems are kept

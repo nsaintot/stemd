@@ -26,6 +26,7 @@ mod probe;
 mod quit;
 mod recents;
 mod section;
+mod settings_sheet;
 mod starting;
 mod status;
 mod theme;
@@ -33,7 +34,6 @@ mod titlebar;
 mod update;
 mod widgets;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -106,7 +106,7 @@ const WINDOW_ICON: &[u8] = include_bytes!("../../../../resources/stemd-icon-mac-
 #[cfg(not(target_os = "macos"))]
 const WINDOW_ICON: &[u8] = include_bytes!("../../../../resources/stemd-icon-win-256.png");
 
-pub fn run(launch: Arc<Launch>, bind: SocketAddr) -> Result<(), eframe::Error> {
+pub fn run(launch: Arc<Launch>) -> Result<(), eframe::Error> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(MIN_WINDOW_SIZE)
@@ -168,7 +168,6 @@ pub fn run(launch: Arc<Launch>, bind: SocketAddr) -> Result<(), eframe::Error> {
             crate::update::start(&cc.egui_ctx);
             Ok(Box::new(App {
                 launch,
-                bind,
                 brushes: Brushes::new(&cc.egui_ctx),
                 first_run: starting::View::default(),
                 window: None,
@@ -180,7 +179,6 @@ pub fn run(launch: Arc<Launch>, bind: SocketAddr) -> Result<(), eframe::Error> {
 /// The startup view until the server is ready, then [`Window`].
 struct App {
     launch: Arc<Launch>,
-    bind: SocketAddr,
     brushes: Brushes,
     first_run: starting::View,
     window: Option<Window>,
@@ -193,7 +191,7 @@ impl eframe::App for App {
         {
             let motion = self.first_run.take_motion();
             let globe = self.first_run.globe;
-            self.window = Some(Window::new(Arc::clone(state), self.bind, motion, globe));
+            self.window = Some(Window::new(Arc::clone(state), motion, globe));
             self.first_run.globe_handed_off = true;
         }
         match &mut self.window {
@@ -250,12 +248,13 @@ impl eframe::App for App {
 
 struct Window {
     state: Arc<AppState>,
-    bind: SocketAddr,
     logs: logs::View,
     /// Whether the log pane is open.
     show_logs: bool,
     /// Height the log pane took last frame, 0 when closed.
     logs_height: Option<f32>,
+    /// The settings sheet, open over the window or not.
+    settings: settings_sheet::Sheet,
     /// The window's height, following what the Clients list, the Separated
     /// list and the log pane want, so they are not squeezed.
     fit: fit::Fit,
@@ -300,18 +299,13 @@ struct Intro {
 const INTRO_SECS: f32 = 0.8;
 
 impl Window {
-    fn new(
-        state: Arc<AppState>,
-        bind: SocketAddr,
-        motion: globe::Motion,
-        globe: Option<(egui::Rect, f32)>,
-    ) -> Self {
+    fn new(state: Arc<AppState>, motion: globe::Motion, globe: Option<(egui::Rect, f32)>) -> Self {
         Self {
             state,
-            bind,
             logs: logs::View::default(),
             show_logs: false,
             logs_height: None,
+            settings: settings_sheet::Sheet::default(),
             fit: fit::Fit::default(),
             sections_room: 0.0,
             current: None,
@@ -441,8 +435,14 @@ impl Window {
                 if let Some(t) = reveal {
                     ui.multiply_opacity(t);
                 }
-                match status::bar(ui, &self.state, &palette, self.bind.port(), self.show_logs) {
-                    Some(status::Action::ToggleLogs) => self.show_logs = !self.show_logs,
+                let settings_open = self.settings.is_open();
+                match status::bar(ui, &self.state, &palette, settings_open, self.show_logs) {
+                    Some(status::Action::Toggle(status::Pane::Settings)) => {
+                        self.settings.toggle(&self.state);
+                    }
+                    Some(status::Action::Toggle(status::Pane::Logs)) => {
+                        self.show_logs = !self.show_logs;
+                    }
                     Some(status::Action::ToggleServer) => {
                         let on = !self.state.serving.is_on();
                         self.state.serving.set(on, &self.state.queue.info().model);
@@ -579,6 +579,7 @@ impl Window {
             })
             .inner;
         self.logs_height = Some(logs_height);
+        settings_sheet::show(&mut self.settings, &self.state, &ctx, &palette, brushes);
         // The first frame fits the window to its contents, whatever size it
         // was saved at; later frames follow changes in what the sections want.
         if !self.fit.started() {

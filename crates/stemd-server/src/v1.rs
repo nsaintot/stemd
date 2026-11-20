@@ -231,7 +231,7 @@ async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
     Ok(Json(job_view(&state, &job)).into_response())
 }
 
@@ -305,7 +305,7 @@ mod tests {
     async fn a_job_result_has_the_0_2_0_shape() {
         let state = state();
         let app = api::router(Arc::clone(&state));
-        let job = state.store.create("track".into());
+        let job = state.jobs.create("track".into());
         job.complete(
             crate::testkit::publish(&state.cache, "track", 100, 1.0),
             false,

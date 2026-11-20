@@ -133,10 +133,12 @@ session stored, and the reverse.
 | --- | --- |
 | A track in use is never deleted. | |
 | A partial track unused for `--partial-max-hours` is deleted. | 24 |
-| A whole track unused for `--whole-max-days` is deleted. | 30 |
+| A whole track unused for `--whole-max-days` is deleted; `0` never. | 30 |
 | Over `--cache-max-gb`, or the free disk minus 2 GB, partial tracks go first, oldest first, then whole tracks, least recently used first. | 8 |
 
-`--ephemeral` empties the cache at start and at quit.
+The window's Settings sheet sets the size and the whole-track age, saved for the
+next launch; a flag overrides either for one run. `--ephemeral` empties the
+cache at start and at quit.
 
 ## Identifiers
 
@@ -433,14 +435,18 @@ POST /v2/sessions?frames=13230000&format=f32le&output_format=flac
 
 The body is optional audio from sample 0; it must be empty with `track`.
 
+An open reserves `(1 + parts) × channels × frames × 4` bytes for the mix and the
+parts. Open tracks may reserve half of physical memory together; a join reserves
+nothing.
+
 | Status | |
 | --- | --- |
 | `201` | The [session view](#view). |
 | `400` | A bad parameter: wrong rate or channels, `frames=0`, only one of `mean` and `std`, `frames` that differs from the joined track. |
 | `404` | `unknown_separation`: the track to join is no longer open. Open with `frames` and upload. |
 | `409` | The loaded model cannot run segment by segment. |
-| `413` | Longer than `max_track_seconds`. |
-| `429` | The session limit is reached. |
+| `413` | Longer than `max_track_seconds`, or needs more memory than open tracks may reserve. |
+| `429` | The session limit is reached, or the open tracks reserve too much memory for this one. |
 
 ### Upload methods
 

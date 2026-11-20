@@ -1,8 +1,9 @@
 //! Preferences the window changes and the next launch remembers.
 //!
 //! Persisted: which model loads, the output format and sample rate a client gets
-//! when it does not ask for one, the parts a drop writes, and whether the server
-//! answers.
+//! when it does not ask for one, the parts a drop writes, whether the server
+//! answers and on which port, the longest track accepted, and the cache's size
+//! and how long it keeps whole tracks.
 //!
 //! Precedence is flag, then file, then built-in default. A flag is for one run and
 //! is never written back, so a launch script that pins `--output-format f32le`
@@ -13,6 +14,7 @@
 //! a damaged one is worth a warning and a default.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -22,7 +24,7 @@ use stemd_core::{OutputRate, PartSet, Parts, StemFormat};
 use crate::models::{self, DEFAULT_PRESET, Preset, RETIRED};
 
 /// What the window can change and the next launch reads back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     /// The preset loaded at boot. Only ever a preset: `--demucs-model` can name
     /// a hand-traced artefact, but that is a flag for one run, so it is not
@@ -37,7 +39,19 @@ pub struct Settings {
     /// Whether the HTTP API answers. The window has a switch; headless always
     /// serves.
     pub serving: bool,
+    /// Disk the cache may occupy, in gigabytes.
+    pub cache_max_gb: f64,
+    /// Days a whole track is kept unused; 0 keeps it until the cache is full.
+    pub whole_max_days: f64,
+    /// Port the API listens on, on every interface.
+    pub port: u16,
+    /// Longest track accepted, in minutes; 0 for the longest this machine's
+    /// memory holds.
+    pub max_track_minutes: f64,
 }
+
+/// Port the API listens on when nothing else is set.
+pub const DEFAULT_PORT: u16 = 8420;
 
 /// Which parts a drop writes.
 ///
@@ -96,7 +110,34 @@ impl std::fmt::Display for DropParts {
     }
 }
 
+/// `secs` as a Duration, at least zero and at most `Duration::MAX`.
+pub fn saturating_secs(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::MAX)
+}
+
 impl Settings {
+    /// The cache's byte cap, and how long it keeps a whole track unused.
+    pub fn cache_limits(&self) -> (u64, Duration) {
+        let max_bytes = (self.cache_max_gb.max(0.0) * 1e9) as u64;
+        let whole_max_age = if self.whole_max_days > 0.0 {
+            saturating_secs(self.whole_max_days * 86400.0)
+        } else {
+            Duration::MAX
+        };
+        (max_bytes, whole_max_age)
+    }
+
+    /// Longest track accepted, in seconds, never past `longest` minutes.
+    pub fn max_track_secs(&self, longest: u32) -> f64 {
+        let longest = f64::from(longest);
+        let minutes = if self.max_track_minutes > 0.0 {
+            self.max_track_minutes.min(longest)
+        } else {
+            longest
+        };
+        minutes * 60.0
+    }
+
     /// Bring the rate down to one the format can actually carry.
     ///
     /// The pair is what a client gets, so it has to be a pair that exists. MP3
@@ -132,6 +173,10 @@ impl Default for Settings {
             rate: OutputRate::default(),
             drop_parts: DropParts::DEFAULT,
             serving: true,
+            cache_max_gb: 8.0,
+            whole_max_days: 30.0,
+            port: DEFAULT_PORT,
+            max_track_minutes: 10.0,
         }
     }
 }
@@ -154,6 +199,10 @@ struct Stored {
     /// Comma-separated, as [`DropParts`] prints it.
     drop_parts: Option<String>,
     serving: Option<bool>,
+    cache_max_gb: Option<f64>,
+    whole_max_days: Option<f64>,
+    port: Option<u16>,
+    max_track_minutes: Option<f64>,
 }
 
 impl Stored {
@@ -164,6 +213,10 @@ impl Stored {
             output_sample_rate: Some(settings.rate.hz()),
             drop_parts: Some(settings.drop_parts.to_string()),
             serving: Some(settings.serving),
+            cache_max_gb: Some(settings.cache_max_gb),
+            whole_max_days: Some(settings.whole_max_days),
+            port: Some(settings.port),
+            max_track_minutes: Some(settings.max_track_minutes),
         }
     }
 
@@ -212,6 +265,28 @@ impl Stored {
         if let Some(serving) = self.serving {
             settings.serving = serving;
         }
+        match self.cache_max_gb {
+            Some(gb) if gb.is_finite() && gb > 0.0 => settings.cache_max_gb = gb,
+            Some(gb) => warn_ignored("cache_max_gb", &gb.to_string(), "8"),
+            None => {}
+        }
+        match self.whole_max_days {
+            Some(days) if days.is_finite() && days >= 0.0 => settings.whole_max_days = days,
+            Some(days) => warn_ignored("whole_max_days", &days.to_string(), "30"),
+            None => {}
+        }
+        match self.port {
+            Some(port) if port > 0 => settings.port = port,
+            Some(port) => warn_ignored("port", &port.to_string(), "8420"),
+            None => {}
+        }
+        match self.max_track_minutes {
+            Some(minutes) if minutes.is_finite() && minutes >= 0.0 => {
+                settings.max_track_minutes = minutes;
+            }
+            Some(minutes) => warn_ignored("max_track_minutes", &minutes.to_string(), "10"),
+            None => {}
+        }
         settings.reconcile();
         settings
     }
@@ -221,8 +296,8 @@ fn warn_ignored(field: &str, found: &str, fallback: &str) {
     tracing::warn!("settings: ignoring {field} {found:?}, using {fallback}");
 }
 
-/// Output fields a flag fixed for this run. A pinned field is not editable, and
-/// the window greys its control out.
+/// Fields a flag fixed for this run. A pinned field is not editable, and the
+/// window greys its control out.
 ///
 /// The model is deliberately not here. `--demucs-model` decides what boots, but
 /// switching model in the window is an explicit act with a download behind it,
@@ -231,6 +306,10 @@ fn warn_ignored(field: &str, found: &str, fallback: &str) {
 pub struct Pinned {
     pub format: bool,
     pub rate: bool,
+    pub cache_max_gb: bool,
+    pub whole_max_days: bool,
+    pub port: bool,
+    pub max_track_minutes: bool,
 }
 
 /// What the file says, and what this run is actually using.
@@ -246,13 +325,13 @@ struct State {
 }
 
 /// The settings file, and the live copy every reader sees.
-pub struct SettingsStore {
+pub struct SettingsFile {
     path: PathBuf,
     state: Mutex<State>,
     pinned: Pinned,
 }
 
-impl SettingsStore {
+impl SettingsFile {
     /// Read the file, or start from defaults if there is not a usable one.
     ///
     /// Infallible on purpose: this runs before the server exists, and no state of
@@ -297,6 +376,36 @@ impl SettingsStore {
         self
     }
 
+    /// Apply `--cache-max-gb` and `--whole-max-days`, for this run only.
+    pub fn pin_cache(mut self, max_gb: Option<f64>, whole_days: Option<f64>) -> Self {
+        let mut state = self.state.lock();
+        if let Some(gb) = max_gb {
+            state.current.cache_max_gb = gb;
+            self.pinned.cache_max_gb = true;
+        }
+        if let Some(days) = whole_days {
+            state.current.whole_max_days = days;
+            self.pinned.whole_max_days = true;
+        }
+        drop(state);
+        self
+    }
+
+    /// Apply `--bind` and `--max-track-minutes`, for this run only.
+    pub fn pin_server(mut self, port: Option<u16>, max_track_minutes: Option<f64>) -> Self {
+        let mut state = self.state.lock();
+        if let Some(port) = port {
+            state.current.port = port;
+            self.pinned.port = true;
+        }
+        if let Some(minutes) = max_track_minutes {
+            state.current.max_track_minutes = minutes;
+            self.pinned.max_track_minutes = true;
+        }
+        drop(state);
+        self
+    }
+
     pub const fn pinned(&self) -> Pinned {
         self.pinned
     }
@@ -328,6 +437,30 @@ impl SettingsStore {
     pub fn set_rate(&self, rate: OutputRate) {
         if !self.pinned.rate {
             self.write(|s| s.rate = rate);
+        }
+    }
+
+    pub fn set_cache_max_gb(&self, gb: f64) {
+        if !self.pinned.cache_max_gb {
+            self.write(|s| s.cache_max_gb = gb);
+        }
+    }
+
+    pub fn set_whole_max_days(&self, days: f64) {
+        if !self.pinned.whole_max_days {
+            self.write(|s| s.whole_max_days = days);
+        }
+    }
+
+    pub fn set_port(&self, port: u16) {
+        if !self.pinned.port {
+            self.write(|s| s.port = port);
+        }
+    }
+
+    pub fn set_max_track_minutes(&self, minutes: f64) {
+        if !self.pinned.max_track_minutes {
+            self.write(|s| s.max_track_minutes = minutes);
         }
     }
 
@@ -371,7 +504,7 @@ fn load(path: &Path) -> Result<Settings> {
 /// A settings file is rewritten whenever a menu changes, including while the
 /// machine is shutting down. Truncating the real file first would make an
 /// interrupted write leave a half-written one behind, which is exactly the state
-/// [`SettingsStore::open`] has to throw away.
+/// [`SettingsFile::open`] has to throw away.
 fn save(path: &Path, settings: &Settings) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -419,10 +552,10 @@ mod tests {
     #[test]
     fn drop_parts_survive_a_relaunch_and_a_bad_list_is_ignored() {
         let path = scratch();
-        let store = SettingsStore::open(path.clone());
-        store.set_drop_parts(DropParts::parse("bass,other,vocals,drums").unwrap());
+        let file = SettingsFile::open(path.clone());
+        file.set_drop_parts(DropParts::parse("bass,other,vocals,drums").unwrap());
         assert_eq!(
-            SettingsStore::open(path).get().drop_parts.to_string(),
+            SettingsFile::open(path).get().drop_parts.to_string(),
             "vocals,drums,bass,other"
         );
         assert!(DropParts::parse("harmonics,bass").is_none());
@@ -431,19 +564,19 @@ mod tests {
 
     #[test]
     fn a_first_run_has_no_file_and_gets_the_defaults() {
-        let store = SettingsStore::open(scratch());
-        assert_eq!(store.get(), Settings::default());
+        let file = SettingsFile::open(scratch());
+        assert_eq!(file.get(), Settings::default());
     }
 
     #[test]
     fn what_the_window_changes_is_what_the_next_launch_reads() {
         let path = scratch();
-        let store = SettingsStore::open(path.clone());
-        store.set_preset(Preset::Balanced);
-        store.set_rate(OutputRate::Hz96000);
-        store.set_format(StemFormat::Pcm32);
+        let file = SettingsFile::open(path.clone());
+        file.set_preset(Preset::Balanced);
+        file.set_rate(OutputRate::Hz96000);
+        file.set_format(StemFormat::Pcm32);
 
-        let reopened = SettingsStore::open(path);
+        let reopened = SettingsFile::open(path);
         assert_eq!(reopened.get().preset, Preset::Balanced);
         assert_eq!(reopened.get().rate, OutputRate::Hz96000);
         assert_eq!(reopened.get().format, StemFormat::Pcm32);
@@ -455,13 +588,13 @@ mod tests {
     #[test]
     fn a_format_and_a_rate_that_cannot_go_together_are_reconciled() {
         let path = scratch();
-        let store = SettingsStore::open(path.clone());
-        store.set_rate(OutputRate::Hz96000);
-        store.set_format(StemFormat::Mp3);
-        assert_eq!(store.get().rate, OutputRate::Hz48000);
+        let file = SettingsFile::open(path.clone());
+        file.set_rate(OutputRate::Hz96000);
+        file.set_format(StemFormat::Mp3);
+        assert_eq!(file.get().rate, OutputRate::Hz48000);
 
         // And it survives the round trip rather than coming back invalid.
-        assert_eq!(SettingsStore::open(path).get().rate, OutputRate::Hz48000);
+        assert_eq!(SettingsFile::open(path).get().rate, OutputRate::Hz48000);
     }
 
     /// A flag naming the other half of an impossible pair is reconciled too, and
@@ -469,14 +602,14 @@ mod tests {
     #[test]
     fn a_flag_cannot_pin_a_pair_that_does_not_exist() {
         let path = scratch();
-        SettingsStore::open(path.clone()).set_rate(OutputRate::Hz96000);
+        SettingsFile::open(path.clone()).set_rate(OutputRate::Hz96000);
 
-        let pinned = SettingsStore::open(path.clone()).pin(Some(StemFormat::Mp3), None);
+        let pinned = SettingsFile::open(path.clone()).pin(Some(StemFormat::Mp3), None);
         assert_eq!(pinned.get().rate, OutputRate::Hz48000);
         drop(pinned);
 
         // The file still says 96000: a flag is for one run, including this one.
-        let reopened = SettingsStore::open(path);
+        let reopened = SettingsFile::open(path);
         assert_eq!(reopened.get().format, StemFormat::Flac);
         assert_eq!(reopened.get().rate, OutputRate::Hz96000);
     }
@@ -486,9 +619,9 @@ mod tests {
     #[test]
     fn a_flag_overrides_the_file_without_rewriting_it() {
         let path = scratch();
-        SettingsStore::open(path.clone()).set_rate(OutputRate::Hz48000);
+        SettingsFile::open(path.clone()).set_rate(OutputRate::Hz48000);
 
-        let run = SettingsStore::open(path.clone()).pin(Some(StemFormat::Pcm32), None);
+        let run = SettingsFile::open(path.clone()).pin(Some(StemFormat::Pcm32), None);
         assert_eq!(run.get().format, StemFormat::Pcm32, "the flag is in force");
         assert_eq!(
             run.get().rate,
@@ -502,9 +635,71 @@ mod tests {
         run.set_rate(OutputRate::Hz96000);
         assert_eq!(run.get().format, StemFormat::Pcm32, "pinned for this run");
 
-        let next = SettingsStore::open(path).get();
+        let next = SettingsFile::open(path).get();
         assert_eq!(next.format, StemFormat::Flac, "the flag must not persist");
         assert_eq!(next.rate, OutputRate::Hz96000);
+    }
+
+    #[test]
+    fn the_cache_settings_persist_and_a_flag_pins_them_for_one_run() {
+        let path = scratch();
+        let file = SettingsFile::open(path.clone());
+        file.set_cache_max_gb(16.0);
+        file.set_whole_max_days(0.0);
+        let next = SettingsFile::open(path.clone()).get();
+        assert_eq!((next.cache_max_gb, next.whole_max_days), (16.0, 0.0));
+        let (bytes, age) = next.cache_limits();
+        assert_eq!(bytes, 16_000_000_000);
+        assert_eq!(age, Duration::MAX, "0 days keeps whole tracks until full");
+
+        let run = SettingsFile::open(path.clone()).pin_cache(Some(2.0), None);
+        assert_eq!(run.get().cache_max_gb, 2.0, "the flag is in force");
+        assert!(run.pinned().cache_max_gb && !run.pinned().whole_max_days);
+        run.set_cache_max_gb(32.0);
+        run.set_whole_max_days(7.0);
+        assert_eq!(run.get().cache_max_gb, 2.0, "pinned for this run");
+        let next = SettingsFile::open(path.clone()).get();
+        assert_eq!((next.cache_max_gb, next.whole_max_days), (16.0, 7.0));
+
+        std::fs::write(
+            &path,
+            r#"{"cache_max_gb": -1, "whole_max_days": -3, "serving": false}"#,
+        )
+        .unwrap();
+        let next = SettingsFile::open(path).get();
+        assert_eq!((next.cache_max_gb, next.whole_max_days), (8.0, 30.0));
+        assert!(!next.serving, "the other fields still load");
+    }
+
+    #[test]
+    fn the_port_and_the_track_length_persist_and_a_flag_pins_them_for_one_run() {
+        let path = scratch();
+        let file = SettingsFile::open(path.clone());
+        file.set_port(8421);
+        file.set_max_track_minutes(0.0);
+        let next = SettingsFile::open(path.clone()).get();
+        assert_eq!(next.port, 8421);
+        assert_eq!(next.max_track_secs(71), 71.0 * 60.0, "0 takes the longest");
+
+        let run = SettingsFile::open(path.clone()).pin_server(Some(9000), Some(20.0));
+        assert_eq!(
+            (run.get().port, run.get().max_track_secs(71)),
+            (9000, 1200.0)
+        );
+        assert_eq!(
+            run.get().max_track_secs(15),
+            900.0,
+            "memory caps a flag too"
+        );
+        run.set_port(9100);
+        run.set_max_track_minutes(5.0);
+        assert_eq!(run.get().port, 9000, "pinned for this run");
+        let next = SettingsFile::open(path.clone()).get();
+        assert_eq!((next.port, next.max_track_minutes), (8421, 0.0));
+
+        std::fs::write(&path, r#"{"port": 0, "max_track_minutes": -1}"#).unwrap();
+        let next = SettingsFile::open(path).get();
+        assert_eq!((next.port, next.max_track_minutes), (8420, 10.0));
     }
 
     /// The file is meant to be editable by hand, so the names in it have to be
@@ -512,9 +707,9 @@ mod tests {
     #[test]
     fn the_file_spells_settings_the_way_the_flags_do() {
         let path = scratch();
-        let store = SettingsStore::open(path.clone());
-        store.set_preset(Preset::Balanced);
-        store.set_rate(OutputRate::Hz48000);
+        let file = SettingsFile::open(path.clone());
+        file.set_preset(Preset::Balanced);
+        file.set_rate(OutputRate::Hz48000);
 
         let text = std::fs::read_to_string(&path).expect("written");
         // The artefact name, whatever it currently is: the point is that the
@@ -544,7 +739,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, content).unwrap();
             assert_eq!(
-                SettingsStore::open(path).get(),
+                SettingsFile::open(path).get(),
                 Settings::default(),
                 "{content:?} should have fallen back to the defaults"
             );
@@ -565,7 +760,7 @@ mod tests {
         )
         .unwrap();
 
-        let settings = SettingsStore::open(path).get();
+        let settings = SettingsFile::open(path).get();
         assert_eq!(settings.preset, Preset::Balanced);
         assert_eq!(settings.rate, OutputRate::Hz96000);
         assert_eq!(settings.format, StemFormat::Flac, "the default stands in");
@@ -577,8 +772,8 @@ mod tests {
     fn every_preset_the_window_offers_round_trips_through_the_file() {
         for preset in Preset::ALL {
             let path = scratch();
-            SettingsStore::open(path.clone()).set_preset(preset);
-            assert_eq!(SettingsStore::open(path).get().preset, preset);
+            SettingsFile::open(path.clone()).set_preset(preset);
+            assert_eq!(SettingsFile::open(path).get().preset, preset);
         }
     }
 
@@ -587,10 +782,10 @@ mod tests {
         for rate in OutputRate::ALL {
             for format in [StemFormat::Flac, StemFormat::Pcm16, StemFormat::Pcm32] {
                 let path = scratch();
-                let store = SettingsStore::open(path.clone());
-                store.set_rate(rate);
-                store.set_format(format);
-                let read = SettingsStore::open(path).get();
+                let file = SettingsFile::open(path.clone());
+                file.set_rate(rate);
+                file.set_format(format);
+                let read = SettingsFile::open(path).get();
                 assert_eq!((read.rate, read.format), (rate, format));
             }
         }
@@ -600,10 +795,21 @@ mod tests {
     #[test]
     fn a_write_never_exposes_a_half_written_file() {
         let path = scratch();
-        SettingsStore::open(path.clone()).set_rate(OutputRate::Hz48000);
+        SettingsFile::open(path.clone()).set_rate(OutputRate::Hz48000);
 
         let staging = path.with_extension("json.new");
         assert!(!staging.exists(), "the temporary file outlived the write");
         assert!(serde_json::from_str::<Stored>(&std::fs::read_to_string(&path).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_whole_track_age_past_what_a_duration_holds_keeps_tracks_forever() {
+        for days in [1e300, f64::INFINITY] {
+            let settings = Settings {
+                whole_max_days: days,
+                ..Settings::default()
+            };
+            assert_eq!(settings.cache_limits().1, Duration::MAX);
+        }
     }
 }

@@ -95,6 +95,23 @@ pub fn lines(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     );
 }
 
+/// A gear: settings.
+pub fn gear(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) / 2.0;
+    let stroke = Stroke::new(width, colour);
+    painter.circle_stroke(c, r * 0.62, stroke);
+    painter.circle_stroke(c, r * 0.24, stroke);
+    for k in 0..8 {
+        let a = k as f32 * std::f32::consts::FRAC_PI_4;
+        let d = egui::vec2(a.cos(), a.sin());
+        painter.line_segment(
+            [c + d * r * 0.62, c + d * r * 0.95],
+            Stroke::new(width * 1.6, colour),
+        );
+    }
+}
+
 /// A clock face: waiting.
 pub fn clock(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     let k = rect.width().min(rect.height()) / 12.0;
