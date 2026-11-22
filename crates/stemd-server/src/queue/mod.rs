@@ -228,6 +228,8 @@ impl Queue {
                     worker_loop(&worker_inner, separator);
                 }
                 worker_inner.left.store(true, Ordering::SeqCst);
+                // Release the queue's state, so a dropped queue frees its cache.
+                drop(worker_inner);
                 loop {
                     thread::park();
                 }
@@ -305,6 +307,13 @@ impl Queue {
                 && inner.pending.lock().is_empty()
                 && !inner.sessions.has_runnable())
         })
+    }
+
+    /// True when the worker runs no job or segment.
+    #[cfg(test)]
+    pub fn is_idle(&self) -> bool {
+        let _pending = self.inner.pending.lock();
+        !self.inner.busy.load(Ordering::SeqCst) && self.inner.running.lock().is_none()
     }
 
     /// Tell the worker that session work may be waiting.
@@ -556,7 +565,9 @@ impl Inner {
             if let Some(staged) = self.incoming.lock().take() {
                 return Some(Next::Install(staged));
             }
+            // Set `busy` under `pending`, so `is_idle` never sees a segment taken but not started.
             if let Some((track, k)) = self.sessions.next(Class::BeforeJobs) {
+                self.busy.store(true, Ordering::SeqCst);
                 return Some(Next::Segment(track, k));
             }
             if let Some(Pending { work, number }) = pending.pop_front() {
@@ -571,6 +582,7 @@ impl Inner {
                 return Some(Next::Job(Claimed { work, cancel }));
             }
             if let Some((track, k)) = self.sessions.next(Class::WhenIdle) {
+                self.busy.store(true, Ordering::SeqCst);
                 return Some(Next::Segment(track, k));
             }
             // Tidy only after every check above, so a wake never skips waiting work.

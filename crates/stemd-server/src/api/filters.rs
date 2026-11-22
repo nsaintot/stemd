@@ -18,16 +18,6 @@ pub(super) async fn put_filter(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    if body.len() > crate::filters::MAX_FILE_BYTES {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "{} bytes is over the limit of {}",
-                body.len(),
-                crate::filters::MAX_FILE_BYTES
-            ),
-        ));
-    }
     let filters = Arc::clone(&state.filters);
     let stored = tokio::task::spawn_blocking(move || filters.put(&id, &body))
         .await

@@ -135,6 +135,9 @@ fn type_dirs(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Vec<Ty
         .into_iter()
         .filter_map(|name| {
             let gain: f32 = name.strip_prefix(&prefix)?.parse().ok()?;
+            if !(gain.is_finite() && gain > 0.0) {
+                return None;
+            }
             let dir = cache.verified_dir(model_id, &name, id);
             let info = Cache::info(&dir)?;
             Some(TypeDir {
@@ -315,6 +318,8 @@ pub fn derive(
     // A second request for the same output waits here, then finds the stems stored.
     let converting = cache.converting(&dir);
     let _held = converting.lock();
+    // Until its first stem is whole, the directory counts as partial, which eviction deletes first.
+    let _writing = cache.writing(&dir);
     cache.write_info(&dir, &source.info)?;
     let target = TypeDir {
         dir,
@@ -385,5 +390,68 @@ mod tests {
         for held in [Stored, Derivable, Consolidating, Separating, Open, Partial] {
             assert_eq!(serde_json::to_value(held).unwrap(), held.as_str());
         }
+    }
+
+    #[test]
+    fn a_conversion_keeps_its_directory_while_the_cache_is_over_budget() {
+        let cache = crate::testkit::cache(1, std::time::Duration::from_secs(60));
+        let flac = Output {
+            format: StemFormat::Flac,
+            ..crate::testkit::output()
+        };
+        let info = TrackInfo {
+            frames: 4410,
+            sample_rate: 44100,
+            channels: 2,
+            stride: 4410,
+            pieces: 1,
+        };
+        let dir = cache.verified_dir("model", &type_dir(&flac, 1.0), "t");
+        let _source = cache.writing(&dir);
+        cache.write_info(&dir, &info).unwrap();
+        let task = Consolidation::new(dir, &flac, info);
+        let audio = stemd_core::Audio::new(vec![vec![0.1; 4410]; 2], 44100);
+        for stem in flac.stored_parts() {
+            let bytes = stemd_core::encode_stem(&audio, StemFormat::Flac, 1.0).unwrap();
+            cache
+                .consolidate(&task, stem, &bytes, 4410, Some(0))
+                .unwrap();
+        }
+        let source = type_dirs(&cache, "model", &flac, "t")
+            .into_iter()
+            .find(TypeDir::all_whole)
+            .expect("the source is stored whole");
+
+        let wav = Output {
+            format: StemFormat::Wav,
+            ..flac
+        };
+        let target = derive(&cache, "model", "t", &source, &wav, 1.0).unwrap();
+        assert_eq!(Cache::info(&target.dir), Some(info));
+        assert!(target.all_whole());
+    }
+
+    #[test]
+    fn a_directory_whose_gain_is_not_a_positive_number_is_ignored() {
+        let cache = crate::testkit::cache(1 << 30, std::time::Duration::from_secs(60));
+        let output = crate::testkit::output();
+        let info = TrackInfo {
+            frames: 4410,
+            sample_rate: 44100,
+            channels: 2,
+            stride: 4410,
+            pieces: 1,
+        };
+        let dir = cache.verified_dir("model", &type_dir(&output, 1.0), "t");
+        cache.write_info(&dir, &info).unwrap();
+        assert_eq!(type_dirs(&cache, "model", &output, "t").len(), 1);
+        let model = cache.root().join("model");
+        std::fs::rename(
+            model.join(type_dir(&output, 1.0)),
+            model.join(type_dir(&output, f32::NAN)),
+        )
+        .unwrap();
+        assert!(model.join(format!("{}NaN", type_prefix(&output))).is_dir());
+        assert!(type_dirs(&cache, "model", &output, "t").is_empty());
     }
 }

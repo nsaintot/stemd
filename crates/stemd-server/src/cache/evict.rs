@@ -133,8 +133,9 @@ impl Cache {
     /// first, oldest first, then whole ones, least recently used first.
     /// Returns the tracks and bytes deleted.
     pub fn evict(&self) -> (usize, u64) {
-        let budget = crate::disk::budget(self.rules().max_bytes, self.bytes(), &self.root);
+        let budget = crate::disk::budget(self.rules().max_bytes, self.bytes(), self.free_bytes());
         if self.bytes() <= budget {
+            self.warned_kept.store(false, Ordering::Relaxed);
             return (0, 0);
         }
         let _held = self.lock.lock();
@@ -159,10 +160,14 @@ impl Cache {
         self.sub_bytes(freed);
         if deleted > 0 {
             *self.counted.lock() = None;
+            tracing::info!("cache over budget, deleted {:.0} MB", freed as f64 / 1e6);
         }
-        tracing::info!("cache over budget, deleted {:.0} MB", freed as f64 / 1e6);
         if self.bytes() > target && kept > 0 {
-            tracing::warn!("cache still over budget: {kept} tracks in use were kept");
+            if !self.warned_kept.swap(true, Ordering::Relaxed) {
+                tracing::warn!("cache still over budget: {kept} tracks in use were kept");
+            }
+        } else {
+            self.warned_kept.store(false, Ordering::Relaxed);
         }
         (deleted, freed)
     }

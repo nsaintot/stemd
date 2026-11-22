@@ -1,8 +1,8 @@
 //! Rewrites a track's stems as whole files once every piece is stored, and deletes the pieces.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
@@ -104,46 +104,68 @@ impl Cache {
         tasks.0.push_back(task);
         if !tasks.1 {
             tasks.1 = true;
-            let cache = Arc::clone(self);
-            std::thread::spawn(move || cache.consolidate_queued());
+            // A weak reference, so a thread waiting on a closed gate does not keep the cache alive.
+            let cache = Arc::downgrade(self);
+            std::thread::spawn(move || Self::consolidate_queued(&cache));
         }
         true
     }
 
-    /// Run queued consolidations one at a time until the queue is empty.
-    pub(super) fn consolidate_queued(&self) {
+    /// Run queued consolidations one at a time until the queue is empty or the cache is dropped.
+    fn consolidate_queued(cache: &Weak<Self>) {
         loop {
-            let task = {
-                let mut tasks = self.tasks.lock();
-                match tasks.0.pop_front() {
-                    Some(task) => task,
-                    None => {
-                        tasks.1 = false;
-                        return;
-                    }
-                }
+            let Some(task) = cache.upgrade().and_then(|cache| cache.next_task()) else {
+                return;
             };
-            if let Err(err) = self.consolidate_task(&task) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::consolidate_task(cache, &task)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "panicked: {}",
+                    crate::panics::message(panic.as_ref())
+                ))
+            });
+            let Some(cache) = cache.upgrade() else {
+                return;
+            };
+            if let Err(err) = outcome {
                 tracing::warn!("storing {} whole: {err:#}", task.dir.display());
-                self.failed.lock().insert(task.dir.clone(), Instant::now());
+                cache.failed.lock().insert(task.dir.clone(), Instant::now());
             }
-            self.consolidating.lock().remove(&task.dir);
+            cache.consolidating.lock().remove(&task.dir);
         }
     }
 
+    /// The next queued consolidation, or `None` after marking the thread stopped.
+    fn next_task(&self) -> Option<Consolidation> {
+        let mut tasks = self.tasks.lock();
+        let task = tasks.0.pop_front();
+        if task.is_none() {
+            tasks.1 = false;
+        }
+        task
+    }
+
     /// Store every stem of `task` whole, waiting for the gate before each.
-    pub(super) fn consolidate_task(&self, task: &Consolidation) -> Result<()> {
+    fn consolidate_task(cache: &Weak<Self>, task: &Consolidation) -> Result<()> {
         for stem in &task.stems {
-            while !self.gate_open() {
+            let cache = loop {
+                let cache = cache.upgrade().context("the cache was closed")?;
+                if cache.gate_open() {
+                    break cache;
+                }
+                drop(cache);
                 std::thread::sleep(GATE_POLL);
-            }
+            };
             ensure!(
-                !crate::disk::low(&self.root),
+                !cache.disk_low(),
                 "the disk is nearly full, so {stem} stays in pieces"
             );
-            self.consolidate_pieces(task, stem)
+            cache
+                .consolidate_pieces(task, stem)
                 .with_context(|| format!("storing {stem} whole"))?;
-            if let Some(on_change) = self.on_change.lock().as_ref() {
+            if let Some(on_change) = cache.on_change.lock().as_ref() {
                 on_change();
             }
         }
@@ -213,7 +235,7 @@ impl Cache {
         // takes it.
         let meta = crate::whole::describe(bytes, format, frames, clipped)?;
         let meta = serde_json::to_vec(&meta)?;
-        crate::disk::ensure_room(&self.root)?;
+        self.ensure_room()?;
         std::fs::create_dir_all(track_dir)
             .with_context(|| format!("creating {}", track_dir.display()))?;
         let file_path = crate::whole::file(track_dir, stem, extension);
@@ -232,11 +254,24 @@ impl Cache {
             let _ = std::fs::remove_file(&staged_meta);
             return Ok(());
         }
+        let size = |path: &Path| std::fs::metadata(path).map_or(0, |m| m.len());
+        let (old_file, old_meta) = (size(&file_path), size(&meta_path));
         // Rename the description last: a whole file counts as stored once both files are in place.
-        std::fs::rename(&staged_file, &file_path)
-            .with_context(|| format!("publishing {}", file_path.display()))?;
-        std::fs::rename(&staged_meta, &meta_path)
-            .with_context(|| format!("publishing {}", meta_path.display()))?;
+        if let Err(err) = std::fs::rename(&staged_file, &file_path) {
+            let _ = std::fs::remove_file(&staged_file);
+            let _ = std::fs::remove_file(&staged_meta);
+            return Err(
+                anyhow::Error::new(err).context(format!("publishing {}", file_path.display()))
+            );
+        }
+        if let Err(err) = std::fs::rename(&staged_meta, &meta_path) {
+            let _ = std::fs::remove_file(&staged_meta);
+            let _ = std::fs::remove_file(&file_path);
+            self.sub_bytes(old_file);
+            return Err(
+                anyhow::Error::new(err).context(format!("publishing {}", meta_path.display()))
+            );
+        }
         let pieces_dir = track_dir.join(stem);
         let freed: u64 = files(&pieces_dir).iter().map(|(_, size, _)| size).sum();
         if pieces_dir.is_dir() {
@@ -245,7 +280,7 @@ impl Cache {
         }
         let added = (bytes.len() + meta.len()) as u64;
         self.bytes.fetch_add(added, Ordering::Relaxed);
-        self.sub_bytes(freed);
+        self.sub_bytes(freed + old_file + old_meta);
         Self::touch(track_dir);
         drop(held);
         self.evict();

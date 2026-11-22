@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_range_cut_from_a_whole_file_equals_the_same_range_of_the_whole_decode() {
-        let dir = crate::scratch::dir("whole-unit");
+        let dir = crate::scratch::Dir::new("whole-unit");
         for frames in [1, 4096, 4097, 50_001] {
             let audio = noise(frames, frames as u32);
             for format in [
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_flac_description_that_does_not_fit_its_file_is_not_found() {
-        let dir = crate::scratch::dir("whole-find");
+        let dir = crate::scratch::Dir::new("whole-find");
         let audio = noise(20_000, 9);
         let bytes = stemd_core::encode_stem(&audio, StemFormat::Flac, 1.0).expect("encoding");
         std::fs::write(file(&dir, "vocals", "flac"), &bytes).expect("writing");

@@ -81,15 +81,21 @@ const NOTICEABLE: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Log a quit slow enough for a person to notice, and which of the two steps was slow.
 fn report(worker: std::time::Duration, advertisement: std::time::Duration) {
-    let total = worker + advertisement;
-    if total < NOTICEABLE {
-        tracing::debug!("shut down in {total:.0?}");
-        return;
+    match slow_quit(worker, advertisement) {
+        Some(line) => tracing::warn!("{line}"),
+        None => tracing::debug!("shut down in {:.0?}", worker + advertisement),
     }
-    tracing::warn!(
-        "shutting down took {total:.1?}: {worker:.1?} stopping the worker, \
-         {advertisement:.1?} withdrawing the advertisement"
-    );
+}
+
+/// The warning for a quit slow enough to notice, or `None` for a quick one.
+fn slow_quit(worker: std::time::Duration, advertisement: std::time::Duration) -> Option<String> {
+    let total = worker + advertisement;
+    (total >= NOTICEABLE).then(|| {
+        format!(
+            "shutting down took {total:.1?}: {worker:.1?} stopping the worker, \
+             {advertisement:.1?} withdrawing the advertisement"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -105,11 +111,19 @@ mod tests {
         assert!(NOTICEABLE * 4 < crate::queue::STOP_GRACE);
     }
 
-    /// Both branches of `report` are reachable without a real shutdown.
     #[test]
-    fn reporting_either_way_does_not_panic() {
-        report(Duration::from_millis(1), Duration::from_millis(2));
-        report(Duration::from_millis(80), Duration::from_secs(3));
-        report(Duration::from_secs(10), Duration::ZERO);
+    fn only_a_slow_quit_is_reported_with_the_step_that_was_slow() {
+        assert_eq!(
+            slow_quit(Duration::from_millis(1), Duration::from_millis(2)),
+            None
+        );
+        assert_eq!(
+            slow_quit(Duration::from_millis(80), Duration::from_secs(3)).as_deref(),
+            Some(
+                "shutting down took 3.1s: 80.0ms stopping the worker, \
+                 3.0s withdrawing the advertisement"
+            )
+        );
+        assert!(slow_quit(Duration::from_secs(10), Duration::ZERO).is_some());
     }
 }

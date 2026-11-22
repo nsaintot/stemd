@@ -261,10 +261,15 @@ mod tests {
         tokio::spawn(serve_moving(app, first, moves));
         assert!(get(old).await.unwrap().ends_with("here"));
 
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-        endpoint.move_to(port).unwrap();
+        // Another process can take the port between the probe and the move, so try a few.
+        let port = (0..10)
+            .find_map(|_| {
+                let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = free.local_addr().unwrap().port();
+                drop(free);
+                endpoint.move_to(port).is_ok().then_some(port)
+            })
+            .expect("a free port");
         let new = std::net::SocketAddr::new(old.ip(), port);
         let mut reply = Err(std::io::ErrorKind::NotConnected.into());
         for _ in 0..50 {
@@ -275,7 +280,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(reply.unwrap().ends_with("here"));
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(get(old).await.is_err(), "the old port still answers");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while get(old).await.is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old port still answers"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn a_job_names_an_uploaded_filter_by_its_id() {
-        let dir = std::env::temp_dir().join(format!("stemd-api-filters-{}", std::process::id()));
-        let filters = Filters::open(dir, 4).unwrap();
+        let dir = crate::scratch::Dir::new("api-filters");
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         let body = crate::filters::encode(44_100, 96_000, &[1.0; 320]);
         let id = crate::filters::id_of(&body);
 

@@ -93,7 +93,8 @@ pub struct Args {
     #[arg(long, alias = "pieces-max-gb")]
     pub cache_max_gb: Option<f64>,
 
-    /// Hours a partial track, with some stem not stored whole, is kept unused.
+    /// Hours a partial track, with some stem not stored whole, is kept unused; 0 keeps it until
+    /// the cache is full.
     #[arg(long, default_value_t = 24.0)]
     pub partial_max_hours: f64,
 
@@ -185,7 +186,7 @@ impl Args {
         let (max_bytes, whole_max_age) = settings.cache_limits();
         crate::cache::Rules {
             max_bytes,
-            partial_max_age: crate::settings::saturating_secs(self.partial_max_hours * 3600.0),
+            partial_max_age: crate::settings::age(self.partial_max_hours * 3600.0),
             whole_max_age,
             unfetched_ttl: self.unfetched_ttl(),
         }
@@ -199,6 +200,13 @@ mod tests {
     #[test]
     fn a_partial_age_past_what_a_duration_holds_keeps_partial_tracks_forever() {
         let args = Args::parse_from(["stemd", "--partial-max-hours", "inf"]);
+        let rules = args.cache_rules(&crate::settings::Settings::default());
+        assert_eq!(rules.partial_max_age, std::time::Duration::MAX);
+    }
+
+    #[test]
+    fn a_partial_age_of_zero_keeps_partial_tracks_until_the_cache_is_full() {
+        let args = Args::parse_from(["stemd", "--partial-max-hours", "0"]);
         let rules = args.cache_rules(&crate::settings::Settings::default());
         assert_eq!(rules.partial_max_age, std::time::Duration::MAX);
     }

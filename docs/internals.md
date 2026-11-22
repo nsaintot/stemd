@@ -49,7 +49,7 @@ Jobs, sessions and drops share one cache in `~/Library/Caches/stemd`
 | Rule | When |
 | --- | --- |
 | A track in use is never deleted. | always |
-| A partial track unused for `--partial-max-hours` (24) is deleted. | at start and hourly |
+| A partial track unused for `--partial-max-hours` (24; `0` keeps it forever) is deleted. | at start and hourly |
 | A whole track unused for `--whole-max-days` (30; `0` keeps it forever) is deleted. | at start and hourly |
 | Over `--cache-max-gb` (8), or over the free disk space minus 2 GB, partial tracks are deleted first, oldest first, then whole tracks, least recently used first, until the cache is down to 90%. | after each write and every 5 s |
 

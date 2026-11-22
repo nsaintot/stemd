@@ -5,20 +5,19 @@ use stemd_core::{OutputRate, Parts, StemFormat};
 
 #[test]
 fn a_second_lock_on_the_same_root_fails() {
-    let root = std::env::temp_dir().join(format!("stemd-lock-test-{}", std::process::id()));
+    let root = crate::scratch::Dir::new("lock-test");
     let held = lock(&root).unwrap();
     let err = lock(&root).unwrap_err();
     assert!(err.to_string().contains("already running"), "{err:#}");
     assert!(root.join(LOCK_FILE).exists());
     drop(held);
     lock(&root).unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
 fn a_file_key_seen_with_two_tracks_names_neither() {
-    let root = std::env::temp_dir().join(format!("stemd-files-test-{}", std::process::id()));
-    let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+    let root = crate::scratch::Dir::new("files-test");
+    let cache = Cache::open(root.to_path_buf(), 1 << 20).expect("open");
     let (key, a, b) = ("aa".repeat(12), "11".repeat(12), "22".repeat(12));
     assert_eq!(cache.file_track(&key), None);
     cache.record_file(&key, &a).expect("recorded");
@@ -28,13 +27,12 @@ fn a_file_key_seen_with_two_tracks_names_neither() {
     assert_eq!(cache.file_track(&key), None, "ambiguous");
     cache.record_file(&key, &a).expect("recorded");
     assert_eq!(cache.file_track(&key), None, "stays ambiguous");
-    let reopened = Cache::open(root.clone(), 1 << 20).expect("reopen");
+    let reopened = Cache::open(root.to_path_buf(), 1 << 20).expect("reopen");
     assert_eq!(reopened.file_track(&key), None);
     assert!(
         track_dirs(&root).is_empty(),
         "aliases are not track directories"
     );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -75,18 +73,25 @@ fn the_type_directory_names_every_setting_that_changes_the_bytes() {
     );
 }
 
-fn root() -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "stemd-pieces-unit-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ))
+fn root() -> crate::scratch::Dir {
+    crate::scratch::Dir::new("pieces-unit")
+}
+
+/// A cache of `max_bytes` in a fresh directory, deleted with the cache.
+fn open(max_bytes: u64) -> Arc<Cache> {
+    open_with(Rules::sized(max_bytes))
+}
+
+fn open_with(rules: Rules) -> Arc<Cache> {
+    let root = root();
+    let cache = Cache::open_with(root.to_path_buf(), rules).expect("open");
+    cache.keep(root);
+    cache
 }
 
 #[test]
 fn rewriting_a_track_file_counts_only_the_change_in_size() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     let dir = cache.verified_dir("model", "type", "track");
     let on_disk = || -> u64 { files(cache.root()).iter().map(|(_, size, _)| size).sum() };
     let info = TrackInfo {
@@ -121,8 +126,26 @@ fn rewriting_a_track_file_counts_only_the_change_in_size() {
 }
 
 #[test]
+fn a_whole_file_that_replaces_one_without_a_description_counts_only_once() {
+    let root = root();
+    let dir = root.join("model").join("type").join("track");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(crate::whole::file(&dir, "vocals", "s16le"), [0; 1000]).unwrap();
+    let cache = Cache::open(root.to_path_buf(), 1 << 30).expect("open");
+    let on_disk = || -> u64 { files(cache.root()).iter().map(|(_, size, _)| size).sum() };
+    assert_eq!(cache.bytes(), on_disk());
+    let task = Consolidation::at_44100(dir, StemFormat::Pcm16, 10);
+    let audio = stemd_core::Audio::new(vec![vec![0.1; 10]; 2], 44_100);
+    let bytes = stemd_core::encode_stem(&audio, StemFormat::Pcm16, 1.0).unwrap();
+    cache
+        .consolidate(&task, "vocals", &bytes, 10, Some(0))
+        .expect("stored");
+    assert_eq!(cache.bytes(), on_disk());
+}
+
+#[test]
 fn subtracting_more_bytes_than_counted_stops_at_zero() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     let dir = cache.verified_dir("model", "type", "track");
     cache
         .write_verified(&dir, "vocals", 0, "flac", &[1; 100])
@@ -134,7 +157,7 @@ fn subtracting_more_bytes_than_counted_stops_at_zero() {
 #[test]
 fn a_reopened_store_keeps_its_pieces_and_drops_partial_writes() {
     let root = root();
-    let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+    let cache = Cache::open(root.to_path_buf(), 1 << 20).expect("open");
     let dir = cache.verified_dir("model", "type", "track");
     cache
         .write_verified(&dir, "vocals", 0, "flac", &[1; 100])
@@ -142,7 +165,7 @@ fn a_reopened_store_keeps_its_pieces_and_drops_partial_writes() {
     std::fs::write(dir.join("vocals").join("0001.flac.part"), [0; 50]).expect("partial");
     drop(cache);
 
-    let reopened = Cache::open(root, 1 << 20).expect("reopen");
+    let reopened = Cache::open(root.to_path_buf(), 1 << 20).expect("reopen");
     assert_eq!(reopened.bytes(), 100);
     assert!(Cache::lookup(&dir, "vocals", 0, "flac").is_some());
     assert!(!dir.join("vocals").join("0001.flac.part").exists());
@@ -177,7 +200,7 @@ fn present(cache: &Cache, track: &str) -> Vec<&'static str> {
 
 #[test]
 fn over_the_budget_the_least_recently_used_track_is_deleted() {
-    let cache = Cache::open(root(), 1300).expect("open");
+    let cache = open(1300);
     fill(&cache, &["a", "b"]);
     // Reading `a` makes `b` the least recently used.
     assert!(
@@ -199,7 +222,7 @@ fn over_the_budget_the_least_recently_used_track_is_deleted() {
 
 #[test]
 fn eviction_skips_the_tracks_open_sessions_play() {
-    let cache = Cache::open(root(), 1300).expect("open");
+    let cache = open(1300);
     cache.set_in_use(Box::new(|| HashSet::from(["a".to_owned()])));
     fill(&cache, &["a", "b", "c"]);
     assert_eq!(present(&cache, "a"), vec!["vocals", "harmonics"]);
@@ -236,7 +259,7 @@ fn rules(max_bytes: u64, partial: u64, whole: u64) -> Rules {
 
 #[test]
 fn a_track_unused_past_its_age_is_deleted_partial_and_whole_alike() {
-    let cache = Cache::open_with(root(), rules(1 << 20, 30, 3_600_000)).expect("open");
+    let cache = open_with(rules(1 << 20, 30, 3_600_000));
     fill(&cache, &["partial"]);
     store_whole(&cache, "whole");
     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -244,7 +267,7 @@ fn a_track_unused_past_its_age_is_deleted_partial_and_whole_alike() {
     assert!(!exists(&cache, "partial"), "a partial track past a day");
     assert!(exists(&cache, "whole"), "a whole track inside 30 days");
 
-    let cache = Cache::open_with(root(), rules(1 << 20, 3_600_000, 30)).expect("open");
+    let cache = open_with(rules(1 << 20, 3_600_000, 30));
     store_whole(&cache, "whole");
     std::thread::sleep(std::time::Duration::from_millis(40));
     cache.clean();
@@ -254,7 +277,7 @@ fn a_track_unused_past_its_age_is_deleted_partial_and_whole_alike() {
 
 #[test]
 fn over_the_budget_partial_tracks_go_before_whole_ones() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     store_whole(&cache, "old-whole");
     fill(&cache, &["new-partial"]);
     store_whole(&cache, "newest-whole");
@@ -268,7 +291,7 @@ fn over_the_budget_partial_tracks_go_before_whole_ones() {
 
 #[test]
 fn a_job_result_is_kept_until_every_stem_is_fetched() {
-    let cache = Cache::open(root(), 1300).expect("open");
+    let cache = open(1300);
     store_whole(&cache, "held");
     let dir = cache.verified_dir("model", "type", "held");
     let output = Output {
@@ -291,14 +314,14 @@ fn a_job_result_is_kept_until_every_stem_is_fetched() {
 #[test]
 fn a_reopened_cache_drops_the_old_job_entries_and_keeps_tracks() {
     let root = root();
-    let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+    let cache = Cache::open(root.to_path_buf(), 1 << 20).expect("open");
     store_whole(&cache, "kept");
     let old = root.join("ab".repeat(32));
     std::fs::create_dir_all(&old).expect("an old entry");
     std::fs::write(old.join("vocals.flac"), [0; 10]).expect("an old stem");
     std::fs::write(root.join(LOCK_FILE), []).expect("a lock file");
     drop(cache);
-    let cache = Cache::open(root.clone(), 1 << 20).expect("reopen");
+    let cache = Cache::open(root.to_path_buf(), 1 << 20).expect("reopen");
     assert!(!old.exists());
     assert!(exists(&cache, "kept"));
     assert_eq!(cache.stats().tracks, 1);
@@ -311,7 +334,7 @@ fn a_reopened_cache_drops_the_old_job_entries_and_keeps_tracks() {
 
 #[test]
 fn emptying_the_cache_keeps_the_tracks_sessions_play() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     cache.set_in_use(Box::new(|| HashSet::from(["playing".to_owned()])));
     fill(&cache, &["playing", "idle"]);
     assert_eq!(cache.clear().0, 1);
@@ -321,7 +344,7 @@ fn emptying_the_cache_keeps_the_tracks_sessions_play() {
 
 #[test]
 fn emptying_the_cache_frees_its_bytes_and_file_keys_and_keeps_held_results() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     store_whole(&cache, "held");
     store_whole(&cache, "idle");
     cache.record_file("key", "idle").expect("recorded");
@@ -346,7 +369,7 @@ fn emptying_the_cache_frees_its_bytes_and_file_keys_and_keeps_held_results() {
 
 #[test]
 fn the_track_count_drops_as_soon_as_the_cache_is_emptied() {
-    let cache = Cache::open(root(), 1 << 20).expect("open");
+    let cache = open(1 << 20);
     fill(&cache, &["a", "b"]);
     assert_eq!(cache.stats().tracks, 2);
     cache.clear();
@@ -359,15 +382,67 @@ fn the_track_count_drops_as_soon_as_the_cache_is_emptied() {
 #[test]
 fn a_track_without_a_used_file_counts_from_its_newest_piece() {
     let root = root();
-    let cache = Cache::open(root.clone(), 1 << 20).expect("open");
+    let cache = Cache::open(root.to_path_buf(), 1 << 20).expect("open");
     fill(&cache, &["a", "b"]);
     for track in ["a", "b"] {
         std::fs::remove_file(cache.verified_dir("model", "type", track).join(USED))
             .expect("a used file");
     }
     drop(cache);
-    let cache = Cache::open(root, 1300).expect("reopen");
+    let cache = Cache::open(root.to_path_buf(), 1300).expect("reopen");
     fill(&cache, &["c"]);
     assert_eq!(present(&cache, "a"), Vec::<&str>::new());
     assert_eq!(present(&cache, "b"), vec!["vocals", "harmonics"]);
+}
+
+#[test]
+fn a_track_is_not_stored_whole_while_the_disk_is_low() {
+    let cache = crate::testkit::cache(1 << 30, std::time::Duration::from_secs(60));
+    cache.set_free_probe(Box::new(|| Some(crate::disk::FLOOR - 1)));
+    let task = Consolidation {
+        stems: vec!["vocals"],
+        ..Consolidation::at_44100(
+            cache.verified_dir("model", "type", "track"),
+            StemFormat::Flac,
+            10,
+        )
+    };
+    assert!(cache.consolidate_later(task.clone()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cache.is_consolidating(&task.dir) {
+        assert!(std::time::Instant::now() < deadline, "still consolidating");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(cache.consolidation_failed(&task.dir));
+    assert!(!cache.consolidate_later(task), "queued again at once");
+}
+
+#[test]
+fn a_panic_while_storing_whole_fails_that_track_and_the_next_one_still_runs() {
+    let cache = crate::testkit::cache(1 << 30, std::time::Duration::from_secs(60));
+    cache.set_gate(Box::new(|| panic!("gate")));
+    let task = |track: &str| Consolidation {
+        stems: vec!["vocals"],
+        ..Consolidation::at_44100(
+            cache.verified_dir("model", "type", track),
+            StemFormat::Flac,
+            10,
+        )
+    };
+    let first = task("first");
+    assert!(cache.consolidate_later(first.clone()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cache.is_consolidating(&first.dir) {
+        assert!(std::time::Instant::now() < deadline, "still consolidating");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(cache.consolidation_failed(&first.dir));
+
+    cache.set_gate(Box::new(|| true));
+    let second = task("second");
+    assert!(cache.consolidate_later(second.clone()));
+    while cache.is_consolidating(&second.dir) {
+        assert!(std::time::Instant::now() < deadline, "the second never ran");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }

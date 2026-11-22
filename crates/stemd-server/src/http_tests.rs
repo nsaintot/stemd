@@ -367,6 +367,8 @@ mod session_api {
             "frames=30000&mean=0.1",
             "frames=30000&mean=0.1&std=-1",
             "frames=30000&peak=-1",
+            "frames=30000&peak=NaN",
+            "frames=30000&peak=17",
         ] {
             let answer = call(
                 &app,
@@ -481,9 +483,35 @@ mod session_api {
             "{}",
             with_body.json
         );
-        let joined = call(&app, Method::POST, &uri, Vec::new()).await;
+        for peak in ["NaN", "1e30"] {
+            let refused = call(
+                &app,
+                Method::POST,
+                &format!("{uri}&peak={peak}"),
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                StatusCode::BAD_REQUEST,
+                "{peak}: {}",
+                refused.json
+            );
+        }
+        let joined = call(
+            &app,
+            Method::POST,
+            &format!("{uri}&file={FILE}"),
+            Vec::new(),
+        )
+        .await;
         assert_eq!(joined.status, StatusCode::CREATED, "{}", joined.json);
         assert_ne!(joined.json["id"], opened.json["id"]);
+        assert_eq!(
+            state.cache.file_track(FILE),
+            None,
+            "a join records no file key"
+        );
     }
 
     const FILE: &str = "3b0c55e19a7d42f08c6e1d2a";
@@ -550,15 +578,8 @@ mod session_api {
         .await;
         assert_eq!(ended.status, StatusCode::NO_CONTENT);
         // A segment that is running when the session ends may still write its pieces.
-        let mut seen = files_under(&dir);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let now = files_under(&dir);
-            if now == seen {
-                break;
-            }
-            seen = now;
-        }
+        let uid = session.track().uid;
+        until(|| !sessions.has_track(uid) && state.queue.is_idle()).await;
         let stored = crate::cache::Cache::cached(
             &dir,
             &session.output.served(),
@@ -667,7 +688,7 @@ mod session_api {
             "the window shows why it ended"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        until(|| state.queue.is_idle()).await;
         assert_eq!(
             files_under(dir.parent().unwrap()),
             before,
@@ -884,7 +905,7 @@ mod v1 {
             &app,
             Method::POST,
             "/v1/jobs?format=f32le&output_format=pcm16",
-            body,
+            body.clone(),
         )
         .await;
         assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
@@ -898,6 +919,19 @@ mod v1 {
         let result = &again.json["result"];
         assert_eq!(result["model_residual_db"].as_f64(), Some(FLOOR_DB));
         assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
+
+        let v2 = call(
+            &app,
+            Method::POST,
+            "/v2/jobs?format=f32le&output_format=pcm16",
+            body,
+        )
+        .await;
+        assert_eq!(v2.status, StatusCode::OK, "{}", v2.json);
+        let result = &v2.json["result"];
+        assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
+        assert_eq!(result["separation_secs"].as_f64(), Some(0.0));
+        assert!(result["model_residual_db"].is_null(), "{result}");
     }
 
     #[tokio::test]
@@ -1030,6 +1064,15 @@ mod jobs {
         let read = call(&app, Method::GET, &uri, Vec::new()).await;
         assert_eq!(read.status, StatusCode::OK, "{}", read.json);
         assert_eq!(read.json, created.json);
+    }
+
+    #[tokio::test]
+    async fn a_filter_past_the_file_limit_is_a_413() {
+        let app = crate::api::router(state());
+        let body = vec![0; crate::filters::MAX_FILE_BYTES + 1];
+        let uri = format!("/v2/filters/{}", "0".repeat(64));
+        let put = call(&app, Method::PUT, &uri, body).await;
+        assert_eq!(put.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

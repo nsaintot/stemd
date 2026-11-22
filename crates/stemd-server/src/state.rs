@@ -51,7 +51,9 @@ impl AppState {
         let job = Arc::clone(&work.job);
         // Stems are written to the cache before they are served, and a full disk also leaves the
         // system no room to swap.
-        let queued = crate::disk::ensure_room(self.cache.root())
+        let queued = self
+            .cache
+            .ensure_room()
             .map_err(Refused::from)
             .and_then(|()| self.queue.submit(work).map_err(Refused::from));
         // Fail the job: a job left at Queued would hold its key, and later requests for the track

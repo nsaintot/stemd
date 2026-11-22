@@ -824,12 +824,20 @@ mod tests {
     /// A drop that fails before reaching the queue still hands on its turn.
     #[test]
     fn a_failed_drop_does_not_hold_up_the_next() {
-        let turns = Turnstile::default();
+        let turns = Arc::new(Turnstile::default());
         let (first, second) = (turns.ticket(), turns.ticket());
         std::mem::drop(Turn::new(&turns, first));
-        let mut next = Turn::new(&turns, second);
-        next.wait();
-        next.pass();
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiting = Arc::clone(&turns);
+        std::thread::spawn(move || {
+            let mut next = Turn::new(&waiting, second);
+            next.wait();
+            next.pass();
+            let _ = done.send(());
+        });
+        waited
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the next drop never got its turn");
     }
 
     #[test]
@@ -858,7 +866,8 @@ mod tests {
                 .expect("store");
         }
         let entry = Entry::stored(&dir, &output, 0.5, 2, None).expect("whole");
-        let path = std::env::temp_dir().join(format!("stemd-part-{}.raw", std::process::id()));
+        let scratch = crate::scratch::Dir::new("part");
+        let path = scratch.join("part.raw");
         let gain = write_part(&entry, &entry.stems[0], &path).expect("written");
         assert_eq!(gain, 1.0);
         let written =
@@ -871,7 +880,6 @@ mod tests {
         {
             assert!((got - want).abs() < 1e-4, "{got} for {want}");
         }
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -886,8 +894,8 @@ mod tests {
         Dropped::finished("track", dir, 1)
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        crate::scratch::dir(&format!("drops-{name}"))
+    fn scratch(name: &str) -> crate::scratch::Dir {
+        crate::scratch::Dir::new(&format!("drops-{name}"))
     }
 
     /// The cross deletes a directory recursively, so this test checks which directory it deletes.
@@ -1000,7 +1008,7 @@ mod tests {
             "a".into(),
             &finished_in(&dir, &["vocals.flac", "drums.flac"]),
         );
-        assert_eq!(history.find("a").unwrap().dir, dir);
+        assert_eq!(history.find("a").unwrap().dir, dir.to_path_buf());
         assert!(history.find("b").is_none(), "another key");
 
         std::fs::write(dir.join("drums.flac"), b"edited stem").unwrap();
@@ -1060,7 +1068,8 @@ mod tests {
     #[test]
     fn a_dropped_track_is_separated_beside_itself_and_found_again_unchanged() {
         let state = crate::testkit::state();
-        let source = scratch("pipeline").join("song.wav");
+        let dir = scratch("pipeline");
+        let source = dir.join("song.wav");
         let data = (0..2)
             .map(|c| {
                 (0..44_100)
@@ -1096,7 +1105,8 @@ mod tests {
     #[test]
     fn a_drop_that_does_not_decode_fails() {
         let state = crate::testkit::state();
-        let source = scratch("pipeline-bad").join("broken.wav");
+        let dir = scratch("pipeline-bad");
+        let source = dir.join("broken.wav");
         std::fs::write(&source, b"not audio").unwrap();
         let dropped = state.drops.accept(&state, source);
         assert!(matches!(settled(&dropped), State::Failed(_)));

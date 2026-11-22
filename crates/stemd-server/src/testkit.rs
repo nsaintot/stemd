@@ -2,7 +2,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -17,25 +16,20 @@ use crate::jobs::Entry;
 use crate::output::Output;
 use crate::state::AppState;
 
-/// Makes each test root unique: tests run in parallel in one process, and two that start in the
-/// same clock tick would share a timestamp.
-static ROOT_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// A cache in a directory no other test uses, holding job results for `ttl`.
+/// A cache in a directory no other test uses, holding job results for `ttl`. The directory is
+/// deleted with the cache.
 pub fn cache(max_bytes: u64, ttl: Duration) -> Arc<Cache> {
-    let root = std::env::temp_dir().join(format!(
-        "stemd-test-{}-{}",
-        std::process::id(),
-        ROOT_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    Cache::open_with(
-        root,
+    let root = crate::scratch::Dir::new("test");
+    let cache = Cache::open_with(
+        root.to_path_buf(),
         Rules {
             unfetched_ttl: ttl,
             ..Rules::sized(max_bytes)
         },
     )
-    .expect("cache root")
+    .expect("cache root");
+    cache.keep(root);
+    cache
 }
 
 /// A mix and its three parts, each `frames` long.
@@ -104,11 +98,7 @@ pub fn state() -> Arc<AppState> {
 
 /// [`state`] with a queue that holds `max_depth` waiting jobs.
 pub fn state_with_depth(max_depth: usize) -> Arc<AppState> {
-    let dir = std::env::temp_dir().join(format!(
-        "stemd-state-test-{}-{}",
-        std::process::id(),
-        ROOT_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = crate::scratch::Dir::new("state-test");
     let cache = cache(1 << 30, Duration::from_secs(60));
     let build: crate::queue::BuildSeparator = Box::new(|| {
         Ok(Box::new(stemd_core::toy::Toy::new(4410, 0.25)) as Box<dyn stemd_core::Separate>)
@@ -134,7 +124,7 @@ pub fn state_with_depth(max_depth: usize) -> Arc<AppState> {
             artefact: "toy".into(),
         },
     ));
-    Arc::new(AppState {
+    let state = Arc::new(AppState {
         jobs: Arc::new(crate::jobs::Jobs::new(Duration::from_secs(60))),
         cache,
         queue,
@@ -146,7 +136,9 @@ pub fn state_with_depth(max_depth: usize) -> Arc<AppState> {
         filters: crate::filters::Filters::open(dir.join("filters"), 4).expect("filters"),
         ephemeral: false,
         endpoint: crate::endpoint::Endpoint::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).0,
-    })
+    });
+    state.cache.keep(dir);
+    state
 }
 
 /// An answer from [`call`], its body parsed as JSON or `null`.

@@ -17,11 +17,6 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     free_at(existing)
 }
 
-/// Whether the volume holding `path` is under [`FLOOR`].
-pub fn low(path: &Path) -> bool {
-    free_bytes(path).is_some_and(|free| free < FLOOR)
-}
-
 /// Work refused for want of disk space.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -34,26 +29,26 @@ pub struct DiskFull {
     pub needed: u64,
 }
 
-/// Fail unless the volume holding `path` has [`FLOOR`] free. Passes when the
-/// free space cannot be read.
-pub fn ensure_room(path: &Path) -> Result<(), DiskFull> {
-    ensure_room_for(path, 0)
-}
-
 /// Fail unless the volume holding `path` can take `bytes` and keep [`FLOOR`]
 /// free.
 pub fn ensure_room_for(path: &Path, bytes: u64) -> Result<(), DiskFull> {
+    check_room(free_bytes(path), bytes)
+}
+
+/// Fail unless a volume with `free` bytes can take `bytes` and keep [`FLOOR`] free. Passes when
+/// the free space is unknown.
+pub fn check_room(free: Option<u64>, bytes: u64) -> Result<(), DiskFull> {
     let needed = bytes.saturating_add(FLOOR);
-    match free_bytes(path) {
+    match free {
         Some(free) if free < needed => Err(DiskFull { free, needed }),
         _ => Ok(()),
     }
 }
 
-/// The bytes a cache may hold: its cap, reduced so the volume keeps [`FLOOR`] free. `used` is the
-/// number of bytes the cache already holds on that volume.
-pub fn budget(cap: u64, used: u64, path: &Path) -> u64 {
-    free_bytes(path).map_or(cap, |free| fit(cap, used, free))
+/// The bytes a cache may hold: its cap, reduced so a volume with `free` bytes keeps [`FLOOR`]
+/// free. `used` is the number of bytes the cache already holds on that volume.
+pub fn budget(cap: u64, used: u64, free: Option<u64>) -> u64 {
+    free.map_or(cap, |free| fit(cap, used, free))
 }
 
 /// `cap`, reduced so that a cache holding `used` bytes, with `free` bytes left on the volume, keeps

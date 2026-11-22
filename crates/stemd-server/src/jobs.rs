@@ -169,6 +169,29 @@ impl Job {
     }
 }
 
+/// A job that a request claimed and has not yet answered or queued. Dropping it fails the job, so
+/// a request that ends early does not leave the job `queued` and holding its key.
+pub struct Claimed(Option<Arc<Job>>);
+
+impl Claimed {
+    pub fn new(job: Arc<Job>) -> Self {
+        Self(Some(job))
+    }
+
+    /// The job, now in the caller's hands.
+    pub fn disarm(mut self) -> Arc<Job> {
+        self.0.take().expect("a claimed job")
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            job.fail("request ended before the job was queued");
+        }
+    }
+}
+
 /// The length and layout of a job's mix, as a lookup reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MixShape {
@@ -473,13 +496,12 @@ impl Entry {
         self.frames as f64 / f64::from(self.output.rate.hz())
     }
 
-    /// How much faster than realtime the separation ran; infinite for stems a
-    /// session stored.
+    /// How much faster than realtime the separation ran; 0 for stems a session stored.
     pub fn realtime_factor(&self) -> f64 {
         if self.separation_secs > 0.0 {
             self.duration_secs() / self.separation_secs
         } else {
-            f64::INFINITY
+            0.0
         }
     }
 }
@@ -748,6 +770,25 @@ mod tests {
             jobs.claim("doomed", MixShape::default()).is_ok(),
             "a second client should get a fresh attempt, not someone else's failure"
         );
+    }
+
+    #[test]
+    fn a_claim_dropped_before_it_is_queued_fails_and_frees_its_key() {
+        let jobs = Jobs::new(Duration::from_secs(3600));
+        let Ok(kept) = jobs.claim("kept", MixShape::default()) else {
+            panic!("a fresh key is claimed");
+        };
+        let kept = Claimed::new(kept).disarm();
+        assert_eq!(kept.view().progress.stage, Stage::Queued);
+
+        let Ok(dropped) = jobs.claim("dropped", MixShape::default()) else {
+            panic!("a fresh key is claimed");
+        };
+        drop(Claimed::new(Arc::clone(&dropped)));
+        let view = dropped.view();
+        assert_eq!(view.progress.stage, Stage::Failed);
+        assert!(view.error.is_some());
+        assert!(jobs.claim("dropped", MixShape::default()).is_ok());
     }
 
     #[test]

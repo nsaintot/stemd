@@ -229,6 +229,53 @@ fn with_the_clients_statistics_a_segment_runs_once_its_own_input_is_in() {
 }
 
 #[test]
+fn a_session_that_moves_onto_an_open_track_runs_its_window_there() {
+    let _gpu = GPU.lock();
+    let frames = 200_000;
+    let mix = track(frames, 9);
+    let queue = start(Toy::new(SEGMENT, 0.25), held_cache());
+    let window = |at: usize| WindowRequest {
+        regions: vec![Region {
+            at,
+            ahead: 10_000,
+            behind: 0,
+            priority: 0,
+        }],
+    };
+    let first = open(&queue, frames, None);
+    first.set_window(&window(0)).expect("open");
+    upload(&queue, &first, 0, &mix);
+    queue.wake();
+    assert!(ready_within(&first, 0, 5_000, Duration::from_secs(20)));
+
+    // The second session runs its cue before its upload completes, on a track of its own.
+    let cue = 150_000;
+    let second = open(&queue, frames, Some(Normalisation::of(&mix)));
+    second.set_window(&window(cue)).expect("open");
+    upload(&queue, &second, 140_000, &mix.excerpt(140_000, frames));
+    queue.wake();
+    assert!(ready_within(
+        &second,
+        cue,
+        cue + 5_000,
+        Duration::from_secs(20)
+    ));
+    let own = second.track();
+    upload(&queue, &second, 0, &mix.excerpt(0, 140_000));
+    assert!(own.closed().is_some(), "the second track was not merged");
+    assert_eq!(second.track().uid, first.track().uid);
+
+    queue.wake();
+    assert!(ready_within(
+        &second,
+        cue,
+        cue + 5_000,
+        Duration::from_secs(20)
+    ));
+    assert!(first.read("vocals", cue, cue + 5_000).is_ok());
+}
+
+#[test]
 fn high_priority_segments_run_between_the_segments_of_a_job() {
     let _gpu = GPU.lock();
     let mut toy = Toy::new(SEGMENT, 0.25);
@@ -1229,9 +1276,11 @@ fn a_whole_track_read_before_any_separation_is_refused() {
 }
 
 #[test]
-fn a_job_leaves_its_pieces_for_sessions() {
+fn a_job_stores_its_stems_whole_and_removes_the_pieces() {
     let _gpu = GPU.lock();
     let cache = fresh_cache();
+    // Plenty free, whatever the test machine has.
+    cache.set_free_probe(Box::new(|| Some(1 << 40)));
     let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
     let frames = 25_000;
     let mix = track(frames, 10);
@@ -1271,6 +1320,36 @@ fn a_job_leaves_its_pieces_for_sessions() {
         );
         assert!(!dir.join(stem).exists(), "{stem} kept its pieces");
     }
+}
+
+#[test]
+fn a_session_stores_nothing_while_the_disk_is_low() {
+    let _gpu = GPU.lock();
+    let cache = fresh_cache();
+    cache.set_free_probe(Box::new(|| Some(crate::disk::FLOOR - 1)));
+    let queue = start(Toy::new(SEGMENT, 0.25), Arc::clone(&cache));
+    let frames = 20_000;
+    let mix = track(frames, 12);
+    let session = open_as(&queue, frames, None, StemFormat::Flac);
+    session.set_window(&whole(&session)).expect("open");
+    upload(&queue, &session, 0, &mix);
+    queue.wake();
+    assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+    let (status, _, _) = whole_file(&queue, &session, "vocals");
+    assert_eq!(status, 200);
+    assert!(
+        queue.sessions().cached_for(&session).is_empty(),
+        "pieces were written"
+    );
+    let dir = cache.verified_dir(
+        "toy-00000000",
+        &type_dir(&session.output, session.gain),
+        &crate::ident::track_id(&mix),
+    );
+    assert!(
+        crate::whole::find(&dir, "vocals", "flac").is_none(),
+        "the whole read was stored"
+    );
 }
 
 #[test]

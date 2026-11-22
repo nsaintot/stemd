@@ -400,8 +400,9 @@ mod tests {
         let queue = Arc::new(queue);
         separate(&queue, "before-the-switch");
 
+        let scratch = crate::scratch::Dir::new("switch-test");
         let settings = Arc::new(crate::settings::SettingsFile::open(
-            std::env::temp_dir().join(format!("stemd-switch-test-{}.json", std::process::id())),
+            scratch.join("settings.json"),
         ));
         let switcher = Arc::new(Switcher::new(
             Some(from),
