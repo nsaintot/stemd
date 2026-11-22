@@ -2075,6 +2075,10 @@ mod session_tests {
     #[test]
     fn a_job_leaves_its_pieces_for_sessions() {
         let _gpu = GPU.lock();
+        if crate::disk::memory_pressure() {
+            eprintln!("skipped: under memory pressure a job writes no pieces");
+            return;
+        }
         let queue = start(Toy::new(SEGMENT, 0.25));
         let pieces = with_pieces(&queue);
         let frames = 25_000;

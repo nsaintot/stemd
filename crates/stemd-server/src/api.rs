@@ -70,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             refuse_when_off,
         ))
+        .layer(axum::middleware::from_fn(crate::v1::deprecate))
         .with_state(state)
 }
 

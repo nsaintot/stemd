@@ -135,7 +135,12 @@ async fn listen(
         defaults.format,
         defaults.rate.hz()
     );
-    axum::serve(listener, app).await.context("server failed")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server failed")
 }
 
 /// Shut down cleanly when the system asks the process to stop.

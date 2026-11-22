@@ -20,6 +20,15 @@ DELETE /v1/sessions/{id}              end the session
 GET    /v1/logs                       recent log lines
 ```
 
+## Protocol 1 (deprecated)
+
+Every path above is protocol 1. It is deprecated and may stop working in a
+future release.
+
+- Every `/v1` answer carries `Deprecation: true` and
+  `Link: <https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel="deprecation"; type="text/html"`.
+- The server logs one warning per client address that calls `/v1`.
+
 ## Identifiers
 
 Two ids cross the wire, and a client stores both. Neither ever contains anything
