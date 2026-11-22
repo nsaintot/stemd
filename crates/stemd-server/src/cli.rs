@@ -176,6 +176,14 @@ impl Args {
         std::time::Duration::from_secs(self.unfetched_ttl)
     }
 
+    /// The cache root `--cache-dir` names, or [`crate::cache::default_dir`].
+    pub fn cache_root(&self) -> anyhow::Result<std::path::PathBuf> {
+        match self.cache_dir.clone() {
+            Some(dir) => Ok(dir),
+            None => crate::cache::default_dir(),
+        }
+    }
+
     /// The cache's deletion rules, with the size and whole-track age `settings` holds.
     pub fn cache_rules(&self, settings: &crate::settings::Settings) -> crate::cache::Rules {
         let (max_bytes, whole_max_age) = settings.cache_limits();

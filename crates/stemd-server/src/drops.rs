@@ -21,11 +21,11 @@ use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 use stemd_core::{Audio, DspMode, PART_NAMES, Progress, Stage};
 
-use crate::api::AppState;
 use crate::jobs::{CachedStem, Entry, Job};
 use crate::output::Output;
 use crate::queue::QueuedWork;
 use crate::settings::{DropParts, Settings};
+use crate::state::AppState;
 
 /// Where a drop records the scale of parts written below unity.
 const GAINS_FILE: &str = "stems.json";
@@ -155,8 +155,7 @@ impl Dropped {
             return false;
         }
         if !job.view().progress.stage.is_terminal() {
-            state.queue.cancel(&job.id);
-            state.jobs.remove(&job.id);
+            state.stop_job(&job.id);
         }
         true
     }
@@ -588,12 +587,12 @@ fn separate(
     // The same track id an upload of these samples gets, so a drop and a deck
     // asking for the same track land on the same stems.
     let cache_id = state.switcher.cache_id();
-    let id = crate::sessions::track_id(&mix);
+    let id = crate::ident::track_id(&mix);
     let key = crate::jobs::job_key(&id, &output, &cache_id);
 
     // Ahead of the turn: a cache hit queues nothing, so it need not wait for
     // the drops before it. It still passes its turn when it ends.
-    if let Some(entry) = crate::api::cached_entry(&state.cache, &cache_id, &output, &id) {
+    if let Some(entry) = crate::held::cached_entry(&state.cache, &cache_id, &output, &id) {
         // The row in the window already says "already separated"; this is only
         // for reading afterwards.
         tracing::debug!("{}: already separated, reusing it", item.title);
@@ -611,26 +610,13 @@ fn separate(
         Ok(job) => {
             // The stems are stored in the cache first. The folder beside the
             // track is checked for the stems' own size once they exist.
-            let queued = crate::disk::ensure_room(state.cache.root())
-                .map_err(anyhow::Error::from)
-                .and_then(|()| {
-                    state
-                        .queue
-                        .submit(QueuedWork {
-                            job: Arc::clone(&job),
-                            mix,
-                            output,
-                            model_id: cache_id,
-                            from_api: false,
-                        })
-                        .map_err(anyhow::Error::from)
-                });
-            // A job left at Queued would hold its key, and later requests for
-            // the track would join it and wait forever.
-            if let Err(err) = queued {
-                job.fail(format!("{err:#}"));
-                return Err(err);
-            }
+            state.queue_claimed(QueuedWork {
+                job: Arc::clone(&job),
+                mix,
+                output,
+                model_id: cache_id,
+                from_api: false,
+            })?;
             job
         }
         // `claim` counted this drop as a waiter.
@@ -641,8 +627,15 @@ fn separate(
     };
     turn.pass();
     *item.job.lock() = Some(Arc::clone(&job));
-    let origin = Origin::Queued;
+    Ok((wait_for(state, item, &job)?, Origin::Queued))
+}
 
+/// Follow `job` on `item`'s row until it ends, and return its stems.
+fn wait_for(
+    state: &Arc<AppState>,
+    item: &Arc<Dropped>,
+    job: &Arc<crate::jobs::Job>,
+) -> Result<Arc<Entry>> {
     loop {
         // `stop` releases the job itself unless it came before the job was stored.
         if item.stopped() {
@@ -653,10 +646,7 @@ fn separate(
         match view.progress.stage {
             Stage::Done => {
                 let entry = job.entry.lock().clone();
-                return Ok((
-                    entry.context("the job finished with no stems attached")?,
-                    origin,
-                ));
+                return entry.context("the job finished with no stems attached");
             }
             Stage::Failed => {
                 anyhow::bail!(
@@ -738,7 +728,7 @@ fn write_part(entry: &Entry, stem: &CachedStem, path: &Path) -> Result<f32> {
         return Ok(entry.gain);
     }
     let bytes = std::fs::read(&stem.path)?;
-    let mut audio = crate::cache::decode(bytes, format, entry.channels, entry.output.rate.hz())?;
+    let mut audio = crate::whole::decode(bytes, format, entry.channels, entry.output.rate.hz())?;
     let restore = 1.0 / entry.gain;
     for v in audio.data.iter_mut().flatten() {
         *v *= restore;
@@ -881,7 +871,7 @@ mod tests {
         let gain = write_part(&entry, &entry.stems[0], &path).expect("written");
         assert_eq!(gain, 1.0);
         let written =
-            crate::cache::decode(std::fs::read(&path).unwrap(), output.format, 2, 44100).unwrap();
+            crate::whole::decode(std::fs::read(&path).unwrap(), output.format, 2, 44100).unwrap();
         for (got, want) in written
             .data
             .iter()
@@ -906,10 +896,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("stemd-drops-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+        crate::scratch::dir(&format!("drops-{name}"))
     }
 
     /// The cross deletes a directory recursively, so what it will delete is
@@ -1065,5 +1052,64 @@ mod tests {
             ..settings
         };
         assert_ne!(key(&a, &settings, "m"), key(&a, &parts, "m"), "the parts");
+    }
+
+    /// Wait up to 20 s for `item` to finish or fail.
+    fn settled(item: &Dropped) -> State {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let state = item.state();
+            if matches!(state, State::Done(_) | State::Failed(_)) {
+                return state;
+            }
+            assert!(std::time::Instant::now() < deadline, "the drop never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_dropped_track_is_separated_beside_itself_and_found_again_unchanged() {
+        let state = crate::testkit::state();
+        let source = scratch("pipeline").join("song.wav");
+        let data = (0..2)
+            .map(|c| {
+                (0..44_100)
+                    .map(|i| ((i * 7 + c) % 200) as f32 / 400.0 - 0.25)
+                    .collect()
+            })
+            .collect();
+        let mix = Audio::new(data, stemd_core::toy::RATE);
+        let wav = stemd_core::encode_stem(&mix, stemd_core::StemFormat::Wav, 1.0).expect("a wav");
+        std::fs::write(&source, wav).unwrap();
+
+        let first = state.drops.accept(&state, source.clone());
+        let State::Done(finished) = settled(&first) else {
+            panic!("{:?}", first.state());
+        };
+        assert!(!finished.cached);
+        assert_eq!(finished.dir, output_dir(&source));
+        assert!(!finished.parts.is_empty());
+        for file in &finished.files {
+            assert!(file.is_file(), "{} was not written", file.display());
+        }
+        assert!(first.job.lock().is_none(), "the job was not released");
+
+        let again = state.drops.accept(&state, source);
+        let State::Done(repeat) = settled(&again) else {
+            panic!("{:?}", again.state());
+        };
+        assert!(repeat.cached);
+        assert_eq!(repeat.dir, finished.dir);
+        assert_eq!(state.drops.recent().len(), 1, "the row was replaced");
+    }
+
+    #[test]
+    fn a_drop_that_does_not_decode_fails() {
+        let state = crate::testkit::state();
+        let source = scratch("pipeline-bad").join("broken.wav");
+        std::fs::write(&source, b"not audio").unwrap();
+        let dropped = state.drops.accept(&state, source);
+        assert!(matches!(settled(&dropped), State::Failed(_)));
+        assert!(!dropped.is_running());
     }
 }

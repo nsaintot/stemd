@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{self, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -25,22 +25,26 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use stemd_core::Progress;
 
-use crate::api::{self, ApiError, AppState, CreateParams};
+use crate::api::error::ApiError;
+use crate::api::health::get_logs;
+use crate::api::jobs::{delete_job, get_stem, live_view, submit};
+use crate::api::params::CreateParams;
 use crate::jobs::{Entry, Job};
+use crate::state::AppState;
 
 /// The residual sent when the stems sum to the mix exactly, since JSON has no `-inf`.
-const FLOOR_DB: f64 = -200.0;
+pub(crate) const FLOOR_DB: f64 = -200.0;
 
 /// The `Link` header on every protocol 1 answer.
-const LINK: &str = "<https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel=\"deprecation\"; type=\"text/html\"";
+pub(crate) const LINK: &str = "<https://github.com/nsaintot/stemd/blob/main/docs/api.md>; rel=\"deprecation\"; type=\"text/html\"";
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/jobs", post(create_job))
-        .route("/v1/jobs/{id}", get(get_job).delete(api::delete_job))
-        .route("/v1/jobs/{id}/stems/{name}", get(api::get_stem))
-        .route("/v1/logs", get(api::get_logs))
+        .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/v1/jobs/{id}/stems/{name}", get(get_stem))
+        .route("/v1/logs", get(get_logs))
         .route("/v1/sessions", any(sessions_moved))
         .route("/v1/sessions/{*rest}", any(sessions_moved))
 }
@@ -75,7 +79,7 @@ pub async fn deprecate(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert("deprecation", HeaderValue::from_static("true"));
-    headers.insert(header::LINK, HeaderValue::from_static(LINK));
+    headers.insert(http::header::LINK, HeaderValue::from_static(LINK));
     response
 }
 
@@ -104,7 +108,7 @@ impl Seen {
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let stems = state.queue.info().stems;
-    let Json(health) = api::health(State(state)).await;
+    let Json(health) = crate::api::health::health(State(state)).await;
     Json(health_of(
         serde_json::to_value(health).unwrap_or_default(),
         stems,
@@ -201,7 +205,7 @@ fn result_of(id: &str, result: crate::jobs::JobResult, entry: Option<&Entry>) ->
 }
 
 fn job_view(state: &AppState, job: &Job) -> JobView {
-    let view = api::live_view(state, job);
+    let view = live_view(state, job);
     let entry = job.entry.lock().clone();
     JobView {
         result: view
@@ -222,7 +226,7 @@ async fn create_job(
         file: None,
         ..params
     };
-    let (status, job) = api::submit(&state, &params, body).await?;
+    let (status, job) = submit(&state, &params, body).await?;
     job.mark_protocol_1();
     Ok((status, Json(job_view(&state, &job))).into_response())
 }
@@ -238,203 +242,8 @@ async fn get_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{call, state};
+    use crate::testkit::call;
     use axum::http::Method;
-
-    fn keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
-    }
-
-    fn sorted(mut keys: Vec<&str>) -> Vec<&str> {
-        keys.sort_unstable();
-        keys
-    }
-
-    #[tokio::test]
-    async fn health_has_the_0_2_0_fields() {
-        let app = api::router(state());
-        let answer = call(&app, Method::GET, "/v1/health", Vec::new()).await;
-        assert_eq!(answer.status, StatusCode::OK);
-        assert_eq!(answer.headers["deprecation"], "true");
-        assert_eq!(answer.headers[header::LINK], LINK);
-        assert_eq!(
-            keys(&answer.json),
-            sorted(vec![
-                "version",
-                "backend",
-                "model",
-                "device",
-                "sample_rate",
-                "channels",
-                "stems",
-                "model_id",
-                "completed_jobs",
-                "queue_depth",
-                "cached_tracks",
-                "cached_bytes",
-                "cache_max_bytes",
-                "max_track_seconds",
-                "output_sample_rates",
-                "dsp_modes",
-                "dsp_mode_pairs",
-                "default_output_format",
-                "default_output_sample_rate",
-                "derived_stem",
-                "parts",
-                "default_parts",
-            ])
-        );
-        assert_eq!(answer.json["stems"], json!(["harmonics", "vocals"]));
-        assert_eq!(answer.json["derived_stem"], "drums");
-        assert_eq!(answer.json["default_parts"], json!(["harmonics", "vocals"]));
-        assert_eq!(answer.json["default_output_format"], "flac");
-        assert_eq!(answer.json["default_output_sample_rate"], 44_100);
-
-        let v2 = call(&app, Method::GET, "/v2/health", Vec::new()).await;
-        assert!(v2.headers.get("deprecation").is_none());
-    }
-
-    #[tokio::test]
-    async fn a_job_result_has_the_0_2_0_shape() {
-        let state = state();
-        let app = api::router(Arc::clone(&state));
-        let job = state.jobs.create("track".into());
-        job.complete(
-            crate::testkit::publish(&state.cache, "track", 100, 1.0),
-            false,
-        );
-
-        let answer = call(
-            &app,
-            Method::GET,
-            &format!("/v1/jobs/{}", job.id),
-            Vec::new(),
-        )
-        .await;
-        assert_eq!(answer.status, StatusCode::OK);
-        assert_eq!(keys(&answer.json), ["id", "progress", "result"]);
-        let result = &answer.json["result"];
-        assert_eq!(
-            keys(result),
-            sorted(vec![
-                "sample_rate",
-                "channels",
-                "frames",
-                "format",
-                "stems",
-                "model_residual_db",
-                "derived_stem",
-                "separation_secs",
-                "realtime_factor",
-                "cached",
-            ])
-        );
-        assert_eq!(result["format"], "pcm16");
-        assert_eq!(result["sample_rate"], 44_100);
-        assert_eq!(result["derived_stem"], "drums");
-        let stem = &result["stems"][0];
-        assert_eq!(keys(stem), ["bytes", "gain", "name", "path", "url"]);
-        assert_eq!(stem["url"], format!("/v1/jobs/{}/stems/harmonics", job.id));
-        assert!(
-            std::path::Path::new(stem["path"].as_str().unwrap()).is_file(),
-            "{stem}"
-        );
-
-        let url = stem["url"].as_str().unwrap();
-        let download = call(&app, Method::GET, url, Vec::new()).await;
-        assert_eq!(download.status, StatusCode::OK);
-        assert_eq!(download.headers["deprecation"], "true");
-
-        let empty = call(&app, Method::POST, "/v1/jobs?format=s16le", Vec::new()).await;
-        assert_eq!(empty.status, StatusCode::BAD_REQUEST);
-        assert_eq!(empty.headers["deprecation"], "true");
-    }
-
-    #[tokio::test]
-    async fn a_job_on_stems_a_session_stored_reads_the_floor_residual() {
-        use crate::cache::{Consolidation, type_dir};
-        use stemd_core::Audio;
-        let state = state();
-        let app = api::router(Arc::clone(&state));
-        let frames = 4410;
-        let wave = |scale: f32| -> Vec<f32> {
-            (0..frames)
-                .map(|i| scale * (i as f32 * 0.01).sin())
-                .collect()
-        };
-        let mix = Audio::new(vec![wave(0.5), wave(0.4)], 44_100);
-        let id = crate::sessions::track_id(&mix);
-        let output = crate::testkit::output();
-        let dir =
-            state
-                .cache
-                .verified_dir(&state.switcher.cache_id(), &type_dir(&output, 1.0), &id);
-        let task = Consolidation::at_44100(dir, output.format, frames);
-        state.cache.write_info(&task.dir, &task.info).unwrap();
-        for (stem, scale) in [("harmonics", 0.2), ("vocals", 0.15), ("drums", 0.1)] {
-            let part = Audio::new(vec![wave(scale), wave(scale)], 44_100);
-            let bytes = stemd_core::encode_stem(&part, output.format, 1.0).unwrap();
-            state
-                .cache
-                .consolidate(&task, stem, &bytes, frames, Some(0))
-                .unwrap();
-        }
-        let body: Vec<u8> = (0..frames)
-            .flat_map(|i| [mix.data[0][i], mix.data[1][i]])
-            .flat_map(f32::to_le_bytes)
-            .collect();
-
-        let answer = call(
-            &app,
-            Method::POST,
-            "/v1/jobs?format=f32le&output_format=pcm16",
-            body,
-        )
-        .await;
-        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
-        let result = &answer.json["result"];
-        assert_eq!(result["cached"], true);
-        assert_eq!(result["model_residual_db"].as_f64(), Some(FLOOR_DB));
-        assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
-
-        let id = answer.json["id"].as_str().unwrap();
-        let again = call(&app, Method::GET, &format!("/v1/jobs/{id}"), Vec::new()).await;
-        let result = &again.json["result"];
-        assert_eq!(result["model_residual_db"].as_f64(), Some(FLOOR_DB));
-        assert_eq!(result["realtime_factor"].as_f64(), Some(0.0));
-    }
-
-    #[tokio::test]
-    async fn sessions_and_filters_are_protocol_2_only() {
-        let app = api::router(state());
-        for (method, path) in [
-            (Method::POST, "/v1/sessions?frames=30000"),
-            (Method::GET, "/v1/sessions/abc"),
-            (Method::PUT, "/v1/sessions/abc/window"),
-        ] {
-            let answer = call(&app, method, path, Vec::new()).await;
-            assert_eq!(answer.status, StatusCode::GONE, "{path}");
-            assert_eq!(answer.json["code"], "protocol_1", "{path}");
-            assert!(
-                answer.json["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("/v2/sessions"),
-                "{path}"
-            );
-            assert_eq!(answer.headers["deprecation"], "true", "{path}");
-        }
-        let filter = format!("/v1/filters/{}", "0".repeat(64));
-        let answer = call(&app, Method::GET, &filter, Vec::new()).await;
-        assert_eq!(answer.status, StatusCode::NOT_FOUND);
-    }
 
     #[tokio::test]
     async fn a_v1_answer_is_marked_deprecated() {
@@ -444,7 +253,7 @@ mod tests {
         for path in ["/v1/health", "/v1/nothing"] {
             let answer = call(&app, Method::GET, path, Vec::new()).await;
             assert_eq!(answer.headers["deprecation"], "true", "{path}");
-            assert_eq!(answer.headers[header::LINK], LINK, "{path}");
+            assert_eq!(answer.headers[http::header::LINK], LINK, "{path}");
         }
         let answer = call(&app, Method::GET, "/v10/health", Vec::new()).await;
         assert!(answer.headers.get("deprecation").is_none());

@@ -90,33 +90,9 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1e6)
 }
 
-/// Draw `stage` into the whole of `ui`. Returns the preset picked this frame.
-pub(super) fn body(
-    ui: &mut egui::Ui,
-    stage: &Stage,
-    palette: &Palette,
-    brushes: &Brushes,
-    view: &mut View,
-) -> Option<Preset> {
-    if matches!(stage, Stage::Choosing(_)) {
-        view.offered = true;
-    }
-    if let Some(preset) = preset_of(stage) {
-        view.picked = Some(preset);
-    }
-    view.last = Some(stage.clone());
-    let area = ui.max_rect();
-    let inner = Rect::from_min_max(area.min + vec2(24.0, 26.0), area.max - vec2(24.0, 24.0));
-    let mid = inner.center().x;
-    let ctx = ui.ctx().clone();
-    let now = ctx.input(|i| i.time);
-    let busy = matches!(
-        stage,
-        Stage::Downloading { .. } | Stage::Verifying(_) | Stage::Loading(_)
-    );
-
-    let picked = view.picked;
-    let (title, sub) = match stage {
+/// The title and the line under it for `stage`.
+fn heading(stage: &Stage) -> (String, String) {
+    match stage {
         Stage::Starting => ("Starting Stemd".to_owned(), "Checking the GPU".to_owned()),
         Stage::Choosing(installed) if installed.is_empty() => (
             "Choose a model".to_owned(),
@@ -157,7 +133,74 @@ pub(super) fn body(
             "A few seconds".to_owned(),
         ),
         Stage::Failed(message) => ("Stemd could not start".to_owned(), message.clone()),
-    };
+    }
+}
+
+/// The note under the model rows while choosing, or the Quit button after a failure.
+fn footer_row(
+    ui: &mut egui::Ui,
+    stage: &Stage,
+    footer: Rect,
+    palette: &Palette,
+    brushes: &Brushes,
+) {
+    match stage {
+        Stage::Choosing(_) => {
+            ui.painter().text(
+                footer.center(),
+                egui::Align2::CENTER_CENTER,
+                "You can switch later from the model menu.",
+                theme::font(12.0, Weight::Regular),
+                palette.muted,
+            );
+        }
+        Stage::Failed(_) => {
+            let rect = Rect::from_center_size(footer.center(), vec2(88.0, QUIT_HEIGHT));
+            let quit = widgets::pill(
+                ui,
+                rect,
+                ui.id().with("quit"),
+                "Quit",
+                Pill::Light,
+                true,
+                palette,
+                brushes,
+            );
+            if quit.clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Draw `stage` into the whole of `ui`. Returns the preset picked this frame.
+pub(super) fn body(
+    ui: &mut egui::Ui,
+    stage: &Stage,
+    palette: &Palette,
+    brushes: &Brushes,
+    view: &mut View,
+) -> Option<Preset> {
+    if matches!(stage, Stage::Choosing(_)) {
+        view.offered = true;
+    }
+    if let Some(preset) = preset_of(stage) {
+        view.picked = Some(preset);
+    }
+    view.last = Some(stage.clone());
+    let area = ui.max_rect();
+    let inner = Rect::from_min_max(area.min + vec2(24.0, 26.0), area.max - vec2(24.0, 24.0));
+    let mid = inner.center().x;
+    let ctx = ui.ctx().clone();
+    let now = ctx.input(|i| i.time);
+    let busy = matches!(
+        stage,
+        Stage::Downloading { .. } | Stage::Verifying(_) | Stage::Loading(_)
+    );
+
+    let picked = view.picked;
+    let (title, sub) = heading(stage);
 
     let failed = matches!(stage, Stage::Failed(_));
     let title_colour = if failed { palette.danger } else { palette.text };
@@ -246,34 +289,7 @@ pub(super) fn body(
     } else {
         Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), QUIT_HEIGHT))
     };
-    match stage {
-        Stage::Choosing(_) => {
-            ui.painter().text(
-                footer.center(),
-                egui::Align2::CENTER_CENTER,
-                "You can switch later from the model menu.",
-                theme::font(12.0, Weight::Regular),
-                palette.muted,
-            );
-        }
-        Stage::Failed(_) => {
-            let rect = Rect::from_center_size(footer.center(), vec2(88.0, QUIT_HEIGHT));
-            let quit = widgets::pill(
-                ui,
-                rect,
-                ui.id().with("quit"),
-                "Quit",
-                Pill::Light,
-                true,
-                palette,
-                brushes,
-            );
-            if quit.clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-        _ => {}
-    }
+    footer_row(ui, stage, footer, palette, brushes);
 
     if let Some(preset) = chosen {
         view.picked = Some(preset);

@@ -43,7 +43,7 @@ impl Advertiser {
         props.insert("version", env!("CARGO_PKG_VERSION").to_owned());
         props.insert("model", model.to_owned());
         props.insert("path", "/v2".to_owned());
-        props.insert("features", crate::api::FEATURES.join(","));
+        props.insert("features", crate::api::health::FEATURES.join(","));
 
         // Logged so a discovery failure on a multi-homed host is a one-line
         // diagnosis rather than a packet capture. Kept out of the ordinary

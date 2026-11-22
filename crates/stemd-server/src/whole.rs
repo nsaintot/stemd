@@ -74,6 +74,18 @@ impl Meta {
     }
 }
 
+/// `audio` encoded as `format` at `gain`, and its [`clipped`] count when `format` has no headroom.
+pub fn encode(
+    audio: &Audio,
+    format: StemFormat,
+    gain: f32,
+    stored: bool,
+) -> Result<(Vec<u8>, Option<usize>)> {
+    let bytes = stemd_core::encode_stem(audio, format, gain)?;
+    let clipped = (!format.has_headroom()).then(|| clipped(audio, gain, stored));
+    Ok((bytes, clipped))
+}
+
 /// Samples of `audio` over full scale at `gain`; with `stored`, samples at full scale count too.
 pub fn clipped(audio: &Audio, gain: f32, stored: bool) -> usize {
     audio
@@ -155,14 +167,14 @@ pub fn read(
             let mut bytes = take(0, meta.header)?;
             unknown_length(&mut bytes)?;
             bytes.extend(take(start, (end - start) as usize)?);
-            let audio = crate::cache::decode(bytes, format, channels, rate)?;
+            let audio = decode(bytes, format, channels, rate)?;
             let skip = from - a * meta.block;
             ensure!(
                 audio.frames() >= skip + (to - from),
                 "flac frames {a}..{b} decoded to {} samples",
                 audio.frames()
             );
-            Ok(crate::sessions::excerpt(&audio, skip, skip + (to - from)))
+            Ok(audio.excerpt(skip, skip + (to - from)))
         }
         StemFormat::Wav | StemFormat::Pcm16 | StemFormat::Pcm32 => {
             let (header, size, raw) = match format {
@@ -172,7 +184,7 @@ pub fn read(
             };
             let per_frame = channels * size;
             let bytes = take((header + from * per_frame) as u64, (to - from) * per_frame)?;
-            crate::cache::decode(bytes, raw, channels, rate)
+            decode(bytes, raw, channels, rate)
         }
         StemFormat::Mp3 => bail!("an mp3 stem is not read by range"),
     }
@@ -339,6 +351,63 @@ fn unknown_length(header: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Decode a stored piece to the samples `encode_stem(_, format, 1.0)` turns back
+/// into the same bytes: 16-bit samples as `q / 32767`, `f32le` as stored.
+pub fn decode(bytes: Vec<u8>, format: StemFormat, channels: usize, rate: u32) -> Result<Audio> {
+    let planar = |samples: Vec<f32>| -> Result<Audio> {
+        anyhow::ensure!(
+            channels > 0 && samples.len().is_multiple_of(channels),
+            "{} samples do not divide into {channels} channels",
+            samples.len()
+        );
+        let mut data = vec![Vec::with_capacity(samples.len() / channels); channels];
+        for (i, v) in samples.into_iter().enumerate() {
+            data[i % channels].push(v);
+        }
+        Ok(Audio::new(data, rate))
+    };
+    let s16 = |raw: &[u8]| -> Vec<f32> {
+        raw.chunks_exact(2)
+            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / S16_SCALE)
+            .collect()
+    };
+    match format {
+        StemFormat::Pcm32 => planar(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        ),
+        StemFormat::Pcm16 => planar(s16(&bytes)),
+        StemFormat::Wav => planar(s16(bytes
+            .get(WAV_HEADER..)
+            .context("a wav piece without its header")?)),
+        StemFormat::Flac => {
+            // Symphonia reads `q` as `q / 32768`, which is exact in f32.
+            let decoded = stemd_audio::decode_flac(bytes)?;
+            anyhow::ensure!(
+                decoded.data.len() == channels,
+                "a flac piece with {} channels, not {channels}",
+                decoded.data.len()
+            );
+            let data = decoded
+                .data
+                .into_iter()
+                .map(|c| {
+                    c.into_iter()
+                        .map(|v| (v * 32768.0).round() / S16_SCALE)
+                        .collect()
+                })
+                .collect();
+            Ok(Audio::new(data, rate))
+        }
+        StemFormat::Mp3 => anyhow::bail!("mp3 is never stored as pieces"),
+    }
+}
+
+/// The multiplier `encode_stem` quantises 16-bit samples with.
+const S16_SCALE: f32 = stemd_audio::wire::FLOAT_TO_S16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,8 +441,7 @@ mod tests {
 
     #[test]
     fn a_range_cut_from_a_whole_file_equals_the_same_range_of_the_whole_decode() {
-        let dir = std::env::temp_dir().join(format!("stemd-whole-unit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a directory");
+        let dir = crate::scratch::dir("whole-unit");
         for frames in [1, 4096, 4097, 50_001] {
             let audio = noise(frames, frames as u32);
             for format in [
@@ -383,7 +451,7 @@ mod tests {
                 StemFormat::Pcm32,
             ] {
                 let whole = stored(&dir, format, &audio);
-                let all = crate::cache::decode(
+                let all = decode(
                     std::fs::read(&whole.path).expect("reading"),
                     format,
                     2,
@@ -400,7 +468,7 @@ mod tests {
                         continue;
                     }
                     let got = read(&whole, format, 2, 96_000, from, to).expect("a range");
-                    let want = crate::sessions::excerpt(&all, from, to);
+                    let want = all.excerpt(from, to);
                     assert_eq!(bits(&got), bits(&want), "{format}, {frames}: {from}..{to}");
                 }
             }
@@ -409,8 +477,7 @@ mod tests {
 
     #[test]
     fn a_flac_description_that_does_not_fit_its_file_is_not_found() {
-        let dir = std::env::temp_dir().join(format!("stemd-whole-find-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a directory");
+        let dir = crate::scratch::dir("whole-find");
         let audio = noise(20_000, 9);
         let bytes = stemd_core::encode_stem(&audio, StemFormat::Flac, 1.0).expect("encoding");
         std::fs::write(file(&dir, "vocals", "flac"), &bytes).expect("writing");
@@ -489,5 +556,27 @@ mod tests {
         let mut broken = bytes.clone();
         broken[at + 4] ^= 0x01;
         assert_eq!(frame_number(&broken, at), None);
+    }
+
+    #[test]
+    fn a_piece_that_does_not_decode_to_its_shape_is_an_error() {
+        let odd = decode(vec![0; 6], StemFormat::Pcm16, 2, 44_100).unwrap_err();
+        assert!(
+            odd.to_string().contains("do not divide into 2 channels"),
+            "{odd:#}"
+        );
+        let short = decode(vec![0; WAV_HEADER - 1], StemFormat::Wav, 2, 44_100).unwrap_err();
+        assert!(
+            short.to_string().contains("without its header"),
+            "{short:#}"
+        );
+        assert!(decode(vec![1, 2, 3, 4], StemFormat::Flac, 2, 44_100).is_err());
+        let stereo =
+            stemd_core::encode_stem(&noise(100, 1), StemFormat::Flac, 1.0).expect("encoding");
+        let mono = decode(stereo, StemFormat::Flac, 1, 44_100).unwrap_err();
+        assert!(
+            mono.to_string().contains("with 2 channels, not 1"),
+            "{mono:#}"
+        );
     }
 }

@@ -4,9 +4,40 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 
+use anyhow::{Context, Result};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::api::AppState;
+/// Take the port before [`crate::startup::prepare`] loads the model, so a port
+/// in use fails in milliseconds.
+///
+/// Non-blocking because tokio requires it of a listener adopted from std, and
+/// doing it here means [`crate::serve::listen`] cannot forget to.
+pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+    listener
+        .set_nonblocking(true)
+        .context("putting the listener in non-blocking mode")?;
+    Ok(listener)
+}
+
+/// Bind `port` on every interface, else 8420, else any free port; return `port` after a fallback.
+pub fn bind_saved(port: u16) -> Result<(std::net::TcpListener, Option<u16>)> {
+    let any = |port: u16| SocketAddr::from(([0, 0, 0, 0], port));
+    let err = match bind(any(port)) {
+        Ok(listener) => return Ok((listener, None)),
+        Err(err) => err,
+    };
+    let fallback = crate::settings::DEFAULT_PORT;
+    let listener = match (port != fallback).then(|| bind(any(fallback))) {
+        Some(Ok(listener)) => listener,
+        _ => bind(any(0))?,
+    };
+    tracing::warn!(
+        "{err:#}; serving on port {} instead",
+        listener.local_addr()?.port()
+    );
+    Ok((listener, Some(port)))
+}
 
 /// Listeners bound for a new port, for the serve loop to take over.
 pub type Moves = UnboundedReceiver<std::net::TcpListener>;
@@ -69,7 +100,7 @@ impl Endpoint {
     /// stops accepting on the old port and lets its open requests finish.
     pub(crate) fn move_to(&self, port: u16) -> Result<(), MoveError> {
         let addr = SocketAddr::new(self.ip, port);
-        let listener = crate::serve::bind(addr).map_err(|err| {
+        let listener = bind(addr).map_err(|err| {
             match err
                 .downcast_ref::<std::io::Error>()
                 .map(std::io::Error::kind)
@@ -87,27 +118,13 @@ impl Endpoint {
     }
 }
 
-impl AppState {
-    /// Serve on `port` from now on: rebind, advertise it, and save it.
-    pub fn move_to_port(&self, port: u16) -> Result<(), MoveError> {
-        if port == self.endpoint.port() {
-            return Ok(());
-        }
-        self.endpoint.move_to(port)?;
-        self.serving.move_to(port, &self.queue.info().model);
-        self.settings.set_port(port);
-        tracing::info!("listening on http://{}", self.endpoint.addr());
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_move_hands_the_new_listener_over_and_a_taken_port_is_refused() {
-        let first = crate::serve::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let first = bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let (endpoint, mut moves) = Endpoint::new(first.local_addr().unwrap(), Some(1));
         assert_eq!(endpoint.taken(), Some(1));
 

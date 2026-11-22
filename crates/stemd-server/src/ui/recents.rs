@@ -49,38 +49,15 @@ pub fn list(
         items.len().max(min_rows),
         max_height.min(MAX_VISIBLE * ROW_HEIGHT),
     );
-    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    brushes.glass(ui.painter(), panel, RADIUS, Glass::List);
-
-    let mut inside = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(panel)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    inside.set_clip_rect(panel.intersect(ui.clip_rect()));
-    inside.spacing_mut().item_spacing = vec2(0.0, 0.0);
-    inside.spacing_mut().scroll = egui::style::ScrollStyle {
-        bar_width: 6.0,
-        ..egui::style::ScrollStyle::floating()
-    };
     let now = ui.input(|i| i.time) as f32;
     let mut stop = None;
-    egui::ScrollArea::vertical()
-        .id_salt("recents")
-        .max_height(height)
-        .auto_shrink([false, true])
-        .show(&mut inside, |ui| {
-            let mark = super::widgets::paint_mark(ui);
-            for (n, item) in items.iter().enumerate() {
-                if row(ui, palette, drops, item, n == 0, n + 1 == items.len(), now) {
-                    stop = Some(Arc::clone(item));
-                }
+    super::widgets::glass_list(ui, brushes, (height, RADIUS, ROW_HEIGHT), "recents", |ui| {
+        for (n, item) in items.iter().enumerate() {
+            if row(ui, palette, drops, item, n == 0, n + 1 == items.len(), now) {
+                stop = Some(Arc::clone(item));
             }
-            if ui.cursor().top() > panel.bottom() + 0.5 {
-                let zone = super::widgets::fade_zone(panel, ROW_HEIGHT);
-                super::widgets::fade_out(ui.painter(), mark, zone);
-            }
-        });
+        }
+    });
     stop
 }
 
@@ -172,71 +149,15 @@ fn row(
     let hover = ui
         .ctx()
         .animate_bool_with_time(id.with("hover"), touched, 0.12);
-    if hover > 0.0 {
-        let corners = egui::CornerRadius {
-            nw: if first { RADIUS as u8 - 1 } else { 0 },
-            ne: if first { RADIUS as u8 - 1 } else { 0 },
-            sw: if last { RADIUS as u8 - 1 } else { 0 },
-            se: if last { RADIUS as u8 - 1 } else { 0 },
-        };
-        painter.rect_filled(rect.shrink(1.0), corners, white(0.05 * hover));
-    }
-    if !first {
-        painter.line_segment(
-            [
-                rect.left_top() + vec2(0.0, 0.5),
-                rect.right_top() + vec2(0.0, 0.5),
-            ],
-            Stroke::new(1.0, palette.hairline),
-        );
-    }
+    row_backdrop(painter, rect, palette, hover, first, last);
 
     //  Painted: a `ui.label` registers its own interaction rect on top of the
     //  row's and takes the pointer from it.
     let icon = icons::square(pos2(rect.left() + 14.0 + 6.0, rect.center().y), 12.0);
-    let waiting = matches!(&state, State::Working(p) if p.stage == stemd_core::Stage::Queued);
-    match &state {
-        State::Done(_) => icons::check(painter, icon, palette.good, 1.6),
-        State::Failed(_) => icons::cross(painter, icon.shrink(1.0), palette.danger, 1.5),
-        _ if waiting => icons::clock(painter, icon, palette.muted, 1.4),
-        State::Reading | State::Working(_) => {
-            icons::spinner(painter, icon, palette.text, 1.6, now.rem_euclid(1.0));
-        }
-    }
+    status_icon(painter, icon, &state, palette, now);
 
     let swapped = touched && openable;
-    let meta_font = theme::font(12.0, Weight::Regular);
-    let meta_right = if touched {
-        cross_rect.left() - 4.0 - 6.0
-    } else {
-        rect.right() - 8.0 - 6.0
-    };
-    let meta_left = if swapped {
-        let open =
-            painter.layout_no_wrap("Open folder".to_owned(), meta_font.clone(), palette.text);
-        let x = cross_rect.left() - 4.0 - 6.0 - open.size().x;
-        painter.galley(
-            pos2(x, rect.center().y - open.size().y / 2.0),
-            open,
-            palette.text,
-        );
-        x
-    } else {
-        let colour = if matches!(state, State::Failed(_)) {
-            palette.danger
-        } else {
-            palette.muted
-        };
-        let mut job = egui::text::LayoutJob::single_section(
-            detail(&state),
-            egui::TextFormat::simple(meta_font, colour),
-        );
-        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() * 0.45);
-        let meta = painter.layout_job(job);
-        let x = meta_right - meta.size().x;
-        painter.galley(pos2(x, rect.center().y - meta.size().y / 2.0), meta, colour);
-        x
-    };
+    let meta_left = meta(painter, rect, cross_rect, &state, palette, touched, swapped);
 
     let title_left = icon.right() + 10.0;
     let mut job = egui::text::LayoutJob::single_section(
@@ -299,6 +220,92 @@ fn row(
         }
     }
     false
+}
+
+/// The row's hover fill and the hairline above every row but the first.
+fn row_backdrop(
+    painter: &egui::Painter,
+    rect: Rect,
+    palette: &Palette,
+    hover: f32,
+    first: bool,
+    last: bool,
+) {
+    if hover > 0.0 {
+        let corners = egui::CornerRadius {
+            nw: if first { RADIUS as u8 - 1 } else { 0 },
+            ne: if first { RADIUS as u8 - 1 } else { 0 },
+            sw: if last { RADIUS as u8 - 1 } else { 0 },
+            se: if last { RADIUS as u8 - 1 } else { 0 },
+        };
+        painter.rect_filled(rect.shrink(1.0), corners, white(0.05 * hover));
+    }
+    if !first {
+        painter.line_segment(
+            [
+                rect.left_top() + vec2(0.0, 0.5),
+                rect.right_top() + vec2(0.0, 0.5),
+            ],
+            Stroke::new(1.0, palette.hairline),
+        );
+    }
+}
+
+/// The icon for where `state` is: done, failed, queued or working.
+fn status_icon(painter: &egui::Painter, icon: Rect, state: &State, palette: &Palette, now: f32) {
+    let waiting = matches!(&state, State::Working(p) if p.stage == stemd_core::Stage::Queued);
+    match state {
+        State::Done(_) => icons::check(painter, icon, palette.good, 1.6),
+        State::Failed(_) => icons::cross(painter, icon.shrink(1.0), palette.danger, 1.5),
+        _ if waiting => icons::clock(painter, icon, palette.muted, 1.4),
+        State::Reading | State::Working(_) => {
+            icons::spinner(painter, icon, palette.text, 1.6, now.rem_euclid(1.0));
+        }
+    }
+}
+
+/// The detail at the row's right end, or "Open folder" on a hovered finished row. Returns its left edge.
+fn meta(
+    painter: &egui::Painter,
+    rect: Rect,
+    cross_rect: Rect,
+    state: &State,
+    palette: &Palette,
+    touched: bool,
+    swapped: bool,
+) -> f32 {
+    let meta_font = theme::font(12.0, Weight::Regular);
+    let meta_right = if touched {
+        cross_rect.left() - 4.0 - 6.0
+    } else {
+        rect.right() - 8.0 - 6.0
+    };
+    if swapped {
+        let open =
+            painter.layout_no_wrap("Open folder".to_owned(), meta_font.clone(), palette.text);
+        let x = cross_rect.left() - 4.0 - 6.0 - open.size().x;
+        painter.galley(
+            pos2(x, rect.center().y - open.size().y / 2.0),
+            open,
+            palette.text,
+        );
+        x
+    } else {
+        let colour = if matches!(state, State::Failed(_)) {
+            palette.danger
+        } else {
+            palette.muted
+        };
+        let mut job = egui::text::LayoutJob::single_section(
+            detail(state),
+            egui::TextFormat::simple(meta_font, colour),
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() * 0.45);
+        let meta = painter.layout_job(job);
+        let x = meta_right - meta.size().x;
+        painter.galley(pos2(x, rect.center().y - meta.size().y / 2.0), meta, colour);
+        x
+    }
 }
 
 fn detail(state: &State) -> String {

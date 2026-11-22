@@ -1,10 +1,8 @@
 //! Choosing a precision per model, rather than per run.
 //!
-//! `--full-precision` used to answer this for the whole server, which cannot be
-//! right for a preset that chains two architectures: on CUDA a BS-RoFormer is
-//! 3.76x faster at full precision and a demucs is 22.8x faster at half. Measured
-//! end to end on Quality, a global switch to full precision is worth 1.16x; per
-//! model it is worth about 3.5x on the model time.
+//! One precision per model family: on CUDA a BS-RoFormer is 3.76x faster at full precision
+//! and a demucs 22.8x faster at half, so a single switch for the whole server cannot suit a
+//! preset that runs both.
 //!
 //! So the flag is an override and the default is a question asked once per model,
 //! of [`stemd_core::Precision::preferred`].

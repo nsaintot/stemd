@@ -18,13 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::pcm::{Audio, PcmError, PcmFormat};
 use crate::resample::OutputRate;
 
-/// Bit depth FLAC stems are written at.
-///
-/// 16 rather than 24: the quantisation floor is already about 60 dB below the
-/// model's own error. FLAC has no float encoding, so `f32le` has no FLAC form.
-const FLAC_BITS: usize = 16;
-
-/// Bits per sample in a WAV stem. The same 16 as FLAC, for the same reason, and
+/// Bits per sample in a WAV stem. The same 16 as [`stemd_audio::wire::FLAC_BITS`], for the same reason, and
 /// because a 16-bit WAV opens everywhere without a conversation about it.
 const WAV_BITS: u16 = 16;
 
@@ -62,6 +56,7 @@ impl StemFormat {
 
     /// The raw sample encoding, when the payload is samples rather than a
     /// container a client has to decode.
+    #[cfg(test)]
     pub const fn as_pcm(self) -> Option<PcmFormat> {
         match self {
             Self::Pcm16 => Some(PcmFormat::S16le),
@@ -74,6 +69,7 @@ impl StemFormat {
     ///
     /// The property the derived part depends on: parts that are not lossless do
     /// not sum back to the mix.
+    #[cfg(test)]
     pub const fn is_lossless(self) -> bool {
         !matches!(self, Self::Mp3)
     }
@@ -287,71 +283,26 @@ fn to_mp3_at(
     Ok(out)
 }
 
-/// FLAC-encode at [`FLAC_BITS`].
+/// FLAC-encode at [`stemd_audio::wire::FLAC_BITS`].
 ///
 /// Samples are quantised by exactly the routine `s16le` uses, so a client rebuilds
 /// the derived part identically whichever format it asked for.
 fn to_flac(audio: &Audio, gain: f32) -> anyhow::Result<Vec<u8>> {
-    use flacenc::error::Verify;
-
-    let mut config = flacenc::config::Encoder::default();
-
     //  One below the crate's default of 10: 13% off the encode for 0.7% more bytes,
     //  measured by `encode_cost`. Order 4 costs 9.5% more size and no LPC costs 25%.
     //  Encoding dominates the writing stage and is already multithreaded, so this is
     //  the only lever.
-    config.subframe_coding.qlpc.lpc_order = 8;
-
-    let config = config
-        .into_verified()
-        .map_err(|e| anyhow::anyhow!("flac encoder config: {e:?}"))?;
+    let config = stemd_audio::wire::flac_config(Some(8))?;
     to_flac_with(audio, gain, &config)
 }
 
-/// The body of [`to_flac`], with the encoder configuration supplied. Split out so
-/// the speed/size trade can be measured against real stems: encode time depends on
-/// the material.
+/// The body of [`to_flac`], with the encoder configuration supplied, so `encode_cost` can vary it.
 fn to_flac_with(
     audio: &Audio,
     gain: f32,
     config: &flacenc::error::Verified<flacenc::config::Encoder>,
 ) -> anyhow::Result<Vec<u8>> {
-    use flacenc::component::BitRepr;
-
-    let channels = audio.channels();
-    anyhow::ensure!(channels > 0, "cannot encode zero channels to flac");
-
-    let mut interleaved = Vec::with_capacity(audio.frames() * channels);
-    for i in 0..audio.frames() {
-        for ch in &audio.data {
-            interleaved.push(i32::from(crate::pcm::quantise_s16(ch[i] * gain)));
-        }
-    }
-
-    let source = flacenc::source::MemSource::from_samples(
-        &interleaved,
-        channels,
-        FLAC_BITS,
-        audio.sample_rate as usize,
-    );
-    let mut stream = flacenc::encode_with_fixed_block_size(config, source, config.block_size)
-        .map_err(|e| anyhow::anyhow!("flac encode: {e}"))?;
-
-    //  Declare the fixed block size the frames actually use. The encoder folds every
-    //  frame's size into STREAMINFO's minimum, so a trailing partial block leaves
-    //  `min < max`, declaring a variable-block-size stream whose frames are fixed. A
-    //  decoder that trusts it locates frames by sample number and stops early.
-    //  libFLAC and ffmpeg both exclude the last block from the minimum.
-    stream
-        .stream_info_mut()
-        .set_block_sizes(config.block_size, config.block_size)
-        .map_err(|e| anyhow::anyhow!("flac block sizes: {e:?}"))?;
-
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| anyhow::anyhow!("flac serialise: {e}"))?;
-    Ok(sink.into_inner())
+    stemd_audio::wire::encode_flac(&audio.data, audio.sample_rate, gain, config)
 }
 
 #[cfg(test)]
@@ -591,6 +542,36 @@ mod tests {
 
     /// Every name the API takes has to survive the round trip, including the
     /// spellings kept for the clients that already use them.
+    /// FNV-1a over `bytes`, to pin encoder output in a test.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn each_format_encodes_to_the_recorded_bytes() {
+        let audio = tone(4096 * 2 + 333);
+        let got: Vec<u64> = [
+            StemFormat::Flac,
+            StemFormat::Wav,
+            StemFormat::Pcm16,
+            StemFormat::Pcm32,
+        ]
+        .into_iter()
+        .map(|format| fnv(&encode(&audio, format, 0.8).expect("encoding")))
+        .collect();
+        assert_eq!(
+            got,
+            [
+                6_879_416_745_213_006_112,
+                17_670_478_727_201_919_131,
+                6_547_095_000_092_806_396,
+                7_324_643_346_458_908_958
+            ]
+        );
+    }
+
     #[test]
     fn every_format_name_parses_back_to_itself() {
         for format in StemFormat::ALL {

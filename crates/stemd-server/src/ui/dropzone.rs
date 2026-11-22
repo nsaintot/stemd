@@ -129,6 +129,23 @@ pub struct Zone<'a> {
     pub intro: Option<Intro>,
 }
 
+/// `text` on one line centred on `mid` at `y`, cut to `width`.
+fn centred_line(
+    painter: &egui::Painter,
+    text: String,
+    font: egui::FontId,
+    colour: egui::Color32,
+    mid: f32,
+    y: f32,
+    width: f32,
+) {
+    let mut job =
+        egui::text::LayoutJob::single_section(text, egui::TextFormat::simple(font, colour));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    let galley = painter.layout_job(job);
+    painter.galley(pos2(mid - galley.size().x / 2.0, y), galley, colour);
+}
+
 impl Zone<'_> {
     /// Draws the zone and returns what its button asked for.
     pub fn show(&self, ui: &mut egui::Ui) -> Option<Action> {
@@ -151,17 +168,7 @@ impl Zone<'_> {
         self.surface(ui, rect, id);
 
         let switch = self.switch.filter(|_| !self.armed && !working && !cheering);
-        let title = if self.armed {
-            "Release to separate".to_owned()
-        } else if cheering {
-            "All done".to_owned()
-        } else if let Some(item) = self.current.filter(|_| working) {
-            item.title.clone()
-        } else if let Some(switch) = switch {
-            switch_title(switch)
-        } else {
-            "Drop a track".to_owned()
-        };
+        let title = self.title(switch, working, cheering);
         let title_colour = if matches!(switch, Some(Switch::Failed { .. })) {
             self.palette.danger
         } else {
@@ -180,33 +187,7 @@ impl Zone<'_> {
         } else {
             TRACK_EASE
         };
-        let sub = if self.armed {
-            hint(self.parts)
-        } else if let Some(switch) = switch {
-            switch_caption(switch)
-        } else if let Some(note) = self.note {
-            note.to_owned()
-        } else if let Some((_, caption)) = &progress {
-            let caption = match self.left.filter(|_| switch.is_none()) {
-                Some(left) => format!("{caption}{}{left}", theme::DOT),
-                None => caption.clone(),
-            };
-            if let Some(shown) = self.batch.shown
-                && self.batch.total() > 1
-            {
-                format!(
-                    "{caption}{}track {} of {}",
-                    theme::DOT,
-                    shown + 1,
-                    self.batch.total()
-                )
-            } else {
-                caption.clone()
-            }
-        } else {
-            hint(self.parts)
-        };
-
+        let sub = self.caption(switch, progress.as_ref());
         let title_font = theme::font(20.0, Weight::Semibold);
         let sub_font = theme::font(12.5, Weight::Regular);
         let (title_h, sub_h) =
@@ -236,69 +217,33 @@ impl Zone<'_> {
             pos2(mid - globe::STAGE.x / 2.0, top + stage_at),
             globe::STAGE,
         );
-        let spread = ctx.animate_bool_with_time_and_easing(
-            id.with("spread"),
-            self.armed || working,
-            0.5,
-            ease_spread,
-        );
-        let lift = Tween::follow(
-            &ctx,
-            id.with("lift"),
-            if response.contains_pointer() {
-                3.0
-            } else {
-                0.0
-            },
-            0.3,
-            theme::ease_spring,
-        );
-        let halo = ctx.animate_bool_with_time(id.with("halo"), self.maxed, 0.7);
-        // From the startup screen's pose to this one.
-        let (stage, spread, halo) = match self.intro {
-            Some(intro) => (
-                Rect::from_min_size(intro.from.min.lerp(stage.min, intro.t), stage.size()),
-                intro.spread + (spread - intro.spread) * intro.t,
-                halo * intro.t,
-            ),
-            None => (stage, spread, halo),
-        };
-        // The halo and rings stay inside the card. During the intro the globe
-        // can still be outside it, so its box is kept too.
-        let globe_painter = globe_painter.with_clip_rect(rect.union(stage));
-        globe::paint(
+        self.paint_globe(
             &globe_painter,
-            self.brushes,
-            self.palette,
+            rect,
             stage,
-            self.motion,
-            globe::Look { spread, lift, halo },
-            now,
+            id,
+            working,
+            response.contains_pointer(),
         );
 
         let painter = ui.painter();
-        let mut job = egui::text::LayoutJob::single_section(
+        centred_line(
+            painter,
             title,
-            egui::TextFormat::simple(title_font, title_colour),
-        );
-        job.wrap =
-            egui::text::TextWrapping::truncate_at_width(TITLE_WIDTH.min(rect.width() - 40.0));
-        let galley = painter.layout_job(job);
-        painter.galley(
-            pos2(mid - galley.size().x / 2.0, top + title_at),
-            galley,
+            title_font,
             title_colour,
+            mid,
+            top + title_at,
+            TITLE_WIDTH.min(rect.width() - 40.0),
         );
-        let mut job = egui::text::LayoutJob::single_section(
+        centred_line(
+            painter,
             sub,
-            egui::TextFormat::simple(sub_font, self.palette.muted),
-        );
-        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 40.0);
-        let galley = painter.layout_job(job);
-        painter.galley(
-            pos2(mid - galley.size().x / 2.0, top + sub_at),
-            galley,
+            sub_font,
             self.palette.muted,
+            mid,
+            top + sub_at,
+            rect.width() - 40.0,
         );
 
         if let (Some((fraction, _)), Some(bar_at)) = (progress, bar_at) {
@@ -343,6 +288,104 @@ impl Zone<'_> {
         )
         .clicked()
         .then_some(action)
+    }
+
+    /// The zone's title line.
+    fn title(&self, switch: Option<Switch<'_>>, working: bool, cheering: bool) -> String {
+        if self.armed {
+            "Release to separate".to_owned()
+        } else if cheering {
+            "All done".to_owned()
+        } else if let Some(item) = self.current.filter(|_| working) {
+            item.title.clone()
+        } else if let Some(switch) = switch {
+            switch_title(switch)
+        } else {
+            "Drop a track".to_owned()
+        }
+    }
+
+    /// The line under the title: the hint, the switch, a note, or the progress caption.
+    fn caption(
+        &self,
+        switch: Option<Switch<'_>>,
+        progress: Option<&(Option<f32>, String)>,
+    ) -> String {
+        if self.armed {
+            hint(self.parts)
+        } else if let Some(switch) = switch {
+            switch_caption(switch)
+        } else if let Some(note) = self.note {
+            note.to_owned()
+        } else if let Some((_, caption)) = progress {
+            let caption = match self.left.filter(|_| switch.is_none()) {
+                Some(left) => format!("{caption}{}{left}", theme::DOT),
+                None => caption.clone(),
+            };
+            if let Some(shown) = self.batch.shown
+                && self.batch.total() > 1
+            {
+                format!(
+                    "{caption}{}track {} of {}",
+                    theme::DOT,
+                    shown + 1,
+                    self.batch.total()
+                )
+            } else {
+                caption.clone()
+            }
+        } else {
+            hint(self.parts)
+        }
+    }
+
+    /// The globe at `stage`, or between the startup screen's pose and it during the intro.
+    fn paint_globe(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        stage: Rect,
+        id: egui::Id,
+        working: bool,
+        hovered: bool,
+    ) {
+        let ctx = painter.ctx();
+        let now = ctx.input(|i| i.time);
+        let spread = ctx.animate_bool_with_time_and_easing(
+            id.with("spread"),
+            self.armed || working,
+            0.5,
+            ease_spread,
+        );
+        let lift = Tween::follow(
+            ctx,
+            id.with("lift"),
+            if hovered { 3.0 } else { 0.0 },
+            0.3,
+            theme::ease_spring,
+        );
+        let halo = ctx.animate_bool_with_time(id.with("halo"), self.maxed, 0.7);
+        // From the startup screen's pose to this one.
+        let (stage, spread, halo) = match self.intro {
+            Some(intro) => (
+                Rect::from_min_size(intro.from.min.lerp(stage.min, intro.t), stage.size()),
+                intro.spread + (spread - intro.spread) * intro.t,
+                halo * intro.t,
+            ),
+            None => (stage, spread, halo),
+        };
+        // The halo and rings stay inside the card. During the intro the globe
+        // can still be outside it, so its box is kept too.
+        let globe_painter = painter.with_clip_rect(rect.union(stage));
+        globe::paint(
+            &globe_painter,
+            self.brushes,
+            self.palette,
+            stage,
+            self.motion,
+            globe::Look { spread, lift, halo },
+            now,
+        );
     }
 
     /// The zone's own surface: faint at rest, brighter with a dashed edge and an

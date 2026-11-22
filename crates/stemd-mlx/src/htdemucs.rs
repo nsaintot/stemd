@@ -121,6 +121,109 @@ impl FreqEmbedding {
     }
 }
 
+/// The frequency and time encoders, then the two decoders, in the order they run.
+type Layers = (Vec<EncLayer>, Vec<EncLayer>, Vec<DecLayer>, Vec<DecLayer>);
+
+/// Load the encoder and decoder layers of both branches.
+fn layers(w: &Scope<'_>, config: &Config) -> Result<Layers> {
+    let dconv = Some((config.dconv_depth, config.dconv_compress));
+    let cac = 2; // complex-as-channels doubles the audio channels
+
+    let mut encoder = Vec::new();
+    let mut tencoder = Vec::new();
+    let mut decoder = Vec::new();
+    let mut tdecoder = Vec::new();
+
+    // Channels double at every step: 48, 96, 192, 384 out of 4 and 2 in.
+    for index in 0..config.depth {
+        let chout = config.channels * (1 << index);
+        let chin_z = if index == 0 {
+            config.audio_channels * cac
+        } else {
+            chout / 2
+        };
+        let chin_t = if index == 0 {
+            config.audio_channels
+        } else {
+            chout / 2
+        };
+        let name = index.to_string();
+
+        encoder.push(EncLayer::load(
+            &w.child("encoder").child(&name),
+            chin_z,
+            chout,
+            config.kernel,
+            config.stride,
+            Domain::Frequency,
+            true,
+            false,
+            config.context_enc,
+            dconv,
+        )?);
+        tencoder.push(EncLayer::load(
+            &w.child("tencoder").child(&name),
+            chin_t,
+            chout,
+            config.kernel,
+            config.stride,
+            Domain::Time,
+            true,
+            false,
+            config.context_enc,
+            dconv,
+        )?);
+
+        // Decoders mirror the encoders and are stored outermost-first, so
+        // index 0 here is the *last* decoder to run.
+        let last = index == 0;
+        let dec_out_z = if last {
+            config.audio_channels * config.sources * cac
+        } else {
+            chin_z
+        };
+        let dec_out_t = if last {
+            config.audio_channels * config.sources
+        } else {
+            chin_t
+        };
+        let position = (config.depth - 1 - index).to_string();
+        decoder.insert(
+            0,
+            DecLayer::load(
+                &w.child("decoder").child(&position),
+                chout,
+                dec_out_z,
+                config.kernel,
+                config.stride,
+                Domain::Frequency,
+                true,
+                false,
+                last,
+                config.context,
+                dconv,
+            )?,
+        );
+        tdecoder.insert(
+            0,
+            DecLayer::load(
+                &w.child("tdecoder").child(&position),
+                chout,
+                dec_out_t,
+                config.kernel,
+                config.stride,
+                Domain::Time,
+                true,
+                false,
+                last,
+                config.context,
+                dconv,
+            )?,
+        );
+    }
+    Ok((encoder, tencoder, decoder, tdecoder))
+}
+
 pub struct HtDemucs {
     config: Config,
     spectral: Spectral,
@@ -137,112 +240,18 @@ pub struct HtDemucs {
 }
 
 impl HtDemucs {
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Build the model from one artefact's tensors.
     ///
     /// `prefix` names the sub-model. A single-model artefact holds only
     /// `model_0`; a fine-tuned set holds one per source, and a caller that
     /// wants a specific source asks for that source's model by index.
-    pub const fn config(&self) -> &Config {
-        &self.config
-    }
-
     pub fn load(weights: &Weights, prefix: &str, config: Config) -> Result<Self> {
         let w = weights.at(prefix);
-        let dconv = Some((config.dconv_depth, config.dconv_compress));
-        let cac = 2; // complex-as-channels doubles the audio channels
-
-        let mut encoder = Vec::new();
-        let mut tencoder = Vec::new();
-        let mut decoder = Vec::new();
-        let mut tdecoder = Vec::new();
-
-        // Channels double at every step: 48, 96, 192, 384 out of 4 and 2 in.
-        for index in 0..config.depth {
-            let chout = config.channels * (1 << index);
-            let chin_z = if index == 0 {
-                config.audio_channels * cac
-            } else {
-                chout / 2
-            };
-            let chin_t = if index == 0 {
-                config.audio_channels
-            } else {
-                chout / 2
-            };
-            let name = index.to_string();
-
-            encoder.push(EncLayer::load(
-                &w.child("encoder").child(&name),
-                chin_z,
-                chout,
-                config.kernel,
-                config.stride,
-                Domain::Frequency,
-                true,
-                false,
-                config.context_enc,
-                dconv,
-            )?);
-            tencoder.push(EncLayer::load(
-                &w.child("tencoder").child(&name),
-                chin_t,
-                chout,
-                config.kernel,
-                config.stride,
-                Domain::Time,
-                true,
-                false,
-                config.context_enc,
-                dconv,
-            )?);
-
-            // Decoders mirror the encoders and are stored outermost-first, so
-            // index 0 here is the *last* decoder to run.
-            let last = index == 0;
-            let dec_out_z = if last {
-                config.audio_channels * config.sources * cac
-            } else {
-                chin_z
-            };
-            let dec_out_t = if last {
-                config.audio_channels * config.sources
-            } else {
-                chin_t
-            };
-            let position = (config.depth - 1 - index).to_string();
-            decoder.insert(
-                0,
-                DecLayer::load(
-                    &w.child("decoder").child(&position),
-                    chout,
-                    dec_out_z,
-                    config.kernel,
-                    config.stride,
-                    Domain::Frequency,
-                    true,
-                    false,
-                    last,
-                    config.context,
-                    dconv,
-                )?,
-            );
-            tdecoder.insert(
-                0,
-                DecLayer::load(
-                    &w.child("tdecoder").child(&position),
-                    chout,
-                    dec_out_t,
-                    config.kernel,
-                    config.stride,
-                    Domain::Time,
-                    true,
-                    false,
-                    last,
-                    config.context,
-                    dconv,
-                )?,
-            );
-        }
+        let (encoder, tencoder, decoder, tdecoder) = layers(&w, &config)?;
 
         let bottom = config.channels * (1 << (config.depth - 1));
         Ok(Self {

@@ -9,12 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use stemd_core::{
-    HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, OutputRate, PcmFormat,
-    RoformerSeparator, Separate, StemFormat,
-};
+use stemd_core::{OutputRate, StemFormat};
 
-use crate::api::AppState;
 use crate::cache::Cache;
 use crate::cli::Args;
 use crate::jobs::Jobs;
@@ -22,8 +18,9 @@ use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::models::{self, DEFAULT_PRESET, Preset};
 use crate::precision::Precisions;
-use crate::queue::{BuildSeparator, Queue};
+use crate::queue::Queue;
 use crate::settings::{self, SettingsFile};
+use crate::state::AppState;
 use crate::switch::{self, Switcher};
 
 /// A server wired up and ready to bind.
@@ -53,19 +50,7 @@ pub fn prepare(
     // Said here rather than in `log_model`, which runs after a model has been
     // loaded at CPU speed. A card whose runtime is missing looks exactly like
     // no card in every later line, and only one of the two has a fix.
-    if stemd_core::Accelerator::gpu_refused() {
-        if cfg!(windows) {
-            tracing::warn!(
-                "a GPU is installed but its runtime is not usable from here, so this \
-                 runs on the CPU. Run with --install-cuda to fetch it (about 1.2 GB, \
-                 once), or put the libraries beside the executable yourself."
-            );
-        } else {
-            tracing::warn!(
-                "a GPU is installed but failed a test computation, so this runs on the CPU."
-            );
-        }
-    }
+    warn_gpu_refused();
     let (stems, cache_summary) = open_stem_cache(args, &settings.get())?;
     let jobs = Arc::new(Jobs::new(args.unfetched_ttl()));
 
@@ -135,6 +120,24 @@ pub fn prepare(
         }),
         cache_summary,
     })
+}
+
+/// Warn that a GPU is present but unusable, with the fix where there is one.
+fn warn_gpu_refused() {
+    if !stemd_core::Accelerator::gpu_refused() {
+        return;
+    }
+    if cfg!(windows) {
+        tracing::warn!(
+            "a GPU is installed but its runtime is not usable from here, so this \
+             runs on the CPU. Run with --install-cuda to fetch it (about 1.2 GB, \
+             once), or put the libraries beside the executable yourself."
+        );
+    } else {
+        tracing::warn!(
+            "a GPU is installed but failed a test computation, so this runs on the CPU."
+        );
+    }
 }
 
 /// Open the settings file and apply the flags that override it for this run.
@@ -255,10 +258,10 @@ fn load_artefact(
         launch,
     )?;
 
-    // Starting the worker *is* loading the model, it builds what it will run.
+    // Starting the worker loads the model: the worker builds what it runs.
     launch.set(Stage::Loading(shown));
     let (queue, info) = Queue::start(
-        builder(&dir, artefact, preset, args.overlap, precisions),
+        models::builder(&dir, artefact, preset, args.overlap, precisions),
         args.queue_depth,
         Arc::clone(stems),
     )?;
@@ -273,72 +276,6 @@ fn load_artefact(
         Arc::new(queue),
         info,
     ))
-}
-
-/// [`build`] as a recipe, for whichever thread is going to run the model.
-///
-/// The arguments are copied rather than borrowed because the closure crosses a
-/// thread boundary. Both callers that install a model, the launch and the switch,
-/// go through here. See [`crate::queue::BuildSeparator`].
-pub fn builder(
-    dir: &Path,
-    artefact: &str,
-    preset: Option<Preset>,
-    overlap: f32,
-    precisions: Precisions,
-) -> BuildSeparator {
-    let (dir, artefact) = (dir.to_path_buf(), artefact.to_owned());
-    Box::new(move || {
-        build(&dir, &artefact, preset, overlap, precisions)
-            .with_context(|| format!("loading {artefact} from {}", dir.display()))
-    })
-}
-
-/// Turn a directory and an artefact name into a loaded model.
-///
-/// Private, and reached only through [`builder`].
-///
-/// Which architecture is decided by the preset rather than by sniffing the file,
-/// because only a preset can say that two artefacts belong together.
-fn build(
-    dir: &Path,
-    artefact: &str,
-    preset: Option<Preset>,
-    overlap: f32,
-    precisions: Precisions,
-) -> Result<Box<dyn Separate>> {
-    // Precision is asked per model family; see `crate::precision`.
-    let families = Preset::families(preset);
-    match preset {
-        Some(Preset::Quality) => Ok(Box::new(RoformerSeparator::load(
-            dir,
-            Preset::Quality.artefact(),
-            precisions.of(families[0]),
-            overlap,
-        )?)),
-        // Two of the artefact's four models, not all four: it only ever needed
-        // three, and two is both cheaper and better. Not chained: this tier's
-        // vocals half is a demucs specialist, and handing on what it leaves
-        // behind measured *worse* on every track tried.
-        Some(Preset::Balanced) => Ok(Box::new(HybridSeparator::demucs_specialists(
-            dir,
-            artefact,
-            HybridConfig {
-                overlap,
-                vocals_precision: precisions.of(families[0]),
-                drums_precision: precisions.of(families[0]),
-                cascade: false,
-            },
-        )?)),
-        _ => Ok(Box::new(MlxSeparator::load(
-            dir,
-            artefact,
-            MlxConfig {
-                overlap,
-                precision: precisions.of(families[0]),
-            },
-        )?)),
-    }
 }
 
 /// Directories searched for a model artefact, in order.
@@ -486,7 +423,7 @@ fn open_stem_cache(
     args: &Args,
     settings: &crate::settings::Settings,
 ) -> Result<(Arc<Cache>, String)> {
-    let root = crate::cache::root(args)?;
+    let root = args.cache_root()?;
     let rules = args.cache_rules(settings);
     let cache = Cache::open_with(root.clone(), rules)
         .with_context(|| format!("preparing the stem cache in {}", root.display()))?;
@@ -605,30 +542,6 @@ const IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// How often the reaper looks at the queue.
 const IDLE_TICK: Duration = Duration::from_secs(5);
 
-/// Bytes the longest permitted track can occupy, at the widest sample format the
-/// API accepts. `f32le`, the larger of the two. This bounds what axum buffers
-/// before the handler runs, so it has to be an upper bound.
-///
-/// Taken at the highest rate the API names rather than the model's, since an
-/// upload arrives at whatever rate the client holds and is converted here. Above
-/// that rate the body is refused by length; the duration limit still applies
-/// underneath it, so this only decides how far past 44.1 kHz an upload may go.
-pub fn max_body_bytes(max_track_secs: f64, sample_rate: u32, channels: usize) -> usize {
-    let per_second =
-        f64::from(sample_rate) * channels as f64 * PcmFormat::F32le.bytes_per_sample() as f64;
-    (max_track_secs * per_second) as usize
-}
-
-/// The highest rate `output_sample_rate` names, and the highest an upload can
-/// carry within the body limit.
-pub fn highest_rate() -> u32 {
-    stemd_core::OutputRate::ALL
-        .iter()
-        .map(|rate| rate.hz())
-        .max()
-        .unwrap_or(96_000)
-}
-
 fn log_model(info: &stemd_core::BackendInfo, precisions: Precisions, max_track_secs: f64) {
     // The backend by name rather than `info.device`'s coarse "gpu": on a
     // cross-platform build the difference between metal, cuda and a CPU
@@ -645,7 +558,7 @@ fn log_model(info: &stemd_core::BackendInfo, precisions: Precisions, max_track_s
     tracing::info!(
         "accepting tracks up to {:.0} minutes at any rate up to {} Hz",
         max_track_secs / 60.0,
-        highest_rate(),
+        crate::state::highest_rate(),
     );
     tracing::info!(
         "output: {} stems [{}]",
@@ -684,13 +597,13 @@ mod tests {
         let mix = Audio::from_interleaved(&bytes, PcmFormat::S16le, 2, 44100).expect("stereo pcm");
 
         for preset in Preset::ALL {
-            let mut sep = build(
+            let mut sep = crate::models::builder(
                 Path::new(&dir),
                 preset.artefact(),
                 Some(preset),
                 0.25,
                 Precisions::stated(None, stemd_core::Accelerator::Metal),
-            )
+            )()
             .unwrap_or_else(|e| panic!("building {preset:?}: {e:#}"));
 
             let advertised: Vec<String> = sep.info().stems;
@@ -781,13 +694,13 @@ mod tests {
             "preset", "vocals rms", "shared with drums"
         );
         for preset in Preset::ALL {
-            let mut sep = build(
+            let mut sep = crate::models::builder(
                 Path::new(&dir),
                 preset.artefact(),
                 Some(preset),
                 0.25,
                 Precisions::stated(None, stemd_core::Accelerator::Metal),
-            )
+            )()
             .unwrap_or_else(|e| panic!("building {preset:?}: {e:#}"));
             let stems = sep
                 .separate(&mix, stemd_core::Parts::DEFAULT, &Silent)
@@ -829,40 +742,6 @@ mod tests {
             let rms = (vocal_energy / (mix.frames() * mix.channels()) as f64).sqrt();
             println!("  {:<9}{rms:>12.4}{ticks:>19.1} dB", preset.label());
         }
-    }
-
-    #[test]
-    fn the_body_limit_admits_the_longest_track_at_every_rate_it_names() {
-        // The two limits are one number seen twice; the body limit must never
-        // reject audio the duration gate would have allowed, or a legal upload
-        // fails before the handler can explain why. An upload arrives at
-        // whatever rate the client holds, so it has to hold at each of them.
-        let secs = 600.0;
-        let limit = max_body_bytes(secs, highest_rate(), 2);
-
-        for rate in stemd_core::OutputRate::ALL {
-            let f32_track = (secs * f64::from(rate.hz()) * 2.0 * 4.0) as usize;
-            let s16_track = (secs * f64::from(rate.hz()) * 2.0 * 2.0) as usize;
-            assert!(limit >= f32_track, "{rate}: {limit} < {f32_track}");
-            assert!(limit >= s16_track);
-        }
-
-        // And one second more at the highest of them must not fit, or the gate
-        // is the only thing holding the line.
-        let widest = f64::from(highest_rate()) * 2.0 * 4.0;
-        assert!(limit < ((secs + 1.0) * widest) as usize);
-    }
-
-    #[test]
-    fn the_body_limit_follows_the_rate_and_channel_count() {
-        assert_eq!(
-            max_body_bytes(600.0, 48000, 2),
-            max_body_bytes(600.0, 44100, 2) * 48000 / 44100
-        );
-        assert_eq!(
-            max_body_bytes(600.0, 44100, 4),
-            max_body_bytes(600.0, 44100, 2) * 2
-        );
     }
 
     #[test]

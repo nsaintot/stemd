@@ -351,6 +351,54 @@ fn read_body(response: ureq::http::Response<ureq::Body>) -> Result<String> {
     Ok(body)
 }
 
+/// A local stand-in for a stemd server, for tests.
+#[cfg(test)]
+pub mod fake {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    use super::Server;
+
+    /// A server on a free local port that answers each request with `answer(method, path)`.
+    pub fn serve(answer: impl Fn(&str, &str) -> (u16, Vec<u8>) + Send + 'static) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().expect("a stream"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut words = line.split_whitespace();
+                let method = words.next().unwrap_or_default().to_owned();
+                let path = words.next().unwrap_or_default().to_owned();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let (status, out) = answer(&method, &path);
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    out.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&out);
+            }
+        });
+        Server { base }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +468,80 @@ mod tests {
         );
         let exact = Formats::new(true);
         assert_eq!((exact.upload, exact.download), ("f32le", "f32le"));
+    }
+
+    const SUMMARY: &str = r#"{"id": "abc", "in_rate": 44100, "out_rate": 96000, "taps": 320}"#;
+
+    #[test]
+    fn waiting_reports_each_new_stage_and_returns_the_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let server = fake::serve(move |_, path| {
+            assert_eq!(path, "/v2/jobs/j1");
+            let body = if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                r#"{"progress": {"stage": "queued"}}"#
+            } else {
+                r#"{"progress": {"stage": "done", "fraction": 1.0}, "result": {
+                    "output": {"format": "flac", "sample_rate": 44100, "derived": "drums"},
+                    "stems": [{"name": "vocals", "url": "/v2/jobs/j1/stems/vocals"}],
+                    "model_residual_db": -30.0, "separation_secs": 1.0, "realtime_factor": 2.0}}"#
+            };
+            (200, body.as_bytes().to_vec())
+        });
+        let mut seen = Vec::new();
+        let result = server
+            .wait("j1", |line, _| seen.push(line.to_owned()))
+            .expect("done");
+        assert_eq!(seen, ["queued", "done"]);
+        assert_eq!(result.stems[0].name, "vocals");
+        assert_eq!(result.stems[0].gain, 1.0);
+    }
+
+    #[test]
+    fn a_failed_job_is_an_error_with_the_servers_reason() {
+        let server = fake::serve(|_, _| {
+            (
+                200,
+                br#"{"progress": {"stage": "failed"}, "error": "out of memory"}"#.to_vec(),
+            )
+        });
+        let err = server.wait("j1", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("out of memory"), "{err:#}");
+    }
+
+    #[test]
+    fn a_filter_the_server_holds_is_not_uploaded_again() {
+        let server = fake::serve(|method, _| {
+            assert_eq!(method, "GET", "the filter was uploaded");
+            (200, SUMMARY.as_bytes().to_vec())
+        });
+        let (summary, uploaded) = server.ensure_filter(b"filter").expect("held");
+        assert!(!uploaded);
+        assert_eq!(summary.taps, 320);
+    }
+
+    #[test]
+    fn a_missing_filter_is_uploaded_and_a_refused_one_is_an_error() {
+        let id = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b"filter"))
+        };
+        let path = format!("/v2/filters/{id}");
+        let server = fake::serve(move |method, got| {
+            assert_eq!(got, path);
+            match method {
+                "GET" => (404, Vec::new()),
+                _ => (201, SUMMARY.as_bytes().to_vec()),
+            }
+        });
+        let (_, uploaded) = server.ensure_filter(b"filter").expect("uploaded");
+        assert!(uploaded);
+
+        let refusing = fake::serve(|method, _| match method {
+            "GET" => (404, Vec::new()),
+            _ => (400, br#"{"error": "not a filter"}"#.to_vec()),
+        });
+        let err = refusing.ensure_filter(b"filter").unwrap_err();
+        assert!(err.to_string().contains("refused the filter"), "{err:#}");
     }
 }

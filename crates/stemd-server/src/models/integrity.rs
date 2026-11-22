@@ -152,9 +152,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("stemd-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::scratch::dir(tag)
     }
 
     #[test]
@@ -200,5 +198,21 @@ mod tests {
         let both = describe(&dir, &["gone", "there"]);
         assert!(both.contains("is missing") && both.contains("does not match"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mismatch_outside_the_cache_is_used_and_inside_it_offline_is_refused() {
+        let preset = Preset::Fast;
+        let dir = scratch("verify");
+        for file in preset.source().files {
+            std::fs::write(dir.join(file.name), b"not the model").unwrap();
+        }
+        let elsewhere = scratch("verify-cache");
+        verify(&dir, &elsewhere, preset, true).expect("a local trace is used");
+        let err = verify(&dir, &dir, preset, true).unwrap_err();
+        assert!(err.to_string().contains("--offline"), "{err:#}");
+        for file in preset.source().files {
+            assert!(dir.join(file.name).is_file(), "{} was deleted", file.name);
+        }
     }
 }

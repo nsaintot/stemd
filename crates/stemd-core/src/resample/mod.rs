@@ -392,7 +392,7 @@ mod tests {
     /// linear.
     #[test]
     fn a_client_rebuilds_the_same_derived_part_at_any_rate() {
-        // Parts that deliberately do NOT sum to the mix, so the model residual
+        // Parts that deliberately do not sum to the mix, so the model residual
         // is real and has to survive the round trip onto the derived fader.
         let mix = tone(220.0, 44_100, 1.0);
         let harmonics = Audio::new(

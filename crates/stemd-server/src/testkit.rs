@@ -7,15 +7,15 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{self, HeaderMap, Method, StatusCode};
 use serde_json::Value;
 use stemd_core::{Audio, DspMode, OutputRate, StemFormat, Stems};
 use tower::ServiceExt as _;
 
-use crate::api::AppState;
 use crate::cache::{Cache, Rules, Separation};
 use crate::jobs::Entry;
 use crate::output::Output;
+use crate::state::AppState;
 
 /// Makes each test root unique. A timestamp alone is not enough: tests run in
 /// parallel within one process, and two starting inside the same clock tick
@@ -101,6 +101,11 @@ pub fn publish(cache: &Cache, track: &str, frames: usize, separation_secs: f64) 
 
 /// A server on the toy model, with nothing stored.
 pub fn state() -> Arc<AppState> {
+    state_with_depth(8)
+}
+
+/// [`state`] with a queue that holds `max_depth` waiting jobs.
+pub fn state_with_depth(max_depth: usize) -> Arc<AppState> {
     let dir = std::env::temp_dir().join(format!(
         "stemd-state-test-{}-{}",
         std::process::id(),
@@ -111,7 +116,7 @@ pub fn state() -> Arc<AppState> {
         Ok(Box::new(stemd_core::toy::Toy::new(4410, 0.25)) as Box<dyn stemd_core::Separate>)
     });
     let queue = Arc::new(
-        crate::queue::Queue::start(build, 8, Arc::clone(&cache))
+        crate::queue::Queue::start(build, max_depth, Arc::clone(&cache))
             .expect("the toy builds")
             .0,
     );
@@ -158,7 +163,7 @@ pub async fn call(app: &Router, method: Method, uri: &str, body: Vec<u8>) -> Ans
     let request = axum::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();

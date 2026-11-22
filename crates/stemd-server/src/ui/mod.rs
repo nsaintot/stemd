@@ -38,10 +38,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::api::AppState;
 use crate::drops::{AUDIO_EXTENSIONS, Dropped, State, looks_like_audio};
 use crate::launch::Launch;
 use crate::models::Preset;
+use crate::state::AppState;
 use crate::switch::SwitchState;
 
 use theme::{Brushes, Glass, Palette};
@@ -339,6 +339,52 @@ const fn pace(preset: Option<Preset>) -> (f32, f32) {
     }
 }
 
+/// The window's side padding with `top` and `bottom`.
+const fn margin(top: i8, bottom: i8) -> egui::Margin {
+    egui::Margin {
+        left: PAD,
+        right: PAD,
+        top,
+        bottom,
+    }
+}
+
+/// What the zone shows of the frame's switch, preset and running job.
+struct ZoneFrame<'a> {
+    shown: Option<Preset>,
+    switch_state: &'a SwitchState,
+    running: bool,
+    left: Option<&'a str>,
+    reveal: Option<f32>,
+}
+
+/// The switch the zone shows in place of the invitation to drop. `running`: a job is in flight.
+fn zone_switch(switch_state: &SwitchState, running: bool) -> Option<dropzone::Switch<'_>> {
+    match switch_state {
+        SwitchState::Downloading {
+            preset,
+            file,
+            done,
+            total,
+        } => Some(dropzone::Switch::Downloading {
+            preset: *preset,
+            file,
+            done: *done,
+            total: *total,
+        }),
+        SwitchState::Verifying(preset) => Some(dropzone::Switch::Verifying(*preset)),
+        SwitchState::Loading(preset) => Some(dropzone::Switch::Loading {
+            preset: *preset,
+            waiting: running,
+        }),
+        SwitchState::Failed { preset, message } => Some(dropzone::Switch::Failed {
+            preset: *preset,
+            message,
+        }),
+        SwitchState::Idle => None,
+    }
+}
+
 const fn fx_for(preset: Preset) -> globe::Fx {
     match preset {
         Preset::Fast => globe::Fx::Fast,
@@ -370,50 +416,10 @@ impl Window {
         // now rather than a frame later, and the answer can end the process.
         quit::guard(&mut self.quit, &self.state, &ctx, &palette, brushes);
 
-        let shown = header::shown_preset(&self.state.switcher);
-        if shown != self.shown {
-            // A switch landed, after its download and check. A failed one falls
-            // back to the old model, which is not a landing.
-            let failed = matches!(self.state.switcher.state(), SwitchState::Failed { .. });
-            if let (Some(_), Some(preset), false) = (self.shown, shown, failed) {
-                let fx = fx_for(preset);
-                self.motion.fire(fx, now);
-                self.note = Some((preset.detail().to_owned(), now + f64::from(fx.duration())));
-            }
-            self.shown = shown;
-        }
+        let shown = self.follow_preset(now);
         let switch_state = self.state.switcher.state();
         let running = self.state.queue.running();
-        let serving_session = self.clients.1.sessions.iter().any(|s| s.runnable);
-        theme::set_processing(&ctx, running.is_some() || serving_session);
-        let working = self.current.as_ref().is_some_and(|d| d.is_running());
-        let switching = match &switch_state {
-            SwitchState::Downloading { .. } | SwitchState::Verifying(_) => true,
-            SwitchState::Loading(_) => running.is_none(),
-            SwitchState::Idle | SwitchState::Failed { .. } => false,
-        };
-        let variant = running
-            .as_deref()
-            .map(globe::variant_of)
-            .or((working || switching).then_some(0));
-        let (speed, period) = pace(shown);
-        let drive = globe::Drive {
-            variant,
-            speed,
-            spin: variant.is_some().then_some(period),
-        };
-        if self.motion.step(dt, now, &drive) {
-            theme::request_frame(&ctx);
-        } else {
-            ctx.request_repaint_after(REPAINT_INTERVAL);
-        }
-
-        let margin = |top: i8, bottom: i8| egui::Margin {
-            left: PAD,
-            right: PAD,
-            top,
-            bottom,
-        };
+        self.drive_globe(&ctx, dt, now, shown, &switch_state, running.as_deref());
 
         egui::Panel::top("header")
             .frame(egui::Frame::NONE.inner_margin(margin(TOP, 0)))
@@ -427,64 +433,11 @@ impl Window {
                 self.fit_width(&ctx, needed + 2.0 * f32::from(PAD));
             });
 
-        egui::Panel::bottom("status")
-            .frame(egui::Frame::NONE.inner_margin(margin(0, PAD)))
-            .show_separator_line(false)
-            .resizable(false)
-            .show(ui, |ui| {
-                if let Some(t) = reveal {
-                    ui.multiply_opacity(t);
-                }
-                let settings_open = self.settings.is_open();
-                match status::bar(ui, &self.state, &palette, settings_open, self.show_logs) {
-                    Some(status::Action::Toggle(status::Pane::Settings)) => {
-                        self.settings.toggle(&self.state);
-                    }
-                    Some(status::Action::Toggle(status::Pane::Logs)) => {
-                        self.show_logs = !self.show_logs;
-                    }
-                    Some(status::Action::ToggleServer) => {
-                        let on = !self.state.serving.is_on();
-                        self.state.serving.set(on, &self.state.queue.info().model);
-                        self.state.settings.set_serving(on);
-                        // Clients get 503 from now on, so nobody could collect
-                        // or cancel these.
-                        if !on {
-                            let cancelled = self.state.queue.cancel_api_jobs();
-                            if cancelled > 0 {
-                                tracing::info!("cancelled {cancelled} API job(s)");
-                                let noun = if cancelled == 1 { "job" } else { "jobs" };
-                                let until = ui.input(|i| i.time) + 4.0;
-                                self.note =
-                                    Some((format!("Stopped {cancelled} client {noun}"), until));
-                            }
-                        }
-                    }
-                    None => {}
-                }
-            });
+        self.status_panel(ui, &palette, reveal);
 
         // The drop zone keeps a fixed height and the sections take the rest,
         // so the ratio between them holds whatever the list holds.
-        let working_on = self
-            .current
-            .as_ref()
-            .and_then(|current| match current.state() {
-                State::Working(progress) => Some((Arc::as_ptr(current) as usize as u64, progress)),
-                _ => None,
-            });
-        let drop_left = match working_on {
-            Some((key, progress)) => {
-                let segment_secs = self.state.queue.segment_run_seconds();
-                self.drop_eta.update(key, now, &progress, segment_secs)
-            }
-            // A later drop can reuse the address that keys this one.
-            None => {
-                self.drop_eta = eta::Eta::default();
-                None
-            }
-        };
-        let drop_left = drop_left.map(eta::left_text);
+        let drop_left = self.drop_left(now);
         let clients = activity::height(&self.clients.1);
         let height = ctx
             .input(|i| i.viewport().inner_rect.map(|r| r.height()))
@@ -505,68 +458,19 @@ impl Window {
             .show_separator_line(false)
             .resizable(false)
             .show(ui, |ui| {
-                let armed = !ui.ctx().input(|i| i.raw.hovered_files.is_empty());
-                let note = self
-                    .note
-                    .as_ref()
-                    .filter(|(_, until)| now < *until)
-                    .map(|(text, _)| text.as_str());
-                let switch = match &switch_state {
-                    SwitchState::Downloading {
-                        preset,
-                        file,
-                        done,
-                        total,
-                    } => Some(dropzone::Switch::Downloading {
-                        preset: *preset,
-                        file,
-                        done: *done,
-                        total: *total,
-                    }),
-                    SwitchState::Verifying(preset) => Some(dropzone::Switch::Verifying(*preset)),
-                    SwitchState::Loading(preset) => Some(dropzone::Switch::Loading {
-                        preset: *preset,
-                        waiting: running.is_some(),
-                    }),
-                    SwitchState::Failed { preset, message } => Some(dropzone::Switch::Failed {
-                        preset: *preset,
-                        message,
-                    }),
-                    SwitchState::Idle => None,
-                };
-                let action = dropzone::Zone {
-                    palette: &palette,
+                self.zone(
+                    ui,
+                    &palette,
                     brushes,
-                    motion: &self.motion,
-                    armed,
-                    current: self.current.as_deref(),
-                    parts: self.state.settings.get().drop_parts,
-                    batch: dropzone::Batch {
-                        finished: self.batch.iter().map(|d| !d.is_running()).collect(),
-                        shown: self.current.as_ref().and_then(|current| {
-                            self.batch.iter().position(|d| Arc::ptr_eq(d, current))
-                        }),
+                    now,
+                    ZoneFrame {
+                        shown,
+                        switch_state: &switch_state,
+                        running: running.is_some(),
+                        left: drop_left.as_deref(),
+                        reveal,
                     },
-                    note,
-                    left: drop_left.as_deref(),
-                    maxed: shown == Some(Preset::Quality),
-                    switch,
-                    intro: self
-                        .intro
-                        .as_ref()
-                        .zip(reveal)
-                        .map(|(intro, t)| dropzone::Intro {
-                            from: intro.from,
-                            spread: intro.spread,
-                            t,
-                        }),
-                }
-                .show(ui);
-                match action {
-                    Some(dropzone::Action::ChooseFile) => self.pick_a_file(),
-                    Some(dropzone::Action::KeepModel) => self.state.switcher.dismiss_error(),
-                    None => {}
-                }
+                );
             });
 
         let logs_height = egui::CentralPanel::default()
@@ -589,6 +493,170 @@ impl Window {
             if let Some(target) = self.fit.start(height, wanted, lacking) {
                 set_height(&ctx, target);
             }
+        }
+    }
+
+    /// Fire the globe's effect and the note when a preset switch lands; the preset the header shows.
+    fn follow_preset(&mut self, now: f64) -> Option<Preset> {
+        let shown = header::shown_preset(&self.state.switcher);
+        if shown != self.shown {
+            // A switch landed, after its download and check. A failed one falls
+            // back to the old model, which is not a landing.
+            let failed = matches!(self.state.switcher.state(), SwitchState::Failed { .. });
+            if let (Some(_), Some(preset), false) = (self.shown, shown, failed) {
+                let fx = fx_for(preset);
+                self.motion.fire(fx, now);
+                self.note = Some((preset.detail().to_owned(), now + f64::from(fx.duration())));
+            }
+            self.shown = shown;
+        }
+        shown
+    }
+
+    /// Step the globe by what is running and schedule the next frame.
+    fn drive_globe(
+        &mut self,
+        ctx: &egui::Context,
+        dt: f32,
+        now: f64,
+        shown: Option<Preset>,
+        switch_state: &SwitchState,
+        running: Option<&str>,
+    ) {
+        let serving_session = self.clients.1.sessions.iter().any(|s| s.runnable);
+        theme::set_processing(ctx, running.is_some() || serving_session);
+        let working = self.current.as_ref().is_some_and(|d| d.is_running());
+        let switching = match switch_state {
+            SwitchState::Downloading { .. } | SwitchState::Verifying(_) => true,
+            SwitchState::Loading(_) => running.is_none(),
+            SwitchState::Idle | SwitchState::Failed { .. } => false,
+        };
+        let variant = running
+            .map(globe::variant_of)
+            .or((working || switching).then_some(0));
+        let (speed, period) = pace(shown);
+        let drive = globe::Drive {
+            variant,
+            speed,
+            spin: variant.is_some().then_some(period),
+        };
+        if self.motion.step(dt, now, &drive) {
+            theme::request_frame(ctx);
+        } else {
+            ctx.request_repaint_after(REPAINT_INTERVAL);
+        }
+    }
+
+    /// The status bar along the bottom, and what its buttons do.
+    fn status_panel(&mut self, ui: &mut egui::Ui, palette: &Palette, reveal: Option<f32>) {
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::NONE.inner_margin(margin(0, PAD)))
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                if let Some(t) = reveal {
+                    ui.multiply_opacity(t);
+                }
+                let settings_open = self.settings.is_open();
+                match status::bar(ui, &self.state, palette, settings_open, self.show_logs) {
+                    Some(status::Action::Toggle(status::Pane::Settings)) => {
+                        self.settings.toggle(&self.state);
+                    }
+                    Some(status::Action::Toggle(status::Pane::Logs)) => {
+                        self.show_logs = !self.show_logs;
+                    }
+                    Some(status::Action::ToggleServer) => {
+                        let cancelled = self.state.set_serving(!self.state.serving.is_on());
+                        if cancelled > 0 {
+                            let noun = if cancelled == 1 { "job" } else { "jobs" };
+                            let until = ui.input(|i| i.time) + 4.0;
+                            self.note = Some((format!("Stopped {cancelled} client {noun}"), until));
+                        }
+                    }
+                    None => {}
+                }
+            });
+    }
+
+    /// Time left on the drop the zone shows, as text.
+    fn drop_left(&mut self, now: f64) -> Option<String> {
+        let working_on = self
+            .current
+            .as_ref()
+            .and_then(|current| match current.state() {
+                State::Working(progress) => Some((Arc::as_ptr(current) as usize as u64, progress)),
+                _ => None,
+            });
+        let drop_left = match working_on {
+            Some((key, progress)) => {
+                let segment_secs = self.state.queue.segment_run_seconds();
+                self.drop_eta.update(key, now, &progress, segment_secs)
+            }
+            // A later drop can reuse the address that keys this one.
+            None => {
+                self.drop_eta = eta::Eta::default();
+                None
+            }
+        };
+        drop_left.map(eta::left_text)
+    }
+
+    /// The drop zone, and what its buttons do.
+    fn zone(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        brushes: &Brushes,
+        now: f64,
+        frame: ZoneFrame<'_>,
+    ) {
+        let ZoneFrame {
+            shown,
+            switch_state,
+            running,
+            left: drop_left,
+            reveal,
+        } = frame;
+        let armed = !ui.ctx().input(|i| i.raw.hovered_files.is_empty());
+        let note = self
+            .note
+            .as_ref()
+            .filter(|(_, until)| now < *until)
+            .map(|(text, _)| text.as_str());
+        let switch = zone_switch(switch_state, running);
+        let action = dropzone::Zone {
+            palette,
+            brushes,
+            motion: &self.motion,
+            armed,
+            current: self.current.as_deref(),
+            parts: self.state.settings.get().drop_parts,
+            batch: dropzone::Batch {
+                finished: self.batch.iter().map(|d| !d.is_running()).collect(),
+                shown: self
+                    .current
+                    .as_ref()
+                    .and_then(|current| self.batch.iter().position(|d| Arc::ptr_eq(d, current))),
+            },
+            note,
+            left: drop_left,
+            maxed: shown == Some(Preset::Quality),
+            switch,
+            intro: self
+                .intro
+                .as_ref()
+                .zip(reveal)
+                .map(|(intro, t)| dropzone::Intro {
+                    from: intro.from,
+                    spread: intro.spread,
+                    t,
+                }),
+        }
+        .show(ui);
+        match action {
+            Some(dropzone::Action::ChooseFile) => self.pick_a_file(),
+            Some(dropzone::Action::KeepModel) => self.state.switcher.dismiss_error(),
+            None => {}
         }
     }
 

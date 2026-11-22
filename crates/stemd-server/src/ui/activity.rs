@@ -11,14 +11,14 @@ use std::time::Duration;
 use eframe::egui::{self, Rect, Sense, Stroke, pos2, vec2};
 use stemd_core::Progress;
 
-use crate::api::AppState;
 use crate::sessions::{Activity, Ended};
+use crate::state::AppState;
 
 use super::eta::{Eta, left_text};
 use super::icons;
 use super::recents::ROW_HEIGHT;
 use super::status::percent;
-use super::theme::{self, Brushes, Glass, Palette, Weight, white};
+use super::theme::{self, Brushes, Palette, Weight, white};
 
 const RADIUS: f32 = 16.0;
 
@@ -232,38 +232,16 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, snapshot: &
         .collect();
 
     let height = ROW_HEIGHT * (rows.len() as f32).min(MAX_VISIBLE);
-    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    brushes.glass(ui.painter(), panel, RADIUS, Glass::List);
-    let mut inside = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(panel)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    inside.set_clip_rect(panel.intersect(ui.clip_rect()));
-    inside.spacing_mut().item_spacing = vec2(0.0, 0.0);
-    inside.spacing_mut().scroll = egui::style::ScrollStyle {
-        bar_width: 6.0,
-        ..egui::style::ScrollStyle::floating()
-    };
     let now = ui.input(|i| i.time) as f32;
     if snapshot.jobs.iter().any(|j| !queued(j)) || snapshot.sessions.iter().any(|s| s.runnable) {
         // Spinners turn every frame.
         theme::request_frame(ui.ctx());
     }
-    egui::ScrollArea::vertical()
-        .id_salt("clients")
-        .max_height(height)
-        .auto_shrink([false, true])
-        .show(&mut inside, |ui| {
-            let mark = super::widgets::paint_mark(ui);
-            for (n, item) in rows.iter().enumerate() {
-                row(ui, palette, brushes, item, n == 0, now);
-            }
-            if ui.cursor().top() > panel.bottom() + 0.5 {
-                let zone = super::widgets::fade_zone(panel, ROW_HEIGHT);
-                super::widgets::fade_out(ui.painter(), mark, zone);
-            }
-        });
+    super::widgets::glass_list(ui, brushes, (height, RADIUS, ROW_HEIGHT), "clients", |ui| {
+        for (n, item) in rows.iter().enumerate() {
+            row(ui, palette, brushes, item, n == 0, now);
+        }
+    });
 }
 
 fn row(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, item: &Row, first: bool, now: f32) {

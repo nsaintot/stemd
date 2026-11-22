@@ -9,9 +9,9 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, pos2, vec2};
 use stemd_core::{OutputRate, PART_NAMES, StemFormat};
 
-use crate::api::AppState;
 use crate::models::Preset;
 use crate::settings::{DropParts, SettingsFile};
+use crate::state::AppState;
 use crate::switch::{SwitchState, Switcher};
 
 use super::icons;

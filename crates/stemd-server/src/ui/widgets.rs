@@ -4,7 +4,7 @@ use eframe::egui::{self, Rect, Sense, Stroke, pos2, vec2};
 
 use super::blur::{self, Frosted};
 use super::icons;
-use super::theme::{self, Brushes, Palette, Weight, white};
+use super::theme::{self, Brushes, Glass, Palette, Weight, white};
 
 /// Seconds a hover wash takes to come and go.
 pub const HOVER_SECS: f32 = 0.15;
@@ -19,6 +19,41 @@ pub fn fade(ui: &egui::Ui, id: egui::Id, on: bool) -> f32 {
 }
 
 /// The bottom of a list panel where its cut row fades out.
+/// A scrolling glass list `height` tall; `add_rows` draws the rows, and the last one fades when more lie below.
+pub fn glass_list(
+    ui: &mut egui::Ui,
+    brushes: &Brushes,
+    (height, radius, row_height): (f32, f32, f32),
+    salt: &str,
+    add_rows: impl FnOnce(&mut egui::Ui),
+) {
+    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    brushes.glass(ui.painter(), panel, radius, Glass::List);
+    let mut inside = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(panel)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    inside.set_clip_rect(panel.intersect(ui.clip_rect()));
+    inside.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    inside.spacing_mut().scroll = egui::style::ScrollStyle {
+        bar_width: 6.0,
+        ..egui::style::ScrollStyle::floating()
+    };
+    egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .max_height(height)
+        .auto_shrink([false, true])
+        .show(&mut inside, |ui| {
+            let mark = paint_mark(ui);
+            add_rows(ui);
+            if ui.cursor().top() > panel.bottom() + 0.5 {
+                let zone = fade_zone(panel, row_height);
+                fade_out(ui.painter(), mark, zone);
+            }
+        });
+}
+
 pub fn fade_zone(panel: Rect, row_height: f32) -> Rect {
     let part = (panel.height() / row_height).fract();
     let cut = if part < 0.05 { 0.5 } else { part };

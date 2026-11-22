@@ -20,7 +20,7 @@ use crate::pcm::Audio;
 use crate::stems::{Parts, Stems, all_parts};
 
 /// The model's output order.
-pub const STEMS: [&str; 4] = ["bass", "drums", "other", "vocals"];
+pub(crate) const STEMS: [&str; 4] = ["bass", "drums", "other", "vocals"];
 
 /// Index of `name` in [`STEMS`].
 fn index(name: &str) -> i32 {

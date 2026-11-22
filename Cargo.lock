@@ -3418,6 +3418,7 @@ name = "stemd-audio"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "flacenc",
  "symphonia",
 ]
 
@@ -3449,6 +3450,7 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
+ "stemd-audio",
  "stemd-mlx",
  "symphonia",
  "thiserror 2.0.20",

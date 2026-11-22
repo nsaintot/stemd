@@ -413,7 +413,8 @@ fn deinterleave(raw: &[u8], f32_format: bool, gain: f32) -> Planar {
         }
     } else {
         for (i, chunk) in raw.chunks_exact(2).enumerate() {
-            let v = f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32767.0;
+            let v = f32::from(i16::from_le_bytes([chunk[0], chunk[1]]))
+                / stemd_audio::wire::FLOAT_TO_S16;
             out[i % 2].push(v * inv);
         }
     }
@@ -476,5 +477,51 @@ mod tests {
     fn an_explicit_output_directory_wins() {
         let args = Args::parse_from(["stemd-cli", "in.wav", "--out", "/tmp/here"]);
         assert_eq!(args.out_dir(), PathBuf::from("/tmp/here"));
+    }
+
+    /// A job result at `rate` with two f32 stems at gain 0.5 and `drums` left to rebuild.
+    fn two_stems(rate: u32) -> JobResult {
+        serde_json::from_str(&format!(
+            r#"{{"output": {{"format": "f32le", "sample_rate": {rate}, "derived": "drums"}},
+                "stems": [{{"name": "vocals", "url": "/s/vocals", "gain": 0.5}},
+                          {{"name": "harmonics", "url": "/s/harmonics", "gain": 0.5}}],
+                "model_residual_db": -30.0, "separation_secs": 1.0, "realtime_factor": 1.0}}"#
+        ))
+        .expect("a job result")
+    }
+
+    /// Two stereo frames of `v` at gain 0.5, interleaved f32.
+    fn wire(v: f32) -> Vec<u8> {
+        std::iter::repeat_n(v * 0.5, 4)
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    }
+
+    #[test]
+    fn assembling_downloads_each_stem_and_rebuilds_the_derived_part() {
+        let server = client::fake::serve(|_, path| match path {
+            "/s/vocals" => (200, wire(0.25)),
+            _ => (200, wire(0.125)),
+        });
+        let mix = Decoded {
+            data: vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            sample_rate: 44_100,
+        };
+        let parts = assemble(&server, &mix, &two_stems(44_100), true).expect("assembled");
+        let names: Vec<_> = parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["vocals", "harmonics", "drums"]);
+        assert!((parts[0].samples[0][0] - 0.25).abs() < 1e-6);
+        assert!(
+            (parts[2].samples[1][1] - 0.625).abs() < 1e-6,
+            "{:?}",
+            parts[2].samples
+        );
+
+        let elsewhere = assemble(&server, &mix, &two_stems(48_000), true).expect("assembled");
+        assert_eq!(
+            elsewhere.len(),
+            2,
+            "a derived part at another rate is left out"
+        );
     }
 }

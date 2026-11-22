@@ -9,44 +9,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Request, State};
 
-use crate::api::{self, AppState};
+use crate::api::{self};
 use crate::cli::Args;
 use crate::endpoint::{Endpoint, Moves};
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::settings::SettingsFile;
-
-/// Take the port before [`crate::startup::prepare`] loads the model, so a port
-/// in use fails in milliseconds.
-///
-/// Non-blocking because tokio requires it of a listener adopted from std, and
-/// doing it here means [`listen`] cannot forget to.
-pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
-    let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
-    listener
-        .set_nonblocking(true)
-        .context("putting the listener in non-blocking mode")?;
-    Ok(listener)
-}
-
-/// Bind `port` on every interface, else 8420, else any free port; return `port` after a fallback.
-pub fn bind_saved(port: u16) -> Result<(std::net::TcpListener, Option<u16>)> {
-    let any = |port: u16| SocketAddr::from(([0, 0, 0, 0], port));
-    let err = match bind(any(port)) {
-        Ok(listener) => return Ok((listener, None)),
-        Err(err) => err,
-    };
-    let fallback = crate::settings::DEFAULT_PORT;
-    let listener = match (port != fallback).then(|| bind(any(fallback))) {
-        Some(Ok(listener)) => listener,
-        _ => bind(any(0))?,
-    };
-    tracing::warn!(
-        "{err:#}; serving on port {} instead",
-        listener.local_addr()?.port()
-    );
-    Ok((listener, Some(port)))
-}
+use crate::state::AppState;
 
 /// Prepare the server, then serve until a signal arrives.
 pub fn headless(
@@ -137,7 +106,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 /// Serve on a listener that is already bound, then on each one `moves` hands
-/// over. The first binding is [`bind`]'s, done before the model was loaded.
+/// over. The first binding is [`crate::endpoint::bind`]'s, done before the model was loaded.
 async fn listen(
     state: Arc<AppState>,
     listener: std::net::TcpListener,
@@ -294,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_serves_on_the_new_port_and_closes_the_old_one() {
         let app = axum::Router::new().route("/", axum::routing::get(|| async { "here" }));
-        let first = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let first = crate::endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let old = first.local_addr().unwrap();
         let (endpoint, moves) = Endpoint::new(old, None);
         tokio::spawn(serve_moving(app, first, moves));

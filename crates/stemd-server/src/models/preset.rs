@@ -9,6 +9,8 @@
 //! `stemd_mlx` and every layer checks the shape of the tensor it pulls, so a file
 //! that is not this architecture fails at load naming the tensor that disagreed.
 
+use stemd_core::Family;
+
 /// One file of a model artefact, pinned by digest.
 pub struct RemoteFile {
     pub name: &'static str,
@@ -22,19 +24,16 @@ pub struct RemoteFile {
 pub struct ModelSource {
     pub files: &'static [RemoteFile],
 }
-use stemd_core::Family;
 
 /// What the window offers, and what each choice costs.
 ///
 /// Named for the trade rather than the checkpoint. See docs/evaluation.md for the
 /// measurements.
 ///
-/// Fast and Balanced are demucs v4. The v3 preset was retired because a
-/// bidirectional LSTM is the one demucs architecture MLX runs badly.
+/// Fast and Balanced are demucs v4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
-    /// `htdemucs` (demucs v4). The cheap end, and the model that won a listening
-    /// test on real material despite scoring lowest of the old three on MUSDB.
+    /// `htdemucs` (demucs v4), the cheapest preset.
     Fast,
     /// `htdemucs_ft`: four checkpoints, each fine-tuned for one source, in a single
     /// artefact, of which two are run.
@@ -71,7 +70,6 @@ impl Preset {
     /// Artefact name, i.e. what `--demucs-model` takes, what identifies the
     /// preset in the settings file, and what the weights file is called
     /// without its extension.
-    ///
     pub const fn artefact(self) -> &'static str {
         match self {
             Self::Fast => "htdemucs",
@@ -88,15 +86,6 @@ impl Preset {
         }
     }
 
-    /// How the preset uses its weights, bumped when that changes.
-    ///
-    /// The weights identify themselves by digest, which is enough while a
-    /// preset is only ever "run this file". It stopped being enough when
-    /// `Balanced` went from running all four of its models and shipping
-    /// `bass + other` to running two and shipping the remainder: different
-    /// audio out of the same bytes in. Cached stems are keyed on the model's
-    /// identity, so without this they would survive a change that invalidates
-    /// them.
     /// The architectures this preset runs, in the order it runs them.
     ///
     /// Not a detail of the weights: which family a half is decides what
@@ -110,13 +99,12 @@ impl Preset {
         }
     }
 
+    /// How the preset uses its weights, part of the cache key. Bumped when that changes,
+    /// since the weights digest alone does not change with it.
     pub const fn recipe(self) -> u32 {
         match self {
             Self::Fast => 1,
-            // 1 was all four models with harmonics as `bass + other`.
             Self::Balanced => 2,
-            // 1 and 2 were BS PolarFormer + htdemucs_ft, unchained then chained.
-            // 3 is one 4-stem model.
             Self::Quality => 3,
         }
     }
@@ -167,13 +155,8 @@ const FORMER: [(&str, Preset); 1] = [("bs_polarformer", Preset::Quality)];
 /// Retired artefacts, still named so a settings file that mentions one can say
 /// what happened rather than falling back in silence.
 ///
-/// Three are TorchScript and none of them loads: there is no TorchScript runtime
-/// left to load them with.
-///
-/// `bs_roformer_viperx` is retired for a different reason, and the distinction is
-/// worth keeping: nothing is wrong with it, it stopped being the best answer. It
-/// no longer loads either, because a lone vocals model is not a separator, and
-/// only a preset can say which drums half to pair it with.
+/// Three are TorchScript, which nothing loads. `bs_roformer_viperx` is a lone vocals
+/// model, which is not a separator on its own.
 pub const RETIRED: [&str; 4] = [
     "hdemucs_mmi_mps",
     "htdemucs_mps",

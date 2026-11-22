@@ -1,22 +1,16 @@
 //! Asking before quitting mid-separation.
 //!
-//! The process already ends correctly under a close: [`crate::shutdown::now`]
-//! takes the worker out of the model, gives it ten seconds, then withdraws the
-//! mDNS advertisement and leaves. What was missing is being asked: a quality
-//! separation is four minutes, and closing the window a minute in threw that
-//! minute away silently.
+//! [`crate::shutdown::now`] ends the process correctly on a close; this asks first, since a
+//! quality separation takes minutes.
 //!
-//! **This covers closing the window, not `Cmd-Q`.** The close button raises a
-//! request egui can veto, while `Cmd-Q` is `[NSApp terminate:]`, which calls
-//! `exit()` as soon as the delegate returns, so there is no point in that path
-//! where a window can say "wait". `Cmd-Q` mid-separation is still safe and still
-//! cancels the job; it just does not ask.
+//! It covers closing the window only. `Cmd-Q` is `[NSApp terminate:]`, which calls `exit()`
+//! as soon as the delegate returns, so it cancels the job without asking.
 
 use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::api::AppState;
+use crate::state::AppState;
 use crate::ui::theme::{self, Brushes, Palette, Weight};
 use crate::ui::widgets::{self, Pill};
 

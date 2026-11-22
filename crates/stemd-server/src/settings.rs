@@ -265,30 +265,43 @@ impl Stored {
         if let Some(serving) = self.serving {
             settings.serving = serving;
         }
-        match self.cache_max_gb {
-            Some(gb) if gb.is_finite() && gb > 0.0 => settings.cache_max_gb = gb,
-            Some(gb) => warn_ignored("cache_max_gb", &gb.to_string(), "8"),
-            None => {}
-        }
-        match self.whole_max_days {
-            Some(days) if days.is_finite() && days >= 0.0 => settings.whole_max_days = days,
-            Some(days) => warn_ignored("whole_max_days", &days.to_string(), "30"),
-            None => {}
-        }
-        match self.port {
-            Some(port) if port > 0 => settings.port = port,
-            Some(port) => warn_ignored("port", &port.to_string(), "8420"),
-            None => {}
-        }
-        match self.max_track_minutes {
-            Some(minutes) if minutes.is_finite() && minutes >= 0.0 => {
-                settings.max_track_minutes = minutes;
-            }
-            Some(minutes) => warn_ignored("max_track_minutes", &minutes.to_string(), "10"),
-            None => {}
-        }
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        let at_least_zero = |v: f64| v.is_finite() && v >= 0.0;
+        take(
+            "cache_max_gb",
+            self.cache_max_gb,
+            positive,
+            &mut settings.cache_max_gb,
+        );
+        take(
+            "whole_max_days",
+            self.whole_max_days,
+            at_least_zero,
+            &mut settings.whole_max_days,
+        );
+        take("port", self.port, |port| port > 0, &mut settings.port);
+        take(
+            "max_track_minutes",
+            self.max_track_minutes,
+            at_least_zero,
+            &mut settings.max_track_minutes,
+        );
         settings.reconcile();
         settings
+    }
+}
+
+/// Store `found` in `slot` when `valid`, else keep the default and say so.
+fn take<T: Copy + std::fmt::Display>(
+    field: &str,
+    found: Option<T>,
+    valid: impl Fn(T) -> bool,
+    slot: &mut T,
+) {
+    match found {
+        Some(v) if valid(v) => *slot = v,
+        Some(v) => warn_ignored(field, &v.to_string(), &slot.to_string()),
+        None => {}
     }
 }
 

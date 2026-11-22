@@ -12,18 +12,8 @@ use serde::{Deserialize, Serialize};
 /// `i16::MIN` maps to exactly `-1.0` and no input can exceed the range.
 const S16_TO_FLOAT: f32 = 32768.0;
 
-/// Multiplier turning `[-1.0, 1.0]` back into an `i16`. One less than the
-/// divisor above, so `+1.0` lands on `i16::MAX` rather than wrapping.
-const FLOAT_TO_S16: f32 = 32767.0;
-
-/// Quantise one sample to 16-bit, clamping first: a separated stem is not
-/// bounded by the mix and can sit outside [-1.0, 1.0].
-///
-/// Shared with the FLAC encoder, so a client gets the same integers whichever
-/// container it asked for.
-pub(crate) fn quantise_s16(v: f32) -> i16 {
-    (v.clamp(-1.0, 1.0) * FLOAT_TO_S16).round() as i16
-}
+/// Shared with the FLAC encoder, so a client gets the same integers whichever container it asked for.
+pub(crate) use stemd_audio::wire::quantise_s16;
 
 /// Sample encoding used on the wire and for stem output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +102,8 @@ impl Audio {
     /// [`Self::checked`] instead.
     pub fn new(data: Vec<Vec<f32>>, sample_rate: u32) -> Self {
         debug_assert!(
-            data.iter().all(|c| c.len() == data.first().map_or(0, Vec::len)),
+            data.iter()
+                .all(|c| c.len() == data.first().map_or(0, Vec::len)),
             "Audio::new was handed ragged channels: {:?}",
             data.iter().map(Vec::len).collect::<Vec<_>>()
         );
@@ -148,6 +139,14 @@ impl Audio {
 
     pub fn frames(&self) -> usize {
         self.data.first().map_or(0, Vec::len)
+    }
+
+    /// Samples `from..to` of every channel.
+    pub fn excerpt(&self, from: usize, to: usize) -> Self {
+        Self::new(
+            self.data.iter().map(|c| c[from..to].to_vec()).collect(),
+            self.sample_rate,
+        )
     }
 
     pub fn duration_secs(&self) -> f64 {
@@ -235,7 +234,7 @@ impl Audio {
     /// individually bounded by the mix, and clamping each would destroy the exact-sum
     /// property. Scaling is linear, so the sum survives; the client is handed `gain`
     /// to undo.
-    pub fn to_interleaved_scaled(&self, format: PcmFormat, gain: f32) -> Vec<u8> {
+    pub(crate) fn to_interleaved_scaled(&self, format: PcmFormat, gain: f32) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(self.frames() * self.channels() * format.bytes_per_sample());
         for i in 0..self.frames() {
