@@ -1,6 +1,6 @@
 //! Files dropped on the window.
 //!
-//! A drop is the same job a `POST /v1/jobs` makes: hashed the same way, claimed in
+//! A drop is the same job a `POST /v2/jobs` makes: hashed the same way, claimed in
 //! the same store, separated by the same worker. Dropping a track a deck already
 //! asked for joins that separation, and dropping the same file twice is a cache
 //! hit. What differs is the two ends: the audio comes from a file rather than a
@@ -635,6 +635,7 @@ fn separate(
                             output,
                             model_id: state.switcher.published_identity(),
                             from_api: false,
+                            file: None,
                         })
                         .map_err(anyhow::Error::from)
                 });

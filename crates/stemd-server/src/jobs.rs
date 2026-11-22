@@ -7,12 +7,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use stemd_core::{Progress, Stage, StemFormat};
+use stemd_core::{Progress, Stage};
 
 use crate::cache::Entry;
 
@@ -20,10 +20,7 @@ use crate::cache::Entry;
 #[derive(Debug, Clone, Serialize)]
 pub struct StemFile {
     pub name: String,
-    /// Server-local path. Useful when the client shares the filesystem; remote
-    /// clients should fetch `url` instead.
-    pub path: std::path::PathBuf,
-    /// Relative endpoint that streams the same bytes.
+    /// Relative endpoint that streams the stem.
     pub url: String,
     pub bytes: u64,
     /// Scale already applied to this stem so it fits the output format.
@@ -37,17 +34,14 @@ pub struct StemFile {
 /// What a completed job hands back: the stems, and how to read them.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobResult {
-    pub sample_rate: u32,
+    pub output: crate::separations::OutputView,
     pub channels: usize,
+    /// Samples per channel, at the output rate.
     pub frames: usize,
-    pub format: StemFormat,
     pub stems: Vec<StemFile>,
     /// Level of `mix - sum(model sources)`, in dB relative to the mix.
     /// Diagnostic: what the model failed to explain about the track.
     pub model_residual_db: f64,
-    /// The part a client rebuilds as `mix` minus `stems`; `None` when the stems
-    /// cover the mix.
-    pub derived_stem: Option<&'static str>,
     /// What the separation cost when it ran, which for a cache hit was some
     /// earlier job.
     pub separation_secs: f64,
@@ -62,24 +56,33 @@ impl JobResult {
     /// The URLs are per job, so they are built here rather than stored: two
     /// decks sharing one entry each poll their own id.
     pub fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
+        let parts = entry
+            .stems
+            .iter()
+            .map(|stem| stem.name.clone())
+            .filter(|name| Some(name.as_str()) != entry.derived)
+            .collect();
         Self {
-            sample_rate: entry.sample_rate,
+            output: crate::separations::OutputView {
+                format: entry.format.to_string(),
+                sample_rate: entry.sample_rate,
+                gain: None,
+                parts,
+                derived: entry.derived,
+            },
             channels: entry.channels,
             frames: entry.frames,
-            format: entry.format,
             stems: entry
                 .stems
                 .iter()
                 .map(|stem| StemFile {
                     name: stem.name.clone(),
-                    path: stem.path.clone(),
-                    url: format!("/v1/jobs/{job_id}/stems/{}", stem.name),
+                    url: format!("/v2/jobs/{job_id}/stems/{}", stem.name),
                     bytes: stem.bytes,
                     gain: stem.gain,
                 })
                 .collect(),
             model_residual_db: entry.model_residual_db,
-            derived_stem: entry.derived,
             separation_secs: entry.separation_secs,
             realtime_factor: entry.realtime_factor(),
             cached,
@@ -111,6 +114,8 @@ pub struct Job {
     /// One per deck waiting on this job. See [`Job::release`].
     waiters: Mutex<usize>,
     pub created: Instant,
+    /// Set once a protocol 1 client created or joined the job.
+    protocol_1: AtomicBool,
 }
 
 impl Job {
@@ -121,6 +126,16 @@ impl Job {
             result: self.result.lock().clone(),
             error: self.error.lock().clone(),
         }
+    }
+
+    /// Record that a protocol 1 client waits on this job.
+    pub fn mark_protocol_1(&self) {
+        self.protocol_1.store(true, Ordering::Relaxed);
+    }
+
+    /// True once a protocol 1 client created or joined the job.
+    pub fn protocol_1(&self) -> bool {
+        self.protocol_1.load(Ordering::Relaxed)
     }
 
     /// Register another client waiting on this job.
@@ -250,6 +265,7 @@ impl JobStore {
             entry: Mutex::new(None),
             waiters: Mutex::new(1),
             created: Instant::now(),
+            protocol_1: AtomicBool::new(false),
         });
         jobs.insert(&job);
         Ok(job)
@@ -317,6 +333,26 @@ mod tests {
     use crate::cache::Ingredients;
     use crate::testkit::{cache, publish};
     use stemd_core::PcmFormat;
+
+    #[test]
+    fn a_result_names_its_output_and_no_server_path() {
+        let cache = cache(1 << 30, Duration::from_secs(60));
+        let entry = publish(&cache, "result-shape", 100, 1.0);
+        let result = JobResult::from_entry(&entry, "abc-1", false);
+        let json = serde_json::to_value(&result).expect("serialises");
+        assert_eq!(
+            json["output"],
+            serde_json::json!({
+                "format": "pcm16",
+                "sample_rate": 44100,
+                "parts": ["harmonics", "vocals"],
+                "derived": "drums"
+            })
+        );
+        assert_eq!(json["stems"][0]["url"], "/v2/jobs/abc-1/stems/harmonics");
+        assert!(json["stems"][0].get("path").is_none());
+        assert!(json.get("sample_rate").is_none());
+    }
 
     /// The budget is one byte so the store counts as full and its uncollected
     /// entry is collectable. What is under test is the handle following the
@@ -606,7 +642,7 @@ mod tests {
             sample_rate: 44100,
             channels: 2,
             in_format: PcmFormat::S16le,
-            out_format: StemFormat::Pcm32,
+            out_format: stemd_core::StemFormat::Pcm32,
             out_rate: stemd_core::OutputRate::default(),
             include_derived: false,
             parts: stemd_core::Parts::DEFAULT,

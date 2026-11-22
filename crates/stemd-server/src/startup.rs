@@ -74,7 +74,9 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
         std::time::Duration::from_secs(args.session_idle_secs),
         args.max_sessions,
     );
-    queue.sessions().set_pieces(open_pieces(args)?);
+    let pieces = open_pieces(args)?;
+    pieces.set_gate(queue.consolidation_gate());
+    queue.sessions().set_pieces(pieces);
     spawn_session_reaper(Arc::clone(&queue));
     let max_upload = max_body_bytes(args.max_track_secs(), highest_rate(), info.channels);
     log_model(&info, precisions, args.max_track_secs(), max_upload);

@@ -1,9 +1,7 @@
 //! The log section.
 //!
-//! A thin client over the same [`LogBuffer`](crate::logbuf::LogBuffer) that
-//! `GET /v1/logs` serves, so the window is a second view, never a second logging
-//! path. Collapsed by default: it is where you go when something looks wrong,
-//! not what the window is for.
+//! The lines of the [`LogBuffer`](crate::logbuf::LogBuffer) that `GET /v2/logs`
+//! serves. Collapsed by default.
 
 use eframe::egui::{self, Color32, Sense, Stroke, pos2, vec2};
 

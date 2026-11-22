@@ -561,8 +561,8 @@ fn the_clients_list_fits_the_narrowest_window() {
         ready: 12,
         arrived: 441_000 * 22,
         covered: 441_000 * 9,
-        critical: 6,
-        bonus: 30,
+        high: 6,
+        normal: 30,
         runnable,
     };
     let snapshot = super::activity::Snapshot {
@@ -571,11 +571,13 @@ fn the_clients_list_fits_the_narrowest_window() {
                 number: 1,
                 progress: stemd_core::Progress::counted(stemd_core::Stage::Separating, 3, 8),
                 left: Some(37.0),
+                protocol_1: false,
             },
             super::activity::JobRow {
                 number: 2,
                 progress: stemd_core::Progress::new(stemd_core::Stage::Queued),
                 left: None,
+                protocol_1: true,
             },
         ],
         sessions: vec![session(1, true), session(2, false)],

@@ -7,9 +7,9 @@
 //! Between segments the worker takes session work, in this order:
 //!
 //! 1. a staged model, when no job is mid-track;
-//! 2. a critical session segment, also between two segments of a running job;
+//! 2. a high-priority session segment, also between two segments of a running job;
 //! 3. the next waiting job;
-//! 4. a bonus session segment.
+//! 4. a normal-priority session segment.
 //!
 //! The worker builds every separator it runs. See [`BuildSeparator`].
 
@@ -30,8 +30,10 @@ use crate::cache::Output;
 
 use crate::cache::Cache;
 use crate::jobs::Job;
-use crate::pieces::{Pieces, type_dir};
-use crate::sessions::{Priority, Sessions, Track, excerpt, gain, output_index, track_id};
+use crate::pieces::{Consolidation, Pieces, TrackInfo, stems_of, type_dir};
+use crate::sessions::{
+    Class, Session, Sessions, Track, View, excerpt, gain, output_index, track_id,
+};
 
 /// How a separator reaches the worker: as a recipe, never as a finished model.
 ///
@@ -52,6 +54,8 @@ pub struct QueuedWork {
     /// turning the server off cancels it. Off for a drop, whose stems end up
     /// only in its folder.
     pub from_api: bool,
+    /// The client's file key, recorded against the track id when the pieces are written.
+    pub file: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +79,38 @@ struct Running {
     cancel: Arc<AtomicBool>,
 }
 
+/// Segment times [`Queue::segment_run_seconds`] takes the median of.
+pub const SPEED_KEPT: usize = 16;
+
+/// The last [`SPEED_KEPT`] segment times.
+#[derive(Debug, Default)]
+struct Speed {
+    recent: VecDeque<f64>,
+}
+
+impl Speed {
+    /// Record that a segment took `secs`.
+    fn record(&mut self, secs: f64) {
+        if self.recent.len() == SPEED_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(secs);
+    }
+
+    /// The median of the recent times, to the millisecond.
+    fn median(&self) -> Option<f64> {
+        let mut sorted: Vec<f64> = self.recent.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let n = sorted.len();
+        let median = match n {
+            0 => return None,
+            _ if n % 2 == 1 => sorted[n / 2],
+            _ => (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0,
+        };
+        Some((median * 1000.0).round() / 1000.0)
+    }
+}
+
 /// A job waiting for the worker.
 struct Pending {
     work: QueuedWork,
@@ -89,6 +125,8 @@ pub struct ClientJob {
     pub number: u64,
     pub running: bool,
     pub progress: Progress,
+    /// A protocol 1 client waits on it.
+    pub protocol_1: bool,
 }
 
 /// The running job, then the waiting ones. A job listed in both keeps only its
@@ -133,6 +171,10 @@ struct Inner {
     /// Whether the loaded separator needs the whole mix's normalisation.
     normalises: AtomicBool,
     sessions: Arc<Sessions>,
+    /// Segment times on the loaded model.
+    speed: Mutex<Speed>,
+    /// Set while the worker runs a job or a segment.
+    busy: AtomicBool,
     /// Set when the worker has left its loop and dropped its separator. The
     /// thread then parks and never exits: MLX's per-thread CUDA state throws
     /// from its destructor when a thread exits on Windows.
@@ -178,6 +220,8 @@ impl Queue {
             segmenting: Mutex::new(None),
             normalises: AtomicBool::new(false),
             sessions: Arc::new(Sessions::default()),
+            speed: Mutex::new(Speed::default()),
+            busy: AtomicBool::new(false),
             left: AtomicBool::new(false),
         });
 
@@ -237,6 +281,36 @@ impl Queue {
 
     pub fn sessions(&self) -> &Arc<Sessions> {
         &self.inner.sessions
+    }
+
+    /// Median seconds of the last [`SPEED_KEPT`] segments, `None` until one ran.
+    pub fn segment_run_seconds(&self) -> Option<f64> {
+        self.inner.speed.lock().median()
+    }
+
+    /// What `session`'s client sees now.
+    pub fn view_of(&self, session: &Session) -> View {
+        self.inner
+            .sessions
+            .view_of(session, self.segment_run_seconds())
+    }
+
+    /// When background consolidation may run: always on a GPU, on a CPU while the worker idles.
+    pub fn consolidation_gate(&self) -> crate::pieces::Gate {
+        let inner = Arc::downgrade(&self.inner);
+        Box::new(move || {
+            let Some(inner) = inner.upgrade() else {
+                return true;
+            };
+            let cpu = inner
+                .info
+                .lock()
+                .as_ref()
+                .is_some_and(|info| info.device == "cpu");
+            !cpu || (!inner.busy.load(Ordering::SeqCst)
+                && inner.pending.lock().is_empty()
+                && !inner.sessions.has_runnable())
+        })
     }
 
     /// Tell the worker that session work may be waiting.
@@ -389,6 +463,7 @@ impl Queue {
                     number,
                     running: false,
                     progress: p.work.job.progress.lock().clone(),
+                    protocol_1: p.work.job.protocol_1(),
                 })
             })
             .collect();
@@ -397,6 +472,7 @@ impl Queue {
                 number,
                 running: true,
                 progress: r.job.progress.lock().clone(),
+                protocol_1: r.job.protocol_1(),
             })
         });
         running_first(running, waiting)
@@ -506,7 +582,7 @@ impl Inner {
             if let Some(staged) = self.incoming.lock().take() {
                 return Some(Next::Install(staged));
             }
-            if let Some((track, k)) = self.sessions.next(Priority::Critical) {
+            if let Some((track, k)) = self.sessions.next(Class::BeforeJobs) {
                 return Some(Next::Segment(track, k));
             }
             if let Some(Pending { work, number }) = pending.pop_front() {
@@ -520,7 +596,7 @@ impl Inner {
                 });
                 return Some(Next::Job(Claimed { work, cancel }));
             }
-            if let Some((track, k)) = self.sessions.next(Priority::Bonus) {
+            if let Some((track, k)) = self.sessions.next(Class::WhenIdle) {
                 return Some(Next::Segment(track, k));
             }
             // Tidy only after every check above, so a wake never skips waiting work.
@@ -551,6 +627,7 @@ impl Inner {
                 // Open sessions hold output from the old model. Close them before the
                 // reply, so `install` returns with them closed.
                 self.sessions.close_all("the server switched models");
+                *self.speed.lock() = Speed::default();
                 *self.segmenting.lock() = separator.segmenting();
                 self.normalises
                     .store(separator.normalises(), Ordering::SeqCst);
@@ -607,10 +684,18 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                 }
             }
             Next::Job(claimed) => {
+                inner.busy.store(true, Ordering::SeqCst);
                 let pieces = inner.sessions.pieces();
+                // The time between two calls is one job segment.
+                let mut last: Option<std::time::Instant> = None;
                 let separating = catch_unwind(AssertUnwindSafe(|| {
                     separate_one(separator.as_mut(), &claimed, cache, pieces, &mut |sep| {
-                        serve_critical(inner, sep, &mut passes);
+                        let now = std::time::Instant::now();
+                        if let Some(at) = last {
+                            inner.speed.lock().record((now - at).as_secs_f64());
+                        }
+                        serve_high(inner, sep, &mut passes);
+                        last = Some(std::time::Instant::now());
                         Ok(())
                     });
                 }));
@@ -628,20 +713,22 @@ fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>, cache: &Cac
                 trim_after_job(cache);
             }
             Next::Segment(track, k) => {
-                run_segment(separator.as_mut(), &inner.sessions, &track, k, &mut passes);
+                inner.busy.store(true, Ordering::SeqCst);
+                run_segment(separator.as_mut(), inner, &track, k, &mut passes);
             }
             Next::Tidy => {}
         }
+        inner.busy.store(false, Ordering::SeqCst);
         passes.retain(|uid, _| inner.sessions.has_track(*uid));
     }
 }
 
-/// Run every critical session segment that can run now.
-fn serve_critical(inner: &Inner, separator: &mut dyn Separate, passes: &mut HashMap<u64, Pass>) {
+/// Run every high-priority session segment that can run now.
+fn serve_high(inner: &Inner, separator: &mut dyn Separate, passes: &mut HashMap<u64, Pass>) {
     while !inner.shutdown.load(Ordering::SeqCst)
-        && let Some((track, k)) = inner.sessions.next(Priority::Critical)
+        && let Some((track, k)) = inner.sessions.next(Class::BeforeJobs)
     {
-        run_segment(separator, &inner.sessions, &track, k, passes);
+        run_segment(separator, inner, &track, k, passes);
     }
 }
 
@@ -651,11 +738,12 @@ fn serve_critical(inner: &Inner, separator: &mut dyn Separate, passes: &mut Hash
 /// A failure closes the track; the worker keeps running.
 fn run_segment(
     separator: &mut dyn Separate,
-    sessions: &Sessions,
+    inner: &Inner,
     track: &Track,
     k: usize,
     passes: &mut HashMap<u64, Pass>,
 ) {
+    let sessions = &inner.sessions;
     let began = std::time::Instant::now();
     let ran = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
         let (window, norm) = track.input(k)?;
@@ -672,16 +760,17 @@ fn run_segment(
             let stems = separator.stems(pass, &track.mix(from, to), from, to)?;
             track.store(from, to, &stems)?;
         }
-        if let (Some(pieces), Some(first), Some(last)) =
-            (sessions.pieces(), finals.first(), finals.last())
-        {
-            pieces.publish(sessions, track, first.0..last.1);
+        if let (Some(first), Some(last)) = (finals.first(), finals.last()) {
+            sessions.store_pieces(track, first.0..last.1);
         }
         Ok(())
     }));
+    sessions.changed();
     let failure = match ran {
         Ok(Ok(())) => {
-            tracing::debug!(track = track.uid, "segment {k} in {:.2?}", began.elapsed());
+            let took = began.elapsed();
+            inner.speed.lock().record(took.as_secs_f64());
+            tracing::debug!(track = track.uid, "segment {k} in {took:.2?}");
             return;
         }
         Ok(Err(err)) => format!("segment {k}: {err:#}"),
@@ -692,6 +781,7 @@ fn run_segment(
     };
     tracing::warn!(track = track.uid, "{failure}");
     track.close(failure);
+    sessions.changed();
     passes.remove(&track.uid);
 }
 
@@ -730,8 +820,7 @@ fn trim_after_job(cache: &Cache) {
     }
 }
 
-/// Write a finished job's stems as pieces, so a later session on the same track
-/// starts with them.
+/// Store a finished job's stems whole; a stem whose length is not the track's is written as pieces.
 fn write_job_pieces(
     pieces: &Pieces,
     model_id: &str,
@@ -739,8 +828,14 @@ fn write_job_pieces(
     stems: &Stems,
     output: Output,
     stride: usize,
+    file: Option<String>,
 ) -> Result<()> {
     let id = track_id(mix);
+    if let Some(key) = file
+        && let Err(err) = pieces.record_file(&key, &id)
+    {
+        tracing::warn!("recording file key {key}: {err:#}");
+    }
     let gain = gain(&output, mix.peak().ok());
     let name = type_dir(&output, gain);
     let mut all = output.clone();
@@ -749,14 +844,51 @@ fn write_job_pieces(
     let (model, out) = (u64::from(mix.sample_rate), u64::from(output.rate.hz()));
     let frames = mix.frames();
     let count = frames.div_ceil(stride);
-    let dir = pieces.verified_dir(model_id, &name, &id);
+    let info = TrackInfo {
+        frames,
+        sample_rate: mix.sample_rate,
+        channels: mix.data.len(),
+        stride,
+        pieces: count,
+    };
+    let task = Consolidation {
+        dir: pieces.verified_dir(model_id, &name, &id),
+        format: output.format,
+        rate: output.rate.hz(),
+        info,
+        stems: stems_of(&all),
+    };
+    let dir = &task.dir;
+    pieces.write_info(dir, &info)?;
+    let expected = info.frames_at(output.rate.hz());
+    let mut whole = Vec::new();
+    for (stem, audio) in &converted {
+        if audio.frames() != expected {
+            continue;
+        }
+        let bytes = stemd_core::encode_stem(audio, output.format, gain)?;
+        let clipped = (!output.format.has_headroom()).then(|| {
+            audio
+                .data
+                .iter()
+                .flatten()
+                .filter(|v| (*v * gain).abs() > 1.0)
+                .count()
+        });
+        pieces.consolidate(&task, stem, &bytes, audio.frames(), clipped)?;
+        whole.push(*stem);
+    }
+    if whole.len() == converted.len() {
+        tracing::info!("track {id}: stored {} stems whole in {name}", whole.len());
+        return Ok(());
+    }
     for k in 0..count {
         let (from, to) = (k * stride, ((k + 1) * stride).min(frames));
-        for (stem, audio) in &converted {
+        for (stem, audio) in converted.iter().filter(|(stem, _)| !whole.contains(stem)) {
             let a = output_index(from, model, out).min(audio.frames());
             let b = output_index(to, model, out).min(audio.frames());
             let bytes = stemd_core::encode_stem(&excerpt(audio, a, b), output.format, gain)?;
-            pieces.write_verified(&dir, stem, k, output.format.extension(), &bytes)?;
+            pieces.write_verified(dir, stem, k, output.format.extension(), &bytes)?;
         }
     }
     tracing::info!("track {id}: wrote {count} pieces of {name}");
@@ -815,7 +947,7 @@ fn separate_one(
         cancel: Arc::clone(&claimed.cancel),
     };
 
-    // Segment by segment where the separator can, so critical session work
+    // Segment by segment where the separator can, so high-priority session work
     // waits at most one segment.
     let segmenting = separator.segmenting();
     let separated = if segmenting.is_some() {
@@ -836,12 +968,16 @@ fn separate_one(
                 && pieces_affordable(&pieces)
                 && let Ok(grid) = segmenting.grid(work.mix.frames())
             {
-                let (mix, output, model_id) =
-                    (work.mix.clone(), work.output.clone(), work.model_id.clone());
+                let (mix, output, model_id, file) = (
+                    work.mix.clone(),
+                    work.output.clone(),
+                    work.model_id.clone(),
+                    work.file.clone(),
+                );
                 let stride = grid.stride().unsigned_abs() as usize;
                 std::thread::spawn(move || {
                     if let Err(err) =
-                        write_job_pieces(&pieces, &model_id, &mix, &stems, output, stride)
+                        write_job_pieces(&pieces, &model_id, &mix, &stems, output, stride, file)
                     {
                         tracing::warn!("writing a job's pieces: {err:#}");
                     }
@@ -1268,6 +1404,7 @@ mod tests {
                 },
                 model_id: "test".into(),
                 from_api: true,
+                file: None,
             })
             .expect("queue has room");
     }
@@ -1713,7 +1850,9 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::sessions::{Margin, Request, Session, TrackSpec, WindowRequest};
+
+    const KEY: &str = "0123456789abcdef01234567";
+    use crate::sessions::{Region, Request, Session, TrackSpec, WindowRequest};
     use crate::testkit::cache;
     use std::time::Duration;
     use stemd_core::toy::Toy;
@@ -1769,6 +1908,13 @@ mod session_tests {
         pieces
     }
 
+    /// A piece store whose stems are never stored whole in the background.
+    fn with_held_pieces(queue: &Queue) -> Arc<Pieces> {
+        let pieces = with_pieces(queue);
+        pieces.set_gate(Box::new(|| false));
+        pieces
+    }
+
     fn open_as(
         queue: &Queue,
         frames: usize,
@@ -1806,15 +1952,12 @@ mod session_tests {
 
     fn whole(session: &Session) -> WindowRequest {
         WindowRequest {
-            needle: 0,
-            ahead: Margin {
-                frames: session.track().spec.frames,
-                priority: Priority::Critical,
-            },
-            behind: Margin {
-                frames: 0,
-                priority: Priority::Bonus,
-            },
+            regions: vec![Region {
+                at: 0,
+                ahead: session.track().spec.frames,
+                behind: 0,
+                priority: 0,
+            }],
         }
     }
 
@@ -1910,15 +2053,12 @@ mod session_tests {
         let needle = 200_000;
         session
             .set_window(&WindowRequest {
-                needle,
-                ahead: Margin {
-                    frames: 10_000,
-                    priority: Priority::Critical,
-                },
-                behind: Margin {
-                    frames: 0,
-                    priority: Priority::Bonus,
-                },
+                regions: vec![Region {
+                    at: needle,
+                    ahead: 10_000,
+                    behind: 0,
+                    priority: 0,
+                }],
             })
             .expect("open");
         // Only the region around the cue.
@@ -1934,7 +2074,7 @@ mod session_tests {
     }
 
     #[test]
-    fn critical_segments_run_between_the_segments_of_a_job() {
+    fn high_priority_segments_run_between_the_segments_of_a_job() {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(20);
@@ -1950,6 +2090,7 @@ mod session_tests {
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
                 from_api: true,
+                file: None,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(100));
@@ -1975,6 +2116,7 @@ mod session_tests {
             number,
             running,
             progress: Progress::new(Stage::Queued),
+            protocol_1: false,
         };
         let listed: Vec<(u64, bool)> =
             running_first(Some(job(1, true)), vec![job(1, false), job(2, false)])
@@ -2001,6 +2143,7 @@ mod session_tests {
                     output: output(StemFormat::Pcm32),
                     model_id: "toy-00000000".into(),
                     from_api,
+                    file: None,
                 })
                 .expect("room");
             job
@@ -2047,6 +2190,7 @@ mod session_tests {
                     output: output(StemFormat::Pcm32),
                     model_id: "toy-00000000".into(),
                     from_api,
+                    file: None,
                 })
                 .expect("room");
             job
@@ -2071,7 +2215,7 @@ mod session_tests {
     }
 
     #[test]
-    fn bonus_segments_wait_for_waiting_jobs() {
+    fn normal_priority_segments_wait_for_waiting_jobs() {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
         toy.delay = Duration::from_millis(10);
@@ -2086,6 +2230,7 @@ mod session_tests {
                 output: output(StemFormat::Pcm32),
                 model_id: "toy-00000000".into(),
                 from_api: true,
+                file: None,
             })
             .expect("room");
         thread::sleep(Duration::from_millis(50));
@@ -2095,7 +2240,7 @@ mod session_tests {
         let session = open(&queue, frames, Some(Normalisation::of(&mix)));
         upload(&queue, &session, 0, &mix);
         let mut request = whole(&session);
-        request.ahead.priority = Priority::Bonus;
+        request.regions[0].priority = crate::sessions::BEFORE_JOBS;
         session.set_window(&request).expect("open");
         queue.wake();
 
@@ -2103,7 +2248,7 @@ mod session_tests {
         assert_eq!(
             job.view().progress.stage,
             Stage::Done,
-            "a bonus segment ran ahead of the job"
+            "a normal-priority segment ran ahead of the job"
         );
     }
 
@@ -2171,11 +2316,8 @@ mod session_tests {
         let type_name = type_dir(&first.output, first.gain);
         let stems = ["harmonics", "vocals", "drums"];
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while pieces
-            .cached("toy-00000000", &type_name, &id, &stems, "flac", count)
-            .len()
-            < count
-        {
+        let dir = pieces.verified_dir("toy-00000000", &type_name, &id);
+        while Pieces::cached(&dir, &stems, "flac", count).len() < count {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the pieces were never written"
@@ -2196,6 +2338,780 @@ mod session_tests {
             runs.load(Ordering::SeqCst),
             ran,
             "cached pieces were separated again"
+        );
+    }
+
+    /// Wait until every piece of `session`'s output is on disk.
+    fn stored_within(queue: &Queue, session: &Session, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let count = session.track().spec.grid.len();
+        while std::time::Instant::now() < deadline {
+            if queue.sessions().cached_for(session).len() == count {
+                return true;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        false
+    }
+
+    /// The status, `x-stemd-*` headers and body of a whole-track read.
+    fn whole_file(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>, Vec<u8>) {
+        let frames = session.track().spec.frames;
+        parts_of(crate::session_api::encode_range(
+            queue.sessions(),
+            session,
+            name,
+            0,
+            frames,
+        ))
+    }
+
+    /// The same, sent from the stored whole file.
+    fn sent_whole(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>, Vec<u8>) {
+        let whole = queue.sessions().whole(session, name).expect("a whole file");
+        let response = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+            .block_on(crate::session_api::send_whole(
+                session.output.format,
+                session.gain,
+                whole,
+            ));
+        parts_of(response)
+    }
+
+    fn parts_of(
+        response: Result<axum::response::Response, crate::api::ApiError>,
+    ) -> (u16, Vec<String>, Vec<u8>) {
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => axum::response::IntoResponse::into_response(err),
+        };
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter(|(k, _)| k.as_str().starts_with("x-stemd-"))
+            .map(|(k, v)| format!("{k}: {}", v.to_str().unwrap_or("")))
+            .collect();
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .expect("the body");
+        (status, headers, body.to_vec())
+    }
+
+    fn open_at(queue: &Queue, frames: usize, format: StemFormat, rate: OutputRate) -> Arc<Session> {
+        let grid = queue
+            .segmenting()
+            .expect("the toy segments")
+            .grid(frames)
+            .expect("a grid");
+        let mut output = output(format);
+        output.rate = rate;
+        queue
+            .sessions()
+            .open(Request {
+                output,
+                in_format: PcmFormat::F32le,
+                track: TrackSpec {
+                    frames,
+                    channels: 2,
+                    sample_rate: stemd_core::toy::RATE,
+                    grid,
+                    normalises: queue.normalises(),
+                    parts: Parts::DEFAULT,
+                },
+                norm: None,
+                peak: None,
+                model_id: "toy-00000000".into(),
+            })
+            .expect("room for a session")
+    }
+
+    /// Replace the whole files under `dir` with the pieces copied to `backup`.
+    fn restore_pieces(dir: &std::path::Path, backup: &std::path::Path, format: StemFormat) {
+        for stem in ["harmonics", "vocals", "drums"] {
+            let _ = std::fs::remove_file(crate::whole::file(dir, stem, format.extension()));
+            let _ = std::fs::remove_file(crate::whole::meta_file(dir, stem));
+            let _ = std::fs::remove_dir_all(dir.join(stem));
+            std::fs::create_dir_all(dir.join(stem)).expect("a stem directory");
+            for entry in std::fs::read_dir(backup.join(stem)).expect("a backup") {
+                let entry = entry.expect("an entry");
+                std::fs::copy(entry.path(), dir.join(stem).join(entry.file_name()))
+                    .expect("copying a piece");
+            }
+        }
+    }
+
+    /// The whole-track file of a fresh session, one with every piece stored, one
+    /// with half of them stored, and one with the stem stored whole.
+    fn four_ways(
+        format: StemFormat,
+        rate: OutputRate,
+        seed: u32,
+    ) -> [(u16, Vec<String>, Vec<u8>); 4] {
+        let frames = 40_000;
+        let mix = track(frames, seed);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_held_pieces(&queue);
+        let stems = ["harmonics", "vocals", "drums"];
+
+        let fresh = open_at(&queue, frames, format, rate);
+        fresh.set_window(&whole(&fresh)).expect("open");
+        upload(&queue, &fresh, 0, &mix);
+        queue.wake();
+        assert!(ready_within(&fresh, 0, frames, Duration::from_secs(20)));
+        assert!(stored_within(&queue, &fresh, Duration::from_secs(10)));
+        let dir = pieces.verified_dir(
+            "toy-00000000",
+            &type_dir(&fresh.output, fresh.gain),
+            &crate::sessions::track_id(&mix),
+        );
+        let backup = dir.with_extension("backup");
+        for stem in stems {
+            std::fs::create_dir_all(backup.join(stem)).expect("a backup");
+            for entry in std::fs::read_dir(dir.join(stem)).expect("pieces") {
+                let entry = entry.expect("an entry");
+                std::fs::copy(entry.path(), backup.join(stem).join(entry.file_name()))
+                    .expect("copying a piece");
+            }
+        }
+        let (from, to) = (frames / 3, frames / 3 + 7000);
+        let fresh_range = parts_of(crate::session_api::encode_range(
+            queue.sessions(),
+            &fresh,
+            "vocals",
+            from,
+            to,
+        ));
+        let fresh_file = whole_file(&queue, &fresh, "vocals");
+        assert!(
+            !dir.join("vocals").exists(),
+            "the pieces stayed beside the whole file"
+        );
+        queue.sessions().remove(&fresh.id, "ended by the client");
+
+        let whole_session = open_at(&queue, frames, format, rate);
+        upload(&queue, &whole_session, 0, &mix);
+        let view = queue.view_of(&whole_session);
+        assert!(view.complete, "the whole file does not count as stored");
+        let sent = sent_whole(&queue, &whole_session, "vocals");
+        if rate == OutputRate::default() {
+            let cut = parts_of(crate::session_api::encode_range(
+                queue.sessions(),
+                &whole_session,
+                "vocals",
+                from,
+                to,
+            ));
+            assert_eq!(
+                cut, fresh_range,
+                "{format}: a range cut from the whole file"
+            );
+        }
+        assert_eq!(
+            whole_file(&queue, &whole_session, "vocals"),
+            sent,
+            "a whole read decoded from the file differs from the file"
+        );
+        queue
+            .sessions()
+            .remove(&whole_session.id, "ended by the client");
+
+        restore_pieces(&dir, &backup, format);
+        let stored = open_at(&queue, frames, format, rate);
+        upload(&queue, &stored, 0, &mix);
+        let view = queue.view_of(&stored);
+        assert!(view.ready.is_empty(), "stored pieces were separated");
+        assert!(view.complete, "every piece is stored");
+        let stored_file = whole_file(&queue, &stored, "vocals");
+        queue.sessions().remove(&stored.id, "ended by the client");
+
+        // Drop the second half of the pieces, so that half separates again.
+        restore_pieces(&dir, &backup, format);
+        let count = fresh.track().spec.grid.len();
+        for k in count / 2..count {
+            for stem in stems {
+                let file = dir
+                    .join(stem)
+                    .join(format!("{k:04}.{}", format.extension()));
+                std::fs::remove_file(&file).expect("a stored piece");
+            }
+        }
+        let partly = open_at(&queue, frames, format, rate);
+        upload(&queue, &partly, 0, &mix);
+        assert!(
+            !partly
+                .track()
+                .complete_with(&queue.sessions().cached_for(&partly))
+        );
+        let (status, _, body) = whole_file(&queue, &partly, "vocals");
+        assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+        partly.set_window(&whole(&partly)).expect("open");
+        queue.wake();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !partly
+            .track()
+            .complete_with(&queue.sessions().cached_for(&partly))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the missing half never ran"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        let summary = queue.view_of(&partly);
+        assert!(summary.complete);
+        assert_ne!(
+            summary.ready,
+            vec![[0, frames]],
+            "the stored half was separated"
+        );
+        let partly_file = whole_file(&queue, &partly, "vocals");
+        [fresh_file, stored_file, partly_file, sent]
+    }
+
+    #[test]
+    fn a_whole_track_read_is_the_same_file_from_memory_and_from_stored_pieces() {
+        let _gpu = GPU.lock();
+        for format in [
+            StemFormat::Flac,
+            StemFormat::Wav,
+            StemFormat::Pcm16,
+            StemFormat::Pcm32,
+        ] {
+            let [fresh, stored, partly, whole] = four_ways(format, OutputRate::default(), 11);
+            assert_eq!(fresh.0, 200, "{format}");
+            assert_eq!(stored, fresh, "{format}: all stored");
+            assert_eq!(partly, fresh, "{format}: partly stored");
+            assert_eq!(whole, fresh, "{format}: stored whole");
+        }
+    }
+
+    #[test]
+    fn at_another_rate_stored_pieces_differ_by_at_most_one_lsb() {
+        let _gpu = GPU.lock();
+        let samples = |body: &[u8]| -> Vec<i16> {
+            body.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect()
+        };
+        for rate in [OutputRate::Hz48000, OutputRate::Hz96000] {
+            let [fresh, stored, partly, whole] = four_ways(StemFormat::Pcm16, rate, 13);
+            assert_eq!(whole, fresh, "{rate}: stored whole");
+            let want = samples(&fresh.2);
+            for (label, got) in [("all stored", &stored), ("partly stored", &partly)] {
+                assert_eq!(got.1, fresh.1, "{rate}, {label}: headers");
+                let got = samples(&got.2);
+                assert_eq!(got.len(), want.len(), "{rate}, {label}: length");
+                let diffs: Vec<i32> = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+                    .collect();
+                // The resampler's rounding where a piece was converted on its own.
+                let max = diffs.iter().max().copied().unwrap_or(0);
+                let count = diffs.iter().filter(|d| **d > 0).count();
+                assert!(max <= 1, "{rate}, {label}: off by {max} LSB");
+                assert!(
+                    count * 1000 < diffs.len(),
+                    "{rate}, {label}: {count} samples differ"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_piece_deleted_during_a_session_is_separated_again_on_the_next_window() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 14);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_held_pieces(&queue);
+
+        let first = open_as(&queue, frames, None, StemFormat::Flac);
+        first.set_window(&whole(&first)).expect("open");
+        upload(&queue, &first, 0, &mix);
+        queue.wake();
+        assert!(stored_within(&queue, &first, Duration::from_secs(20)));
+        let want = stemd_core::encode_stem(
+            &first.read("vocals", 0, frames).expect("ready").audio,
+            StemFormat::Flac,
+            first.gain,
+        )
+        .expect("encoding");
+        queue.sessions().remove(&first.id, "ended by the client");
+
+        let second = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &second, 0, &mix);
+        let dir = pieces.verified_dir(
+            "toy-00000000",
+            &type_dir(&second.output, second.gain),
+            &crate::sessions::track_id(&mix),
+        );
+        for stem in ["harmonics", "vocals", "drums"] {
+            std::fs::remove_file(dir.join(stem).join("0003.flac")).expect("a stored piece");
+        }
+        let view = queue.view_of(&second);
+        assert!(!view.complete);
+        assert_eq!(whole_file(&queue, &second, "vocals").0, 409);
+
+        queue
+            .sessions()
+            .set_window(&second, &whole(&second))
+            .expect("open");
+        queue.wake();
+        assert!(stored_within(&queue, &second, Duration::from_secs(20)));
+        assert_eq!(whole_file(&queue, &second, "vocals").2, want);
+    }
+
+    #[test]
+    fn a_track_with_every_piece_stored_is_stored_whole_once_the_gate_opens() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 15);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_pieces(&queue);
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&open);
+        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        let stems = ["harmonics", "vocals", "drums"];
+
+        let first = open_as(&queue, frames, None, StemFormat::Flac);
+        first.set_window(&whole(&first)).expect("open");
+        upload(&queue, &first, 0, &mix);
+        queue.wake();
+        assert!(stored_within(&queue, &first, Duration::from_secs(20)));
+        let range = |session: &Session| {
+            parts_of(crate::session_api::encode_range(
+                queue.sessions(),
+                session,
+                "vocals",
+                frames / 3,
+                frames / 3 + 5000,
+            ))
+        };
+        let from_memory = range(&first);
+        let dir = pieces.verified_dir(
+            "toy-00000000",
+            &type_dir(&first.output, first.gain),
+            &crate::sessions::track_id(&mix),
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            stems.iter().all(|s| dir.join(s).is_dir()),
+            "stored whole while the gate was shut"
+        );
+        assert!(pieces.is_consolidating(&dir));
+
+        open.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stems
+            .iter()
+            .any(|s| crate::whole::find(&dir, s, "flac").is_none())
+        {
+            assert!(std::time::Instant::now() < deadline, "never stored whole");
+            thread::sleep(POLL_INTERVAL);
+        }
+        while pieces.is_consolidating(&dir) {
+            thread::sleep(POLL_INTERVAL);
+        }
+        for stem in stems {
+            assert!(!dir.join(stem).exists(), "{stem} kept its pieces");
+        }
+        queue.sessions().remove(&first.id, "ended by the client");
+
+        let second = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &second, 0, &mix);
+        let view = queue.view_of(&second);
+        assert!(view.complete);
+        assert!(view.ready.is_empty());
+        assert_eq!(
+            range(&second),
+            from_memory,
+            "a range cut from the whole file"
+        );
+        assert_eq!(
+            whole_file(&queue, &second, "vocals"),
+            sent_whole(&queue, &second, "vocals")
+        );
+    }
+
+    /// Wait until every stem of `output` for `mix` is stored whole.
+    fn whole_within(
+        pieces: &Pieces,
+        mix: &Audio,
+        output: &Output,
+        gain: f32,
+    ) -> std::path::PathBuf {
+        let dir = pieces.verified_dir(
+            "toy-00000000",
+            &type_dir(output, gain),
+            &crate::sessions::track_id(mix),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while crate::pieces::stems_of(output)
+            .iter()
+            .any(|s| crate::whole::find(&dir, s, output.format.extension()).is_none())
+            || pieces.is_consolidating(&dir)
+        {
+            assert!(std::time::Instant::now() < deadline, "never stored whole");
+            thread::sleep(POLL_INTERVAL);
+        }
+        dir
+    }
+
+    #[test]
+    fn a_lookup_follows_a_track_from_open_to_stored() {
+        use crate::separations::{Held, Storage, lookup};
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 16);
+        let id = crate::sessions::track_id(&mix);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_pieces(&queue);
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&open);
+        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        let flac = output(StemFormat::Flac);
+        let held = || lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id);
+        assert!(held().is_none());
+
+        let session = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &session, 0, &mix);
+        let now = held().expect("open");
+        assert_eq!(now.state, Held::Open);
+        assert_eq!(now.frames, frames);
+        assert_eq!(now.output.gain, None);
+
+        session.set_window(&whole(&session)).expect("open");
+        queue.wake();
+        assert!(stored_within(&queue, &session, Duration::from_secs(20)));
+        assert_eq!(held().expect("stored").state, Held::Consolidating);
+
+        open.store(true, Ordering::SeqCst);
+        let dir = whole_within(&pieces, &mix, &flac, session.gain);
+        let now = held().expect("stored");
+        assert_eq!(now.state, Held::Stored);
+        assert_eq!(now.output.gain, Some(session.gain));
+        assert_eq!(
+            now.stems
+                .iter()
+                .map(|s| (s.name, s.sources))
+                .collect::<Vec<_>>(),
+            [("harmonics", 6), ("vocals", 8), ("drums", 1)]
+        );
+        for stem in &now.stems {
+            assert_eq!(stem.stored, Storage::Whole);
+            let len = std::fs::metadata(dir.join(format!("{}.flac", stem.name)))
+                .expect("a whole file")
+                .len();
+            assert_eq!(stem.bytes, Some(len));
+        }
+
+        queue.sessions().remove(&session.id, "ended by the client");
+        std::fs::remove_file(dir.join("vocals.flac")).expect("a whole file");
+        let now = held().expect("partial");
+        assert_eq!(now.state, Held::Partial);
+        assert_eq!(now.stems[1].stored, Storage::None);
+    }
+
+    #[test]
+    fn a_track_uploaded_but_never_separated_is_unknown_once_its_session_ends() {
+        use crate::separations::lookup;
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 23);
+        let id = crate::sessions::track_id(&mix);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_held_pieces(&queue);
+        let flac = output(StemFormat::Flac);
+        let session = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &session, 0, &mix);
+        queue.sessions().remove(&session.id, "ended by the client");
+        assert!(lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id).is_none());
+    }
+
+    #[test]
+    fn a_track_that_fails_to_be_stored_whole_reads_as_partial_until_the_retry() {
+        use crate::separations::{Held, lookup};
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 24);
+        let id = crate::sessions::track_id(&mix);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_pieces(&queue);
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&open);
+        pieces.set_gate(Box::new(move || gate.load(Ordering::SeqCst)));
+        let flac = output(StemFormat::Flac);
+        let session = open_as(&queue, frames, None, StemFormat::Flac);
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &mix);
+        queue.wake();
+        assert!(stored_within(&queue, &session, Duration::from_secs(20)));
+        queue.sessions().remove(&session.id, "ended by the client");
+
+        let dir = pieces.verified_dir("toy-00000000", &type_dir(&flac, session.gain), &id);
+        let piece = std::fs::read_dir(dir.join("harmonics"))
+            .expect("pieces")
+            .flatten()
+            .next()
+            .expect("a piece")
+            .path();
+        std::fs::write(&piece, b"not flac").expect("writing");
+        open.store(true, Ordering::SeqCst);
+        while pieces.is_consolidating(&dir) {
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert!(pieces.consolidation_failed(&dir));
+        let held = lookup(Some(&pieces), queue.sessions(), "toy-00000000", &flac, &id);
+        assert_eq!(held.expect("partial").state, Held::Partial);
+        assert!(!pieces.is_consolidating(&dir), "queued again");
+    }
+
+    #[test]
+    fn a_stored_output_converts_to_another_container_of_the_same_samples() {
+        use crate::separations::{Held, derive, lookup};
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_pieces(&queue);
+        let find = |out: &Output, mix: &Audio| {
+            lookup(
+                Some(&pieces),
+                queue.sessions(),
+                "toy-00000000",
+                out,
+                &crate::sessions::track_id(mix),
+            )
+        };
+        let derive_from = |out: &Output, mix: &Audio, source: &Output, gain: f32| {
+            let id = crate::sessions::track_id(mix);
+            let dir = pieces.verified_dir("toy-00000000", &type_dir(source, gain), &id);
+            let source = crate::separations::Found {
+                info: Pieces::info(&dir).expect("a track.json"),
+                dir,
+                output: source.clone(),
+                gain,
+            };
+            let to_gain = find(out, mix)
+                .expect("derivable")
+                .output
+                .gain
+                .expect("a gain");
+            derive(&pieces, "toy-00000000", &id, &source, out, to_gain).expect("derived")
+        };
+
+        // flac to wav: the same 16-bit samples in another container.
+        let mix = track(frames, 17);
+        let session = open_as(&queue, frames, None, StemFormat::Flac);
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &mix);
+        queue.wake();
+        let flac = output(StemFormat::Flac);
+        let flac_dir = whole_within(&pieces, &mix, &flac, session.gain);
+        let wav = output(StemFormat::Wav);
+        let now = find(&wav, &mix).expect("derivable");
+        assert_eq!(now.state, Held::Derivable);
+        assert_eq!(now.from.expect("a source").format, "flac");
+        let wav_dir = derive_from(&wav, &mix, &flac, session.gain).dir;
+        assert_eq!(find(&wav, &mix).expect("stored").state, Held::Stored);
+        for stem in ["harmonics", "vocals", "drums"] {
+            let decoded = |dir: &std::path::Path, format: StemFormat| {
+                let path = dir.join(format!("{stem}.{}", format.extension()));
+                let bytes = std::fs::read(path).expect("a whole file");
+                bits(&crate::pieces::decode(bytes, format, 2, 44_100).expect("decodes"))
+            };
+            assert_eq!(
+                decoded(&wav_dir, StemFormat::Wav),
+                decoded(&flac_dir, StemFormat::Flac),
+                "{stem}"
+            );
+        }
+        queue.sessions().remove(&session.id, "ended by the client");
+
+        // f32le to flac: a 16-bit read at the gain a session without `peak` uses.
+        let mix = track(frames, 18);
+        let session = open_as(&queue, frames, None, StemFormat::Pcm32);
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &mix);
+        queue.wake();
+        let pcm32 = output(StemFormat::Pcm32);
+        whole_within(&pieces, &mix, &pcm32, 1.0);
+        let to_gain = gain(&flac, None);
+        let want = stemd_core::encode_stem(
+            &session.read("vocals", 0, frames).expect("ready").audio,
+            StemFormat::Flac,
+            to_gain,
+        )
+        .expect("encoding");
+        let flac_dir = derive_from(&flac, &mix, &pcm32, 1.0).dir;
+        assert_eq!(
+            std::fs::read(flac_dir.join("vocals.flac")).expect("a whole file"),
+            want
+        );
+        assert!(
+            find(&output(StemFormat::Pcm32), &track(frames, 19)).is_none(),
+            "nothing converts to f32le"
+        );
+    }
+
+    #[test]
+    fn a_view_shows_how_each_stem_is_stored_and_changes_its_rev() {
+        use crate::separations::Storage;
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 20);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        with_held_pieces(&queue);
+        let session = open_as(&queue, frames, None, StemFormat::Flac);
+        let mut changes = queue.sessions().subscribe();
+        changes.borrow_and_update();
+        let before = queue.view_of(&session);
+        assert_eq!(before.rev, queue.view_of(&session).rev);
+        assert_eq!(before.track.id, None);
+        assert!(before.stems.iter().all(|s| s.stored == Storage::None));
+
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &mix);
+        queue.wake();
+        assert!(stored_within(&queue, &session, Duration::from_secs(20)));
+        assert!(changes.has_changed().expect("a sender"));
+        let count = session.track().spec.grid.len();
+        let view = queue.view_of(&session);
+        assert_ne!(view.rev, before.rev);
+        assert_eq!(view.track.id, Some(crate::sessions::track_id(&mix)));
+        for stem in &view.stems {
+            assert_eq!(stem.stored, Storage::Pieces, "{}", stem.name);
+            assert_eq!(stem.pieces, vec![[0, count]]);
+        }
+
+        assert_eq!(whole_file(&queue, &session, "vocals").0, 200);
+        let view = queue.view_of(&session);
+        let vocals = view
+            .stems
+            .iter()
+            .find(|s| s.name == "vocals")
+            .expect("vocals");
+        assert_eq!(vocals.stored, Storage::Whole);
+        assert!(vocals.bytes.is_some_and(|b| b > 0));
+        assert!(vocals.pieces.is_empty());
+        let harmonics = &view.stems[0];
+        assert_eq!(harmonics.stored, Storage::Pieces);
+    }
+
+    #[test]
+    fn a_session_joins_an_open_track_without_an_upload() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 21);
+        let toy = Toy::new(SEGMENT, 0.25);
+        let runs = Arc::clone(&toy.runs);
+        let queue = start(toy);
+        with_held_pieces(&queue);
+        let first = open_as(&queue, frames, None, StemFormat::Flac);
+        upload(&queue, &first, 0, &mix);
+        let id = crate::sessions::track_id(&mix);
+        let track = queue
+            .sessions()
+            .open_track(&id, Parts::DEFAULT)
+            .expect("an open track");
+
+        let second = queue
+            .sessions()
+            .join(output(StemFormat::Wav), PcmFormat::F32le, None, track)
+            .expect("room");
+        assert_eq!(second.track().uid, first.track().uid);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        second.set_window(&whole(&second)).expect("open");
+        queue.wake();
+        assert!(ready_within(&first, 0, frames, Duration::from_secs(20)));
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            second.track().spec.grid.len(),
+            "each segment ran once"
+        );
+        assert!(
+            queue
+                .sessions()
+                .open_track("000000000000000000000000", Parts::DEFAULT)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_join_after_the_last_session_left_finds_the_track_gone() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 22);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        with_held_pieces(&queue);
+        let first = open(&queue, frames, None);
+        upload(&queue, &first, 0, &mix);
+        let id = crate::sessions::track_id(&mix);
+        let track = queue
+            .sessions()
+            .open_track(&id, Parts::DEFAULT)
+            .expect("an open track");
+
+        assert!(queue.sessions().remove(&first.id, "ended by the client"));
+        let joined =
+            queue
+                .sessions()
+                .join(output(StemFormat::Pcm32), PcmFormat::F32le, None, track);
+        assert!(
+            matches!(joined, Err(crate::sessions::JoinError::Gone)),
+            "the join found the track open"
+        );
+        assert!(queue.sessions().is_empty());
+    }
+
+    #[test]
+    fn the_segment_time_is_the_median_of_the_last_ones() {
+        let mut speed = Speed::default();
+        assert_eq!(speed.median(), None);
+        speed.record(6.0);
+        assert_eq!(speed.median(), Some(6.0), "one segment is enough");
+        for _ in 0..SPEED_KEPT / 2 {
+            speed.record(0.5);
+        }
+        assert_eq!(speed.median(), Some(0.5), "a slow outlier does not move it");
+        for _ in 0..SPEED_KEPT {
+            speed.record(0.4);
+        }
+        assert_eq!(speed.median(), Some(0.4), "older times left");
+    }
+
+    #[test]
+    fn session_segments_set_the_segment_time() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let session = open(&queue, frames, None);
+        session.set_window(&whole(&session)).expect("open");
+        upload(&queue, &session, 0, &track(frames, 22));
+        queue.wake();
+        assert!(ready_within(&session, 0, frames, Duration::from_secs(20)));
+        assert!(queue.view_of(&session).grid.segment_run_seconds.is_some());
+    }
+
+    #[test]
+    fn a_whole_track_read_before_any_separation_is_refused() {
+        let _gpu = GPU.lock();
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        with_pieces(&queue);
+        let frames = 20_000;
+        let session = open_at(&queue, frames, StemFormat::Flac, OutputRate::default());
+        upload(&queue, &session, 0, &track(frames, 12));
+        let (status, _, body) = whole_file(&queue, &session, "vocals");
+        assert_eq!(status, 409);
+        assert!(
+            String::from_utf8_lossy(&body).contains("neither ready nor stored"),
+            "{}",
+            String::from_utf8_lossy(&body)
         );
     }
 
@@ -2220,35 +3136,61 @@ mod session_tests {
                 output: output(StemFormat::Flac),
                 model_id: "toy-00000000".into(),
                 from_api: true,
+                file: Some(KEY.into()),
             })
             .expect("room");
-        let grid = queue
-            .segmenting()
-            .expect("segments")
-            .grid(frames)
-            .expect("a grid");
         let name = type_dir(
             &output(StemFormat::Flac),
             gain(&output(StemFormat::Flac), mix.peak().ok()),
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while pieces
-            .cached(
-                "toy-00000000",
-                &name,
-                &id,
-                &["harmonics", "vocals", "drums"],
-                "flac",
-                grid.len(),
-            )
-            .len()
-            < grid.len()
-        {
+        let dir = pieces.verified_dir("toy-00000000", &name, &id);
+        let stems = ["harmonics", "vocals", "drums"];
+        // A whole file is published before its pieces are removed.
+        let stored = |stem: &&str| {
+            crate::whole::find(&dir, stem, "flac").is_some() && !dir.join(stem).exists()
+        };
+        while !stems.iter().all(stored) {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the job wrote no pieces"
+                "the job stored no whole stems"
             );
             thread::sleep(POLL_INTERVAL);
         }
+        for stem in ["harmonics", "vocals", "drums"] {
+            assert!(
+                crate::whole::find(&dir, stem, "flac").is_some(),
+                "{stem} is not stored whole"
+            );
+            assert!(!dir.join(stem).exists(), "{stem} kept its pieces");
+        }
+        assert_eq!(
+            pieces.file_track(KEY),
+            Some(id),
+            "the file key names the track"
+        );
+    }
+
+    #[test]
+    fn a_session_records_its_file_key_once_the_upload_is_hashed() {
+        let _gpu = GPU.lock();
+        let frames = 30_000;
+        let mix = track(frames, 25);
+        let queue = start(Toy::new(SEGMENT, 0.25));
+        let pieces = with_held_pieces(&queue);
+        let session = open(&queue, frames, None);
+        session.set_file(Some(KEY.into()));
+        upload(&queue, &session, 0, &excerpt(&mix, 0, frames / 2));
+        assert_eq!(pieces.file_track(KEY), None, "recorded before the hash");
+        upload(
+            &queue,
+            &session,
+            frames / 2,
+            &excerpt(&mix, frames / 2, frames),
+        );
+        assert_eq!(
+            pieces.file_track(KEY),
+            Some(crate::sessions::track_id(&mix))
+        );
     }
 }

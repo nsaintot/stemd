@@ -24,11 +24,7 @@ use crate::client::{Formats, Health, JobResult, Server};
 use crate::output::{Encoding, Part, Planar};
 use stemd_audio::Decoded;
 
-/// The part rebuilt from the mix rather than downloaded.
-///
-/// Compiled in rather than read from `/v1/health`: the server ships two stems
-/// and has no notion of a third, so this is a client-side decision. Stem *names*
-/// still come from the server.
+/// The part the client rebuilds from the mix; stem names come from `/v2/health`.
 const DERIVED: &str = "drums";
 
 #[derive(Parser, Debug)]
@@ -73,7 +69,7 @@ struct Args {
 
     /// Parts to ask for, comma-separated, such as `bass,other,vocals`. Defaults
     /// to the server's `harmonics,vocals`. Whatever the list leaves out is
-    /// rebuilt here from the mix; `/v1/health` lists what a server offers.
+    /// rebuilt here from the mix; `/v2/health` lists what a server offers.
     #[arg(long)]
     parts: Option<String>,
 
@@ -81,7 +77,7 @@ struct Args {
     /// rate pair; a numbered mode covers one pair and is refused on any other.
     ///
     /// Deprecated: use --dsp-filter. Only ask for one if you are subtracting the
-    /// stems from a mix converted by that same filter. `/v1/health` lists what a
+    /// stems from a mix converted by that same filter. `/v2/health` lists what a
     /// server offers.
     #[arg(long, conflicts_with = "dsp_filter")]
     dsp_mode: Option<u8>,
@@ -122,7 +118,7 @@ fn main() -> Result<()> {
     report_server(&health);
 
     check_rate(&args, &health)?;
-    let filter = upload_filter(&args, &health, &server)?;
+    let filter = upload_filter(&args, &server)?;
     let audio = load_input(&args, &health)?;
     let formats = Formats::new(args.f32)
         .at_rate(args.output_sample_rate)
@@ -185,13 +181,10 @@ fn check_rate(args: &Args, health: &Health) -> Result<()> {
 }
 
 /// Make sure the server holds the `--dsp-filter` file, and return its id.
-fn upload_filter(args: &Args, health: &Health, server: &Server) -> Result<Option<String>> {
+fn upload_filter(args: &Args, server: &Server) -> Result<Option<String>> {
     let Some(path) = &args.dsp_filter else {
         return Ok(None);
     };
-    if !health.has("dsp-filters") {
-        bail!("this server does not take uploaded filters; it has no `dsp-filters` feature");
-    }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let (filter, uploaded) = server.ensure_filter(&bytes)?;
     if args.output_sample_rate != Some(filter.out_rate) {
@@ -223,9 +216,10 @@ fn report_server(health: &Health) {
         health.model, health.sample_rate
     );
     println!(
-        "transfers    : {} stems [{}] by default — `{DERIVED}` is rebuilt here",
-        health.stems.len(),
-        health.stems.join(", "),
+        "transfers    : {} stems [{}] by default — `{}` is rebuilt here",
+        health.default_output.parts.len(),
+        health.default_output.parts.join(", "),
+        health.default_output.derived.as_deref().unwrap_or(DERIVED),
     );
 }
 
@@ -295,7 +289,7 @@ fn assemble(
     for stem in &result.stems {
         let raw = server.fetch_stem(stem)?;
         // Each stem carries its own scale so a quiet one keeps its bits.
-        let samples = if result.format == "flac" {
+        let samples = if result.output.format == "flac" {
             rescale(stemd_audio::decode_flac(raw)?.data, stem.gain)
         } else {
             deinterleave(&raw, f32_wire, stem.gain)
@@ -309,7 +303,7 @@ fn assemble(
     }
 
     // Nothing left to rebuild, or already sent because it was asked for.
-    let Some(derived_name) = result.derived_stem.as_deref() else {
+    let Some(derived_name) = result.output.derived.as_deref() else {
         return Ok(parts);
     };
     if parts.iter().any(|part| part.name == derived_name) {
@@ -321,11 +315,11 @@ fn assemble(
     // filter the server used, which this client does not carry, so it is left
     // out rather than computed from buffers that do not correspond. Pass
     // --include-derived to have the server send it instead.
-    if result.sample_rate != audio.sample_rate {
+    if result.output.sample_rate != audio.sample_rate {
         println!(
             "note         : stems at {} Hz, so `{derived_name}` is not rebuilt — pass \
              --include-derived to have the server send it",
-            result.sample_rate
+            result.output.sample_rate
         );
         return Ok(parts);
     }
@@ -360,7 +354,7 @@ fn write_parts(args: &Args, result: &JobResult, parts: &[Part]) -> Result<()> {
     }
 
     for part in parts {
-        let file = output::write(&dir, part, result.sample_rate, encoding)?;
+        let file = output::write(&dir, part, result.output.sample_rate, encoding)?;
         println!(
             "  {:<12} : {file:<14} {:.1} dBFS",
             part.origin,
@@ -375,7 +369,7 @@ fn write_parts(args: &Args, result: &JobResult, parts: &[Part]) -> Result<()> {
 fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, elapsed: f64) {
     // Only when every part is present and at the mix's rate; otherwise the
     // number would describe two buffers that do not line up.
-    if result.sample_rate == audio.sample_rate {
+    if result.output.sample_rate == audio.sample_rate {
         let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
         println!(
             "reconstruct  : {:.1} dB  ({} vs the original)",
@@ -383,7 +377,7 @@ fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, el
             names.join("+")
         );
     }
-    match result.derived_stem.as_deref() {
+    match result.output.derived.as_deref() {
         Some(derived) => println!(
             "model resid  : {:.1} dB (the model's own error — it all lands on `{derived}`)",
             result.model_residual_db,

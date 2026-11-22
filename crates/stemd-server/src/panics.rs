@@ -9,7 +9,7 @@
 //! 0` with no file, no line, and no way to narrow it from here.
 //!
 //! So the hook is replaced by one that logs the location through `tracing`, which
-//! puts it in the ring buffer behind the window's log view and `GET /v1/logs`.
+//! puts it in the ring buffer behind the window's log view and `GET /v2/logs`.
 //! The hook that was there runs afterwards, so a launch from a terminal keeps the
 //! output it always had, `RUST_BACKTRACE` included.
 //!

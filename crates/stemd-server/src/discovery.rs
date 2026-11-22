@@ -39,10 +39,10 @@ impl Advertiser {
     /// Announce this server over mDNS with TXT keys `v`, `version`, `model`, `path`, `features`.
     pub fn start(instance: &str, port: u16, model: &str) -> Result<Self> {
         let mut props = HashMap::new();
-        props.insert("v", "1".to_owned());
+        props.insert("v", "2".to_owned());
         props.insert("version", env!("CARGO_PKG_VERSION").to_owned());
         props.insert("model", model.to_owned());
-        props.insert("path", "/v1".to_owned());
+        props.insert("path", "/v2".to_owned());
         props.insert("features", crate::api::FEATURES.join(","));
 
         // Logged so a discovery failure on a multi-homed host is a one-line

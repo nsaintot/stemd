@@ -1,21 +1,24 @@
 //! HTTP surface for sessions. See [`crate::sessions`] and [`crate::pieces`].
 //!
 //! ```text
-//! POST   /v1/sessions                          open: track length and output;
+//! POST   /v2/sessions                          open: track length and output;
 //!                                              body is optional PCM from sample 0
-//! PUT    /v1/sessions/{id}/pcm?offset=N        PCM placed at track sample N
-//! PUT    /v1/sessions/{id}/window              needle and margins, JSON
-//! GET    /v1/sessions/{id}                     what has arrived, what is ready
-//! GET    /v1/sessions/{id}/stems/{name}        ?from=&to= in track samples
-//! GET    /v1/sessions/{id}/pieces/{name}/{k}   piece k, encoded, as stored
-//! DELETE /v1/sessions/{id}                     end it
+//! PUT    /v2/sessions/{id}/pcm?offset=N        PCM placed at track sample N
+//! PUT    /v2/sessions/{id}/window              needle and margins, JSON
+//! GET    /v2/sessions/{id}                     what has arrived, what is ready;
+//!                                              ?wait= with If-None-Match long-polls
+//! GET    /v2/sessions/{id}/stems/{name}        ?from=&to= in track samples, or the whole track
+//! GET    /v2/sessions/{id}/pieces/{name}/{k}   piece k, encoded, as stored
+//! DELETE /v2/sessions/{id}                     end it
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -23,26 +26,35 @@ use serde::Deserialize;
 use stemd_core::{Audio, Normalisation, StemFormat};
 
 use crate::api::{ApiError, AppState, CreateParams, default_channels, default_rate, parse_output};
-use crate::pieces::type_dir;
+use crate::pieces::Pieces;
 use crate::sessions::{
-    Request, Session, TooMany, TrackSpec, UploadError, WindowRequest, output_index,
+    JoinError, Request, Session, Sessions, TooMany, TrackSpec, UploadError, WindowRequest,
+    output_index, served,
 };
+use crate::whole::Whole;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/v1/sessions", post(open))
-        .route("/v1/sessions/{id}", get(view).delete(end))
-        .route("/v1/sessions/{id}/pcm", put(upload))
-        .route("/v1/sessions/{id}/window", put(window))
-        .route("/v1/sessions/{id}/stems/{name}", get(stem))
-        .route("/v1/sessions/{id}/pieces/{name}/{k}", get(piece))
+        .route("/v2/sessions", post(open))
+        .route("/v2/sessions/{id}", get(view).delete(end))
+        .route("/v2/sessions/{id}/pcm", put(upload))
+        .route("/v2/sessions/{id}/window", put(window))
+        .route("/v2/sessions/{id}/stems/{name}", get(stem))
+        .route("/v2/sessions/{id}/pieces/{name}/{k}", get(piece))
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenParams {
-    /// Track length in samples, at `sample_rate`.
-    frames: usize,
-    /// Must be the model's rate; see `sample_rate` in `/v1/health`.
+    /// Track length in samples, at `sample_rate`. Required unless `track` is set.
+    #[serde(default)]
+    frames: Option<usize>,
+    /// The id of an open track to join instead of uploading.
+    #[serde(default)]
+    track: Option<String>,
+    /// The client's key for the file the audio came from; see `GET /v2/separations?file=`.
+    #[serde(default)]
+    file: Option<String>,
+    /// Must be the model's rate; see `sample_rate` in `/v2/health`.
     #[serde(default = "default_rate")]
     sample_rate: u32,
     #[serde(default = "default_channels")]
@@ -84,6 +96,7 @@ impl OpenParams {
             parts: self.parts.clone(),
             dsp_mode: self.dsp_mode.clone(),
             dsp_filter: self.dsp_filter.clone(),
+            file: None,
         }
     }
 }
@@ -99,9 +112,17 @@ fn session(state: &AppState, id: &str) -> Result<Arc<Session>, ApiError> {
 }
 
 fn view_of(state: &AppState, session: &Session) -> Response {
-    let pieces = state.queue.sessions().cached_for(session);
-    Json(session.view(state.queue.sessions().idle_timeout(), pieces)).into_response()
+    let view = state.queue.view_of(session);
+    ([(header::ETAG, etag(view.rev))], Json(view)).into_response()
 }
+
+/// The `ETag` of a view at `rev`.
+fn etag(rev: u64) -> String {
+    format!("\"{rev:016x}\"")
+}
+
+/// The longest a long poll waits.
+const MAX_WAIT: Duration = Duration::from_secs(25);
 
 /// Decode a PCM body and place it at `offset`, off the async runtime.
 async fn place(
@@ -155,10 +176,16 @@ async fn open(
             info.model, info.channels, params.channels
         )));
     }
-    if params.frames == 0 {
-        return Err(ApiError::bad_request("frames must be at least 1"));
+    if let Some(key) = &params.file {
+        crate::separations::check_file_key(key)?;
     }
-    let secs = params.frames as f64 / f64::from(model_rate);
+    if let Some(id) = &params.track {
+        return join(&state, &params, id, output, in_format, body).await;
+    }
+    let Some(frames) = params.frames.filter(|&f| f > 0) else {
+        return Err(ApiError::bad_request("frames must be at least 1"));
+    };
+    let secs = frames as f64 / f64::from(model_rate);
     if secs > state.max_track_secs {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -176,7 +203,7 @@ async fn open(
         ));
     };
     let grid = segmenting
-        .grid(params.frames)
+        .grid(frames)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     if !grid.order_free() {
         return Err(ApiError::new(
@@ -208,7 +235,7 @@ async fn open(
             output: output.clone(),
             in_format,
             track: TrackSpec {
-                frames: params.frames,
+                frames,
                 channels: params.channels,
                 sample_rate: model_rate,
                 grid,
@@ -220,6 +247,7 @@ async fn open(
             model_id: state.switcher.published_identity(),
         })
         .map_err(|e: TooMany| ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")))?;
+    session.set_file(params.file.clone());
     tracing::info!(
         session = %session.id,
         "opened for {secs:.1}s of audio, {} segments of {} samples",
@@ -235,6 +263,56 @@ async fn open(
     }
     state.queue.wake();
     Ok((StatusCode::CREATED, view_of(&state, &session)).into_response())
+}
+
+/// Open a session on the open track `id`, which needs no upload.
+async fn join(
+    state: &Arc<AppState>,
+    params: &OpenParams,
+    id: &str,
+    output: crate::cache::Output,
+    in_format: stemd_core::PcmFormat,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    if !body.is_empty() {
+        return Err(ApiError::bad_request(
+            "a session joining a track takes no upload",
+        ));
+    }
+    let sessions = state.queue.sessions();
+    let track = sessions.open_track(id, output.parts).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no open track {id}; open a session with frames and upload it"),
+        )
+        .with_code("unknown_separation")
+    })?;
+    if params.frames.is_some_and(|f| f != track.spec.frames) {
+        return Err(ApiError::bad_request(format!(
+            "track {id} is {} samples long",
+            track.spec.frames
+        )));
+    }
+    let peak = params.peak;
+    let joined = {
+        let sessions = Arc::clone(sessions);
+        tokio::task::spawn_blocking(move || sessions.join(output, in_format, peak, track))
+            .await
+            .map_err(|e| ApiError::internal(format!("join failed: {e}")))?
+    };
+    let session = joined.map_err(|e| match e {
+        JoinError::TooMany(e) => ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")),
+        JoinError::Gone => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no open track {id}; open a session with frames and upload it"),
+        )
+        .with_code("unknown_separation"),
+    })?;
+    session.set_file(params.file.clone());
+    sessions.record_file(&session, id);
+    tracing::info!(session = %session.id, "joined track {id}");
+    state.queue.wake();
+    Ok((StatusCode::CREATED, view_of(state, &session)).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,22 +338,63 @@ async fn upload(
 async fn window(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(request): Json<WindowRequest>,
+    body: Result<Json<WindowRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
-    session
-        .set_window(&request)
+    let Json(request) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    request
+        .check()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state
+        .queue
+        .sessions()
+        .set_window(&session, &request)
         .map_err(|e| ApiError::new(StatusCode::GONE, format!("{e:#}")))?;
     state.queue.wake();
     Ok(view_of(&state, &session))
 }
 
+#[derive(Debug, Deserialize)]
+struct ViewParams {
+    /// Seconds to hold the answer while the view matches `If-None-Match`.
+    #[serde(default)]
+    wait: Option<u64>,
+}
+
 async fn view(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<ViewParams>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
-    Ok(view_of(&state, &session))
+    let known = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Half the idle timeout at most, so a client that only polls is not reaped mid-poll.
+    let idle = state.queue.sessions().idle_timeout();
+    let wait = Duration::from_secs(params.wait.unwrap_or(0))
+        .min(MAX_WAIT)
+        .min(idle / 2);
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut changes = state.queue.sessions().subscribe();
+    loop {
+        changes.borrow_and_update();
+        let view = state.queue.view_of(&session);
+        let tag = etag(view.rev);
+        if known.as_deref() != Some(tag.as_str()) {
+            session.touch();
+            return Ok(([(header::ETAG, tag)], Json(view)).into_response());
+        }
+        if tokio::time::timeout_at(deadline, changes.changed())
+            .await
+            .is_err()
+        {
+            session.touch();
+            return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
+        }
+    }
 }
 
 async fn end(
@@ -291,16 +410,20 @@ async fn end(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// A range of track samples; both left out means the whole track.
 #[derive(Debug, Deserialize)]
 struct RangeParams {
-    from: usize,
-    to: usize,
+    #[serde(default)]
+    from: Option<usize>,
+    #[serde(default)]
+    to: Option<usize>,
 }
 
 /// Headers every range and piece carries.
-fn audio_response(
+pub(crate) fn audio_response(
     format: StemFormat,
-    bytes: Vec<u8>,
+    body: Body,
+    len: u64,
     from: usize,
     frames: usize,
     gain: f32,
@@ -308,7 +431,7 @@ fn audio_response(
 ) -> Response {
     let mut response = Response::builder()
         .header(header::CONTENT_TYPE, format.content_type())
-        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CONTENT_LENGTH, len)
         .header("x-stemd-from", from)
         .header("x-stemd-frames", frames)
         .header("x-stemd-gain", gain.to_string());
@@ -316,35 +439,89 @@ fn audio_response(
         response = response.header("x-stemd-clipped", clipped);
     }
     response
-        .body(Body::from(bytes))
+        .body(body)
         .expect("response builder inputs are valid")
 }
 
-/// Read `from..to` of `name` and encode it.
-fn encode_range(
+/// Open a stored whole file and give its length; one deleted since its lookup is `410`.
+pub(crate) async fn open_whole(whole: &Whole) -> Result<(tokio::fs::File, u64), ApiError> {
+    let path = whole.path.display();
+    let file = tokio::fs::File::open(&whole.path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            crate::separations::evicted()
+        } else {
+            ApiError::internal(format!("opening {path}: {e}"))
+        }
+    })?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| ApiError::internal(format!("reading {path}: {e}")))?
+        .len();
+    Ok((file, len))
+}
+
+/// Send a stored whole file as it is.
+pub(crate) async fn send_whole(
+    format: StemFormat,
+    gain: f32,
+    whole: Whole,
+) -> Result<Response, ApiError> {
+    let (file, len) = open_whole(&whole).await?;
+    Ok(audio_response(
+        format,
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        len,
+        0,
+        whole.meta.frames,
+        gain,
+        whole.meta.clipped,
+    ))
+}
+
+/// Encode `from..to` of `name` from memory or stored pieces; a whole-track read stores the file.
+pub(crate) fn encode_range(
+    sessions: &Sessions,
     session: &Session,
     name: &str,
     from: usize,
     to: usize,
 ) -> Result<Response, ApiError> {
-    let excerpt = session
-        .read(name, from, to)
-        .map_err(|e| ApiError::new(StatusCode::CONFLICT, format!("{e:#}")))?;
+    let in_memory = from >= to || session.track().ready_covers(&(from..to));
+    let (excerpt, gain) = if in_memory {
+        (session.read(name, from, to), session.gain)
+    } else {
+        (sessions.read_stored(session, name, from, to), 1.0)
+    };
+    let excerpt = excerpt.map_err(|e| ApiError::new(StatusCode::CONFLICT, format!("{e:#}")))?;
     let format = session.output.format;
-    let bytes = stemd_core::encode_stem(&excerpt.audio, format, session.gain)
+    let bytes = stemd_core::encode_stem(&excerpt.audio, format, gain)
         .map_err(|e| ApiError::internal(format!("encoding {name}: {e:#}")))?;
+    // Stored samples do not record clipping, so one at full scale counts as clipped.
     let clipped = (!format.has_headroom()).then(|| {
         excerpt
             .audio
             .data
             .iter()
             .flatten()
-            .filter(|v| (*v * session.gain).abs() > 1.0)
+            .filter(|v| {
+                let v = (*v * gain).abs();
+                if in_memory { v > 1.0 } else { v >= 1.0 }
+            })
             .count()
     });
+    if from == 0
+        && to == session.track().spec.frames
+        && let Err(err) =
+            sessions.consolidate(session, name, &bytes, excerpt.audio.frames(), clipped)
+    {
+        tracing::warn!(session = %session.id, "storing {name} whole: {err:#}");
+    }
+    let len = bytes.len() as u64;
     Ok(audio_response(
         format,
-        bytes,
+        Body::from(bytes),
+        len,
         excerpt.from,
         excerpt.audio.frames(),
         session.gain,
@@ -358,9 +535,27 @@ async fn stem(
     Query(range): Query<RangeParams>,
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
-    tokio::task::spawn_blocking(move || encode_range(&session, &name, range.from, range.to))
-        .await
-        .map_err(|e| ApiError::internal(format!("reading the range: {e}")))?
+    let frames = session.track().spec.frames;
+    let (from, to) = match (range.from, range.to) {
+        (None, None) => (0, frames),
+        (Some(from), Some(to)) => (from, to),
+        _ => {
+            return Err(ApiError::bad_request(
+                "send both from and to, or neither for the whole track",
+            ));
+        }
+    };
+    if from == 0
+        && to == frames
+        && let Some(whole) = state.queue.sessions().whole(&session, &name)
+    {
+        return send_whole(session.output.format, session.gain, whole).await;
+    }
+    tokio::task::spawn_blocking(move || {
+        encode_range(state.queue.sessions(), &session, &name, from, to)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading the range: {e}")))?
 }
 
 async fn piece(
@@ -368,6 +563,28 @@ async fn piece(
     Path((id, name, k)): Path<(String, String, usize)>,
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
+    if !served(&session.output).contains(&name.as_str()) {
+        return Err(ApiError::not_found());
+    }
+    // A stem stored whole: the client can fetch it in one read.
+    let whole = state
+        .queue
+        .sessions()
+        .whole(&session, &name)
+        .map(|_| format!("/v2/sessions/{id}/stems/{name}"));
+    let mut response = piece_of(state, session, name, k).await?;
+    if let Some(value) = whole.and_then(|url| url.parse().ok()) {
+        response.headers_mut().insert("x-stemd-whole", value);
+    }
+    Ok(response)
+}
+
+async fn piece_of(
+    state: Arc<AppState>,
+    session: Arc<Session>,
+    name: String,
+    k: usize,
+) -> Result<Response, ApiError> {
     let track = session.track();
     if k >= track.spec.grid.len() {
         return Err(ApiError::not_found());
@@ -381,31 +598,99 @@ async fn piece(
     let frames = output_index(samples.end, model, out) - from;
 
     // Stored: sent as it is. Otherwise encoded from what is ready in memory.
-    let stored = match (state.queue.sessions().pieces(), track.verified()) {
-        (Some(pieces), Some(track_id)) => pieces.lookup(
-            &track.model_id,
-            &type_dir(&session.output, session.gain),
-            &track_id,
-            &name,
-            k,
-            session.output.format.extension(),
-        ),
-        _ => None,
+    let stored = state
+        .queue
+        .sessions()
+        .track_dir(&session)
+        .and_then(|dir| Pieces::lookup(&dir, &name, k, session.output.format.extension()));
+    // A piece stored whole since the lookup is cut from the whole file below.
+    let bytes = match stored {
+        Some(path) => match tokio::fs::read(&path).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "reading {}: {e}",
+                    path.display()
+                )));
+            }
+        },
+        None => None,
     };
-    if let Some(path) = stored {
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| ApiError::internal(format!("reading {}: {e}", path.display())))?;
+    if let Some(bytes) = bytes {
+        let len = bytes.len() as u64;
         return Ok(audio_response(
             session.output.format,
-            bytes,
+            Body::from(bytes),
+            len,
             from,
             frames,
             session.gain,
             None,
         ));
     }
-    tokio::task::spawn_blocking(move || encode_range(&session, &name, samples.start, samples.end))
-        .await
-        .map_err(|e| ApiError::internal(format!("encoding the piece: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        encode_range(
+            state.queue.sessions(),
+            &session,
+            &name,
+            samples.start,
+            samples.end,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("encoding the piece: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+
+    use super::open_whole;
+    use crate::testkit::{call, state};
+    use crate::whole::{Meta, Whole};
+
+    #[tokio::test]
+    async fn a_whole_file_deleted_since_its_lookup_is_410() {
+        let whole = Whole {
+            path: std::env::temp_dir().join("stemd-no-such-stem.flac"),
+            meta: Meta {
+                frames: 1,
+                clipped: None,
+                header: 0,
+                block: 0,
+                offsets: Vec::new(),
+            },
+        };
+        let err = open_whole(&whole).await.expect_err("no such file");
+        assert_eq!(err.into_response().status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_window_is_a_400_with_a_json_error() {
+        let app = crate::api::router(state());
+        let opened = call(&app, Method::POST, "/v2/sessions?frames=30000", Vec::new()).await;
+        assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.json);
+        let uri = format!(
+            "/v2/sessions/{}/window",
+            opened.json["id"].as_str().unwrap()
+        );
+        for body in [
+            &b"not json"[..],
+            br#"{"regions": [{"at": "soon"}]}"#,
+            br#"{}"#,
+        ] {
+            let answer = call(&app, Method::PUT, &uri, body.to_vec()).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::BAD_REQUEST,
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+            assert!(answer.json["error"].is_string(), "{}", answer.json);
+        }
+        let fine = call(&app, Method::PUT, &uri, br#"{"regions": []}"#.to_vec()).await;
+        assert_eq!(fine.status, StatusCode::OK);
+    }
 }

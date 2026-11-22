@@ -62,7 +62,7 @@ Linux.
 start on the part under the needle before the whole track is done.
 - One job queue and one cache for drops and clients. A track separated once is
 a cache hit the next time, from a drop or a client.
-- `model_id` in `/v1/health` names the exact weights and settings behind the
+- `model_id` in `/v2/health` names the exact weights and settings behind the
 stems, so a client can key its own stem cache on it.
 - The server switch in the status bar turns the API off without closing the
 app.

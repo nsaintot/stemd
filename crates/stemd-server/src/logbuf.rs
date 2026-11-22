@@ -1,6 +1,6 @@
 //! In-memory ring buffer of recent log lines.
 //!
-//! Exposed at `GET /v1/logs` so a headless server is still debuggable, and so
+//! Exposed at `GET /v2/logs` so a headless server is still debuggable, and so
 //! the optional desktop window is a thin client over the same buffer rather
 //! than a second logging path.
 
@@ -33,7 +33,7 @@ pub struct LogBuffer {
 /// Lines held in memory, and the most the window asks for.
 ///
 /// One constant because the two must agree: a window showing fewer than the
-/// buffer holds would hide lines that `GET /v1/logs` still serves.
+/// buffer holds would hide lines that `GET /v2/logs` still serves.
 pub const CAPACITY: usize = 2000;
 
 impl LogBuffer {
@@ -61,7 +61,7 @@ impl LogBuffer {
 
     /// Drop everything buffered. Returns how many lines went.
     ///
-    /// This is the buffer `GET /v1/logs` reads, so clearing it in the window
+    /// This is the buffer `GET /v2/logs` reads, so clearing it in the window
     /// clears it for a client too. That is the right behaviour for what it is:
     /// a shared tail of what just happened, not a record, but it does mean the
     /// button is not local to the window.

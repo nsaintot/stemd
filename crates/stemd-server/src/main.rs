@@ -29,6 +29,7 @@ mod panics;
 mod pieces;
 mod precision;
 mod queue;
+mod separations;
 mod serve;
 mod serving;
 mod session_api;
@@ -42,6 +43,7 @@ mod testkit;
 mod ui;
 mod update;
 mod v1;
+mod whole;
 
 use anyhow::Result;
 use tracing_subscriber::Layer;
@@ -148,7 +150,7 @@ fn adopt_parent_console() {
 fn adopt_parent_console() {}
 
 /// Install the tracing subscriber, returning the buffer the window and
-/// `GET /v1/logs` both read from.
+/// `GET /v2/logs` both read from.
 ///
 /// Four levels:
 ///

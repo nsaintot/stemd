@@ -36,6 +36,8 @@ pub struct JobRow {
     pub progress: Progress,
     /// Seconds left, once there is an estimate. Only a job separating has one.
     pub left: Option<f64>,
+    /// A protocol 1 client waits on it.
+    pub protocol_1: bool,
 }
 
 /// What the list shows, read from the server state at most once per refresh.
@@ -53,14 +55,16 @@ impl Snapshot {
     /// the window's clock.
     pub fn read(state: &AppState, eta: &mut Eta, now: f64) -> Self {
         let queue = &state.queue;
+        let segment_secs = queue.segment_run_seconds();
         let jobs = queue
             .client_jobs()
             .into_iter()
             .map(|client| JobRow {
                 number: client.number,
+                protocol_1: client.protocol_1,
                 left: client
                     .running
-                    .then(|| eta.update(client.number, now, &client.progress))
+                    .then(|| eta.update(client.number, now, &client.progress, segment_secs))
                     .flatten(),
                 progress: client.progress,
             })
@@ -105,12 +109,12 @@ pub fn length(frames: usize, sample_rate: u32) -> String {
 
 /// Session segments waiting, for the right of the heading; empty when none.
 pub fn queue_text(snapshot: &Snapshot) -> String {
-    let critical: usize = snapshot.sessions.iter().map(|s| s.critical).sum();
-    let bonus: usize = snapshot.sessions.iter().map(|s| s.bonus).sum();
-    if critical + bonus == 0 {
+    let high: usize = snapshot.sessions.iter().map(|s| s.high).sum();
+    let normal: usize = snapshot.sessions.iter().map(|s| s.normal).sum();
+    if high + normal == 0 {
         return String::new();
     }
-    format!("{critical} critical, {bonus} bonus")
+    format!("{high} high, {normal} normal")
 }
 
 /// What a session is doing, which picks its glyph.
@@ -126,7 +130,7 @@ pub enum SessionState {
 }
 
 pub fn session_state(session: &Activity) -> SessionState {
-    let planned = session.critical + session.bonus > 0;
+    let planned = session.high + session.normal > 0;
     if session.runnable {
         SessionState::Separating
     } else if planned && session.arrived < session.frames {
@@ -159,13 +163,13 @@ fn session_tooltip(session: &Activity) -> String {
     format!(
         "Uploaded: {}\n\
          Ready: {} of {} pieces, {}\n\
-         Waiting: {} critical, {} bonus",
+         Waiting: {} high, {} normal",
         percent(session.arrived as f32 / session.frames.max(1) as f32),
         session.ready,
         session.pieces,
         percent(session.covered as f32 / session.frames.max(1) as f32),
-        session.critical,
-        session.bonus,
+        session.high,
+        session.normal,
     )
 }
 
@@ -279,7 +283,7 @@ fn row(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, item: &Row, firs
     let (title, length, detail, fill, tooltip) = match item {
         Row::Job(job) => (
             format!("Job {}", job.number),
-            None,
+            job.protocol_1.then(|| "protocol 1".to_owned()),
             job_detail(&job.progress, job.left),
             (!queued(job)).then(|| {
                 let id = egui::Id::new(("client-fill", "job", job.number));
@@ -404,8 +408,8 @@ mod tests {
             ready: 20,
             arrived: 441_000,
             covered: 220_500,
-            critical: 3,
-            bonus: 5,
+            high: 3,
+            normal: 5,
             runnable: true,
         }
     }
@@ -422,8 +426,8 @@ mod tests {
         assert_eq!(session_detail(&uploading), "uploading 25% · 20/40 pieces");
         let idle = Activity {
             runnable: false,
-            critical: 0,
-            bonus: 0,
+            high: 0,
+            normal: 0,
             ..session()
         };
         assert_eq!(session_state(&idle), SessionState::Idle);
@@ -462,7 +466,7 @@ mod tests {
             sessions: vec![session(), session()],
             ..Snapshot::default()
         };
-        assert_eq!(queue_text(&busy), "6 critical, 10 bonus");
+        assert_eq!(queue_text(&busy), "6 high, 10 normal");
     }
 
     #[test]
