@@ -404,15 +404,9 @@ fn load(path: &Path) -> Option<(String, Arc<Fir>, SystemTime)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn dir() -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "stemd-filters-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
+    fn dir() -> crate::scratch::Dir {
+        crate::scratch::Dir::new("filters")
     }
 
     /// A valid 44.1 to 96 kHz file, distinct for each `seed`.
@@ -428,20 +422,21 @@ mod tests {
         let body = file(0);
         let id = id_of(&body);
         {
-            let filters = Filters::open(dir.clone(), 4).unwrap();
+            let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
             let (fir, created) = filters.put(&id, &body).unwrap();
             assert!(created);
             assert_eq!(fir.poly.taps(), 1280);
             let (_, again) = filters.put(&id, &body).unwrap();
             assert!(!again, "a second upload is a no-op");
         }
-        let filters = Filters::open(dir, 4).unwrap();
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         assert_eq!(filters.get(&id).unwrap().id, id);
     }
 
     #[test]
     fn the_id_must_be_the_hash_of_the_body() {
-        let filters = Filters::open(dir(), 4).unwrap();
+        let dir = dir();
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         let body = file(0);
         let other = id_of(&file(1));
         assert!(matches!(
@@ -461,7 +456,8 @@ mod tests {
 
     #[test]
     fn a_malformed_file_is_refused_with_the_reason() {
-        let filters = Filters::open(dir(), 4).unwrap();
+        let dir = dir();
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         let cases: [(Vec<u8>, &str); 4] = [
             (b"nope".to_vec(), "SFIR"),
             (encode(44_100, 96_000, &[0.0; 319]), "multiple of 320"),
@@ -484,7 +480,7 @@ mod tests {
     #[test]
     fn past_the_cap_the_least_recently_used_goes() {
         let dir = dir();
-        let filters = Filters::open(dir.clone(), 2).unwrap();
+        let filters = Filters::open(dir.to_path_buf(), 2).unwrap();
         let ids: Vec<String> = (0..3).map(|s| id_of(&file(s))).collect();
         filters.put(&ids[0], &file(0)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -502,7 +498,7 @@ mod tests {
 
         // The order is on disk, so a restart with a smaller cap keeps the newest.
         drop(filters);
-        let filters = Filters::open(dir, 1).unwrap();
+        let filters = Filters::open(dir.to_path_buf(), 1).unwrap();
         assert!(filters.peek(&ids[2]).is_some());
         assert_eq!(filters.len(), 1);
     }
@@ -515,7 +511,7 @@ mod tests {
         let wrong = id_of(&file(1));
         std::fs::write(dir.join(format!("{wrong}.fir")), &body).unwrap();
         std::fs::write(dir.join("stray.txt"), b"x").unwrap();
-        let filters = Filters::open(dir.clone(), 4).unwrap();
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         assert_eq!(filters.len(), 0);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
@@ -528,7 +524,8 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let body = encode(44_100, 96_000, &taps);
-        let filters = Filters::open(dir(), 4).unwrap();
+        let dir = dir();
+        let filters = Filters::open(dir.to_path_buf(), 4).unwrap();
         let (fir, _) = filters.put(&id_of(&body), &body).unwrap();
 
         let plane: Vec<f32> = (0..4410)

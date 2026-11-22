@@ -48,7 +48,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v2/jobs/{id}/join", post(join_job))
         .route("/v2/jobs/{id}/stems/{name}", get(get_stem))
         .route("/v2/logs", get(get_logs))
-        .route("/v2/filters/{id}", put(put_filter))
+        .route(
+            "/v2/filters/{id}",
+            put(put_filter).layer(axum::extract::DefaultBodyLimit::max(
+                crate::filters::MAX_FILE_BYTES,
+            )),
+        )
         .route("/v2/filters/{id}", get(get_filter))
         .merge(crate::session_api::routes())
         .merge(crate::separations::routes())

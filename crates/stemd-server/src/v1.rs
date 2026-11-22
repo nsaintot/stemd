@@ -194,12 +194,7 @@ fn result_of(id: &str, result: crate::jobs::JobResult, entry: Option<&Entry>) ->
         model_residual_db: result.model_residual_db.unwrap_or(FLOOR_DB),
         derived_stem: result.output.derived,
         separation_secs: result.separation_secs,
-        // JSON has no infinity, and 0.2.0 clients need a number.
-        realtime_factor: if result.realtime_factor.is_finite() {
-            result.realtime_factor
-        } else {
-            0.0
-        },
+        realtime_factor: result.realtime_factor,
         cached: result.cached,
     }
 }

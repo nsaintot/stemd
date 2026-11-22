@@ -62,6 +62,8 @@ pub struct Excerpt {
 
 struct SessionState {
     plan: VecDeque<(usize, Rank)>,
+    /// The client's last window, planned again when the session moves onto another track.
+    window: Option<WindowRequest>,
     /// When the worker last took one of this session's segments.
     last_served: Option<Instant>,
     last_seen: Instant,
@@ -106,6 +108,7 @@ impl Session {
             file: Mutex::new(None),
             state: Mutex::new(SessionState {
                 plan: VecDeque::new(),
+                window: None,
                 last_served: None,
                 last_seen: now,
                 closed: None,
@@ -183,16 +186,33 @@ impl Session {
     /// Replace the plan with the segments `request` asks for, minus those that have run.
     pub fn set_window(&self, request: &WindowRequest) -> Result<()> {
         self.ensure_open()?;
+        let planned = self.plan_for(request);
+        let mut state = self.state.lock();
+        state.last_seen = Instant::now();
+        state.plan = planned;
+        state.window = Some(request.clone());
+        Ok(())
+    }
+
+    /// Plan the last window again on the track this session plays now.
+    fn replan(&self) {
+        let Some(request) = self.state.lock().window.clone() else {
+            return;
+        };
+        let planned = self.plan_for(&request);
+        let mut state = self.state.lock();
+        if state.closed.is_none() {
+            state.plan = planned;
+        }
+    }
+
+    /// The segments `request` asks for, minus those that have run.
+    fn plan_for(&self, request: &WindowRequest) -> VecDeque<(usize, Rank)> {
         let track = self.track();
-        let planned: VecDeque<(usize, Rank)> = plan(&track.spec.grid, request)
+        plan(&track.spec.grid, request)
             .into_iter()
             .filter(|(k, _)| !track.is_done(*k) && !self.covered(*k))
-            .collect();
-        let mut state = self.state.lock();
-        let now = Instant::now();
-        state.last_seen = now;
-        state.plan = planned;
-        Ok(())
+            .collect()
     }
 
     /// The best runnable segment of `class`, its rank, and when this session was last served.
@@ -648,10 +668,20 @@ impl Sessions {
 
     /// File `track`, whose whole upload hashed to `id`, under that id.
     ///
-    /// When another open track already holds the same audio and parts, every
     /// When another open track already holds the same audio and parts, every session on `track`
-    /// moves onto that track and `track` closes. Returns the track the sessions play now.
+    /// moves onto that track, plans its window again there, and `track` closes. Returns the track
+    /// the sessions play now.
     pub fn settle(&self, track: &Arc<Track>, id: &str) -> Arc<Track> {
+        let (existing, moved) = self.merge(track, id);
+        for session in moved {
+            session.replan();
+        }
+        existing
+    }
+
+    /// File `track` under `id`, or move its sessions onto the open track with that id and return
+    /// them.
+    fn merge(&self, track: &Arc<Track>, id: &str) -> (Arc<Track>, Vec<Arc<Session>>) {
         let key = format!("{id}-{}", track.spec.parts);
         let sessions = self.sessions.lock();
         let mut tracks = self.tracks.lock();
@@ -663,18 +693,20 @@ impl Sessions {
             .cloned();
         let Some(existing) = existing else {
             by_id.insert(key, track.uid);
-            return Arc::clone(track);
+            return (Arc::clone(track), Vec::new());
         };
+        let mut moved = Vec::new();
         for session in sessions.values() {
             let mut held = session.track.lock();
             if held.uid == track.uid {
                 *held = Arc::clone(&existing);
+                moved.push(Arc::clone(session));
             }
         }
         track.close(format!("merged into the open track {id}"));
         tracks.remove(&track.uid);
         tracing::info!("track {id}: a second session joined the one already open");
-        existing
+        (existing, moved)
     }
 
     /// Every open session, as the window shows it, in the order they opened.
@@ -786,7 +818,10 @@ impl Sessions {
             let keep = closed.is_none() && !session.idle(now, timeout);
             if !keep {
                 session.close("idle");
-                tracing::info!(session = %id, "ended after {:.0?} idle", timeout);
+                match &closed {
+                    Some(reason) => tracing::info!(session = %id, "ended: {reason}"),
+                    None => tracing::info!(session = %id, "ended after {:.0?} idle", timeout),
+                }
                 reaped.push((session.number, closed.unwrap_or_else(|| "idle".to_owned())));
             }
             keep

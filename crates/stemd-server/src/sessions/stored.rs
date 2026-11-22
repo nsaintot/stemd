@@ -44,7 +44,7 @@ impl Sessions {
         };
         let cache = &self.cache;
         // Pieces are only a cache: on a nearly full disk, skip them and let the job go on.
-        if crate::disk::low(cache.root()) {
+        if cache.disk_low() {
             tracing::debug!(track = %id, "disk nearly full, not writing pieces");
             return;
         }
@@ -291,7 +291,7 @@ impl Sessions {
             return Ok(());
         };
         let cache = &self.cache;
-        if crate::disk::low(cache.root()) {
+        if cache.disk_low() {
             return Ok(());
         }
         let task = Consolidation::new(dir, &session.output, TrackInfo::from(&track.spec));

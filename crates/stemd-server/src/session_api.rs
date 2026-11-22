@@ -165,6 +165,7 @@ async fn open(
     if let Some(key) = &params.file {
         crate::stem_http::check_file_key(key)?;
     }
+    let norm = parse_levels(&params)?;
     let (frames, stored) = match &params.track {
         Some(id)
             if state
@@ -197,7 +198,6 @@ async fn open(
         ));
     }
     let grid = session_grid(&state, &info, frames)?;
-    let norm = parse_levels(&params)?;
     let spec = TrackSpec {
         frames,
         channels: params.channels,
@@ -298,6 +298,9 @@ fn session_grid(
     Ok(grid)
 }
 
+/// The highest `peak` a session accepts. A larger peak gives a gain that stores near-silence.
+const MAX_PEAK: f32 = 16.0;
+
 /// The client's normalisation from `mean` and `std`, after checking those and `peak`.
 fn parse_levels(params: &OpenParams) -> Result<Option<Normalisation>, ApiError> {
     let norm = match (params.mean, params.std) {
@@ -311,10 +314,10 @@ fn parse_levels(params: &OpenParams) -> Result<Option<Normalisation>, ApiError> 
             ));
         }
     };
-    if params.peak.is_some_and(|p| !p.is_finite() || p < 0.0) {
-        return Err(ApiError::bad_request(
-            "peak must be a finite number, at least 0",
-        ));
+    if params.peak.is_some_and(|p| !(0.0..=MAX_PEAK).contains(&p)) {
+        return Err(ApiError::bad_request(format!(
+            "peak must be a number from 0 to {MAX_PEAK}"
+        )));
     }
     Ok(norm)
 }
@@ -404,8 +407,6 @@ async fn join(
         JoinError::TooMany(e) => ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")),
         JoinError::Gone => unknown_track(id),
     })?;
-    session.set_file(params.file.clone());
-    sessions.record_file(&session, id);
     tracing::info!(session = %session.id, "joined track {id}");
     state.queue.wake();
     Ok((StatusCode::CREATED, view_of(state, &session)).into_response())

@@ -38,7 +38,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -112,6 +112,9 @@ pub type InUse = Box<dyn Fn() -> HashSet<String> + Send + Sync>;
 
 /// True when background consolidation may use the CPU now.
 pub type Gate = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Reads the free bytes on the cache's volume, `None` when unknown.
+pub type FreeProbe = Box<dyn Fn() -> Option<u64> + Send + Sync>;
 
 /// The file in each track directory that holds its [`TrackInfo`].
 const INFO: &str = "track.json";
@@ -190,9 +193,48 @@ pub struct Cache {
     converting: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Numbers staged files so two writers never share one.
     staged: AtomicU64,
+    /// Set once eviction has warned that in-use tracks keep the cache over budget.
+    warned_kept: AtomicBool,
+    /// Reads the free bytes on the cache's volume; [`crate::disk::free_bytes`] unless a test sets
+    /// one.
+    free: Mutex<Option<FreeProbe>>,
+    /// Test directories deleted when the cache is dropped.
+    #[cfg(test)]
+    scratch: Mutex<Vec<crate::scratch::Dir>>,
 }
 
 impl Cache {
+    /// Read the free space through `probe` from now on.
+    #[cfg(test)]
+    pub fn set_free_probe(&self, probe: FreeProbe) {
+        *self.free.lock() = Some(probe);
+    }
+
+    /// Bytes free on the cache's volume, or `None` when they cannot be read.
+    pub fn free_bytes(&self) -> Option<u64> {
+        match self.free.lock().as_ref() {
+            Some(probe) => probe(),
+            None => crate::disk::free_bytes(&self.root),
+        }
+    }
+
+    /// True when the cache's volume has less than [`crate::disk::FLOOR`] free.
+    pub fn disk_low(&self) -> bool {
+        self.free_bytes()
+            .is_some_and(|free| free < crate::disk::FLOOR)
+    }
+
+    /// Fail unless the cache's volume keeps [`crate::disk::FLOOR`] free.
+    pub fn ensure_room(&self) -> Result<(), crate::disk::DiskFull> {
+        crate::disk::check_room(self.free_bytes(), 0)
+    }
+
+    /// Delete `dir` when the cache is dropped.
+    #[cfg(test)]
+    pub fn keep(&self, dir: crate::scratch::Dir) {
+        self.scratch.lock().push(dir);
+    }
+
     /// Open `root` with a budget of `max_bytes` and the default ages.
     #[cfg(test)]
     pub fn open(root: PathBuf, max_bytes: u64) -> Result<Arc<Self>> {
@@ -228,6 +270,10 @@ impl Cache {
             failed: Mutex::new(HashMap::new()),
             converting: Mutex::new(HashMap::new()),
             staged: AtomicU64::new(0),
+            warned_kept: AtomicBool::new(false),
+            free: Mutex::new(None),
+            #[cfg(test)]
+            scratch: Mutex::new(Vec::new()),
         });
         cache.clean();
         Ok(cache)
@@ -411,13 +457,14 @@ impl Cache {
     }
 
     /// The cache root.
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Write a piece file.
     fn write_in(&self, dir: &Path, k: usize, extension: &str, bytes: &[u8]) -> Result<()> {
-        crate::disk::ensure_room(&self.root)?;
+        self.ensure_room()?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         self.publish_counted(&dir.join(file(k, extension)), bytes)
     }

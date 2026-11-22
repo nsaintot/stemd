@@ -129,7 +129,7 @@ pub(crate) async fn submit(
             );
             return Ok((StatusCode::ACCEPTED, existing));
         }
-        Ok(job) => job,
+        Ok(job) => crate::jobs::Claimed::new(job),
     };
 
     if let Some(entry) = cached_result(
@@ -140,11 +140,13 @@ pub(crate) async fn submit(
     )
     .await
     {
+        let job = job.disarm();
         tracing::debug!(job = %job.id, "serving track {id} from the cache");
         job.complete(entry, true);
         return Ok((StatusCode::OK, job));
     }
 
+    let job = job.disarm();
     enqueue(state, &job, mix, submission)?;
     Ok((StatusCode::ACCEPTED, job))
 }

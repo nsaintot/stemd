@@ -131,7 +131,7 @@ the stems a session stored, and a session finds the stems a job stored.
 | Rule | Default |
 | --- | --- |
 | A track in use is never deleted. | |
-| A partial track unused for `--partial-max-hours` is deleted. | 24 |
+| A partial track unused for `--partial-max-hours` is deleted; `0` keeps partial tracks forever. | 24 |
 | A whole track unused for `--whole-max-days` is deleted; `0` keeps whole tracks forever. | 30 |
 | When the cache exceeds `--cache-max-gb`, or the free disk space minus 2 GB, partial tracks are deleted first, oldest first, then whole tracks, least recently used first. | 8 |
 
@@ -435,7 +435,7 @@ POST /v2/sessions?frames=13230000&format=f32le&output_format=flac
 | `sample_rate`, `channels`, `format` | The format of the upload. The rate and channel count must match the model's. |
 | output parameters | The same as for jobs, except that `mp3` is refused. |
 | `mean`, `std` | Optional; send both or neither. See [Upload methods](#upload-methods) and [Track statistics](#track-statistics). |
-| `peak` | Optional. It sets the session's gain; see [Gain](#gain). |
+| `peak` | Optional, from 0 to 16. It sets the session's gain; see [Gain](#gain). A join checks it too. |
 
 The body is optional audio starting at sample 0; it must be empty when joining
 an `open` track.

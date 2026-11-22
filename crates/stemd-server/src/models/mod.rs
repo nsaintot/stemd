@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn completeness_needs_every_file() {
-        let dir = crate::scratch::dir("models");
+        let dir = crate::scratch::Dir::new("models");
         // Take the name from the preset, so retiring or renaming a preset updates this test.
         let source = Preset::Fast.source();
 

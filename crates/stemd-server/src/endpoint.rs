@@ -129,10 +129,15 @@ mod tests {
         let (endpoint, mut moves) = Endpoint::new(first.local_addr().unwrap(), Some(1));
         assert_eq!(endpoint.taken(), Some(1));
 
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-        endpoint.move_to(port).expect("a free port");
+        // Another process can take the port between the probe and the move, so try a few.
+        let port = (0..10)
+            .find_map(|_| {
+                let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = free.local_addr().unwrap().port();
+                drop(free);
+                endpoint.move_to(port).is_ok().then_some(port)
+            })
+            .expect("a free port");
         assert_eq!(endpoint.port(), port);
         assert_eq!(endpoint.taken(), None, "a move clears the launch fallback");
         let moved = moves.try_recv().expect("the listener was handed over");

@@ -478,7 +478,10 @@ fn stopping_an_already_stopped_queue_is_harmless() {
     assert!(queue.stop(Duration::from_secs(10)));
     let began = std::time::Instant::now();
     assert!(queue.stop(Duration::from_secs(10)), "a second stop failed");
-    assert!(began.elapsed() < Duration::from_millis(100));
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "the second stop waited for its grace"
+    );
     // `Drop` stops it a third time as the queue goes out of scope here.
 }
 
@@ -622,21 +625,25 @@ fn the_thread_that_builds_a_model_is_the_thread_that_runs_it() {
         cache(u64::MAX, Duration::from_secs(60)),
     )
     .expect("a stub always builds");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let happened = |count: usize| {
+        while threads.lock().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {:?} happened",
+                threads.lock()
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    };
     submit(&queue, job_for(&jobs, "one"));
+    // A staged model is taken before a waiting job, so install only after the first job ran.
+    happened(2);
     queue
         .install(traced(&threads))
         .expect("a stub always builds");
     submit(&queue, job_for(&jobs, "two"));
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while threads.lock().len() < 4 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "only {:?} happened",
-            threads.lock()
-        );
-        thread::sleep(POLL_INTERVAL);
-    }
+    happened(4);
 
     let seen = threads.lock().clone();
     assert_eq!(

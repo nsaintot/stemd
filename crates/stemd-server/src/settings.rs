@@ -108,19 +108,24 @@ impl std::fmt::Display for DropParts {
 }
 
 /// `secs` as a Duration, at least zero and at most `Duration::MAX`.
-pub fn saturating_secs(secs: f64) -> Duration {
+fn saturating_secs(secs: f64) -> Duration {
     Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::MAX)
+}
+
+/// A maximum age of `secs`, where 0 or less means no limit.
+pub fn age(secs: f64) -> Duration {
+    if secs > 0.0 {
+        saturating_secs(secs)
+    } else {
+        Duration::MAX
+    }
 }
 
 impl Settings {
     /// The cache's byte cap, and how long it keeps a whole track unused.
     pub fn cache_limits(&self) -> (u64, Duration) {
         let max_bytes = (self.cache_max_gb.max(0.0) * 1e9) as u64;
-        let whole_max_age = if self.whole_max_days > 0.0 {
-            saturating_secs(self.whole_max_days * 86400.0)
-        } else {
-            Duration::MAX
-        };
+        let whole_max_age = age(self.whole_max_days * 86400.0);
         (max_bytes, whole_max_age)
     }
 
@@ -516,16 +521,11 @@ fn save(path: &Path, settings: &Settings) -> Result<()> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn scratch() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "stemd-settings-{}-{}/settings.json",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
+    /// A settings path in a fresh directory, which lives as long as the guard.
+    fn scratch() -> (crate::scratch::Dir, PathBuf) {
+        let dir = crate::scratch::Dir::new("settings");
+        let path = dir.join("settings.json");
+        (dir, path)
     }
 
     #[test]
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn drop_parts_survive_a_relaunch_and_a_bad_list_is_ignored() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_drop_parts(DropParts::parse("bass,other,vocals,drums").unwrap());
         assert_eq!(
@@ -561,13 +561,14 @@ mod tests {
 
     #[test]
     fn a_first_run_has_no_file_and_gets_the_defaults() {
-        let file = SettingsFile::open(scratch());
+        let (_dir, path) = scratch();
+        let file = SettingsFile::open(path);
         assert_eq!(file.get(), Settings::default());
     }
 
     #[test]
     fn what_the_window_changes_is_what_the_next_launch_reads() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_preset(Preset::Balanced);
         file.set_rate(OutputRate::Hz96000);
@@ -583,7 +584,7 @@ mod tests {
     /// flag can name either half of the pair. Every route ends with a valid pair.
     #[test]
     fn a_format_and_a_rate_that_cannot_go_together_are_reconciled() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_rate(OutputRate::Hz96000);
         file.set_format(StemFormat::Mp3);
@@ -597,7 +598,7 @@ mod tests {
     /// without writing the correction to the file.
     #[test]
     fn a_flag_cannot_pin_a_pair_that_does_not_exist() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         SettingsFile::open(path.clone()).set_rate(OutputRate::Hz96000);
 
         let pinned = SettingsFile::open(path.clone()).pin(Some(StemFormat::Mp3), None);
@@ -614,7 +615,7 @@ mod tests {
     /// offers next time.
     #[test]
     fn a_flag_overrides_the_file_without_rewriting_it() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         SettingsFile::open(path.clone()).set_rate(OutputRate::Hz48000);
 
         let run = SettingsFile::open(path.clone()).pin(Some(StemFormat::Pcm32), None);
@@ -638,7 +639,7 @@ mod tests {
 
     #[test]
     fn the_cache_settings_persist_and_a_flag_pins_them_for_one_run() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_cache_max_gb(16.0);
         file.set_whole_max_days(0.0);
@@ -669,7 +670,7 @@ mod tests {
 
     #[test]
     fn the_port_and_the_track_length_persist_and_a_flag_pins_them_for_one_run() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_port(8421);
         file.set_max_track_minutes(0.0);
@@ -701,7 +702,7 @@ mod tests {
     /// The file is editable by hand, so it uses the same names as the flags and the API.
     #[test]
     fn the_file_spells_settings_the_way_the_flags_do() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         let file = SettingsFile::open(path.clone());
         file.set_preset(Preset::Balanced);
         file.set_rate(OutputRate::Hz48000);
@@ -729,7 +730,7 @@ mod tests {
             r#"{"output_sample_rate": "44100"}"#,
             r#"{"unknown_key": 1}"#,
         ] {
-            let path = scratch();
+            let (_dir, path) = scratch();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, content).unwrap();
             assert_eq!(
@@ -743,7 +744,7 @@ mod tests {
     /// One unreadable field does not discard the fields beside it.
     #[test]
     fn a_bad_field_costs_that_field_and_no_others() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
@@ -765,7 +766,7 @@ mod tests {
     #[test]
     fn every_preset_the_window_offers_round_trips_through_the_file() {
         for preset in Preset::ALL {
-            let path = scratch();
+            let (_dir, path) = scratch();
             SettingsFile::open(path.clone()).set_preset(preset);
             assert_eq!(SettingsFile::open(path).get().preset, preset);
         }
@@ -775,7 +776,7 @@ mod tests {
     fn every_rate_and_format_round_trips_through_the_file() {
         for rate in OutputRate::ALL {
             for format in [StemFormat::Flac, StemFormat::Pcm16, StemFormat::Pcm32] {
-                let path = scratch();
+                let (_dir, path) = scratch();
                 let file = SettingsFile::open(path.clone());
                 file.set_rate(rate);
                 file.set_format(format);
@@ -788,7 +789,7 @@ mod tests {
     /// An interrupted write cannot leave the real file truncated.
     #[test]
     fn a_write_never_exposes_a_half_written_file() {
-        let path = scratch();
+        let (_dir, path) = scratch();
         SettingsFile::open(path.clone()).set_rate(OutputRate::Hz48000);
 
         let staging = path.with_extension("json.new");

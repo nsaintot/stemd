@@ -155,7 +155,7 @@ fn run_segment(
 fn trim_after_job(cache: &Cache) {
     let held = stemd_core::memory::cached();
     let ceiling = crate::disk::physical_memory().map_or(8 << 30, |ram| ram / 2);
-    let short = crate::disk::memory_pressure() || crate::disk::low(cache.root());
+    let short = crate::disk::memory_pressure() || cache.disk_low();
     if held as u64 > ceiling || (short && held > 0) {
         let freed = stemd_core::memory::release();
         tracing::info!(

@@ -146,8 +146,8 @@ fn describe(dir: &Path, bad: &[&'static str]) -> String {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        crate::scratch::dir(tag)
+    fn scratch(tag: &str) -> crate::scratch::Dir {
+        crate::scratch::Dir::new(tag)
     }
 
     #[test]

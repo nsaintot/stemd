@@ -33,7 +33,7 @@ fn free_space(ctx: &egui::Context, state: &AppState) -> Option<u64> {
     {
         return free;
     }
-    let free = crate::disk::free_bytes(state.cache.root());
+    let free = state.cache.free_bytes();
     ctx.data_mut(|d| d.insert_temp(id, (now, free)));
     free
 }

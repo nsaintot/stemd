@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn streaming_hashes_and_counts_what_it_wrote() {
-        let dir = crate::scratch::dir("stream");
+        let dir = crate::scratch::Dir::new("stream");
         let path = dir.join("out");
 
         let (digest, written) = stream_to_file(&b"abc"[..], &path, |_| {}).unwrap();
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn progress_is_reported_at_most_once_per_step() {
-        let dir = crate::scratch::dir("progress");
+        let dir = crate::scratch::Dir::new("progress");
 
         let payload = vec![0u8; (PROGRESS_STEP * 2) as usize + 1];
         let mut seen = Vec::new();

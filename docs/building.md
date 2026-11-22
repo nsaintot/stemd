@@ -311,7 +311,7 @@ default model instead of failing the launch.
 | `--full-precision` | off | runs the model at float32, 1.3x slower |
 | `--cache-dir` | user cache directory | kept across restarts; the alias is `--pieces-dir` |
 | `--cache-max-gb` | saved, else `8` | 8 GB holds about 200 six-minute tracks as 44.1 kHz flac; the alias is `--pieces-max-gb` |
-| `--partial-max-hours` | `24` | how long a track with a stem still in pieces is kept unused |
+| `--partial-max-hours` | `24` | how long a track with a stem still in pieces is kept unused; `0` keeps it until the cache is full |
 | `--whole-max-days` | saved, else `30` | how long a track with every stem whole is kept unused; `0` keeps it until the cache is full |
 | `--ephemeral` | off | empties the cache at start and at quit |
 | `--unfetched-ttl` | `300` | seconds a job result is held for its client |
