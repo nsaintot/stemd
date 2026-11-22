@@ -12,7 +12,7 @@ use crate::pcm::Audio;
 
 /// Added to the mixture's standard deviation before inverting it, so silence
 /// does not divide by zero.
-pub const STD_FLOOR: f32 = 1e-8;
+pub(crate) const STD_FLOOR: f32 = 1e-8;
 
 /// The loudness normalisation demucs applies to the whole track and undoes at
 /// the end.
@@ -60,7 +60,7 @@ impl Normalisation {
 /// Summing `bass` and `other` before the wire rather than after is what keeps
 /// the transfer at two stems. `names` is the source order the model produces,
 /// which is what makes this independent of any one backend's manifest.
-pub fn fold_into_shipped(
+pub(crate) fn fold_into_shipped(
     sources: &[Audio],
     names: &[String],
 ) -> Result<Vec<(&'static str, Audio)>> {

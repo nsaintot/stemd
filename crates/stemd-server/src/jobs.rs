@@ -31,7 +31,7 @@ pub struct StemFile {
 /// What a completed job hands back: the stems, and how to read them.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobResult {
-    pub output: crate::separations::OutputView,
+    pub output: crate::output::OutputView,
     pub channels: usize,
     /// Samples per channel, at the output rate.
     pub frames: usize,
@@ -55,7 +55,7 @@ impl JobResult {
     /// decks sharing one entry each poll their own id.
     pub fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
         Self {
-            output: crate::separations::OutputView::of(&entry.output, None),
+            output: crate::output::OutputView::of(&entry.output, None),
             channels: entry.channels,
             frames: entry.frames,
             stems: entry
@@ -400,6 +400,16 @@ pub struct Entry {
     state: Mutex<State>,
 }
 
+impl crate::cache::Hold for Entry {
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn held(&self, unfetched_ttl: Duration) -> bool {
+        Entry::held(self, unfetched_ttl)
+    }
+}
+
 impl Entry {
     /// The stems `output` serves from `dir`, every one stored whole at `gain`.
     pub fn stored(
@@ -412,7 +422,7 @@ impl Entry {
         let extension = output.format.extension();
         let mut stems = Vec::new();
         let mut frames = 0;
-        for name in crate::sessions::served(output) {
+        for name in output.served() {
             let whole = crate::whole::find(dir, name, extension)?;
             frames = whole.meta.frames;
             stems.push(CachedStem {

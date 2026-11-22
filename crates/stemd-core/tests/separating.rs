@@ -10,17 +10,17 @@
 //!
 //! `STEMD_AB_PCM` is raw interleaved stereo 16-bit PCM at 44.1 kHz: the body of a
 //! WAV with its header removed, and one of the two formats the server already
-//! accepts, so this needs no decoder of its own.
+//! accepts, so this needs no decoder of its own. The hybrid tests also need
+//! `--features research`.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[cfg(feature = "research")]
 use stemd_core::stems::remainder;
-
-use stemd_core::{
-    Audio, HybridConfig, HybridSeparator, MlxConfig, MlxSeparator, Parts, PcmFormat, Precision,
-    Separate, Silent,
-};
+use stemd_core::{Audio, MlxConfig, MlxSeparator, Parts, PcmFormat, Precision, Separate};
+#[cfg(feature = "research")]
+use stemd_core::{HybridConfig, HybridSeparator, Silent};
 
 /// Raw interleaved stereo 16-bit PCM at 44.1 kHz.
 fn read_pcm(path: &std::path::Path) -> Audio {
@@ -157,6 +157,7 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
 /// STEMD_AB_HYBRID=1 cargo test --release -p stemd-core --test separating \
 ///     -- --ignored --nocapture
 /// ```
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn the_hybrid_separates_a_real_track() {
@@ -267,6 +268,7 @@ fn the_hybrid_separates_a_real_track() {
 /// cargo test --release -p stemd-core --test separating -- --ignored \
 ///     what_half_precision --nocapture
 /// ```
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn what_half_precision_costs_the_roformer() {
@@ -349,6 +351,7 @@ fn what_half_precision_costs_the_roformer() {
 /// cargo test --release -p stemd-core --test separating -- --ignored \
 ///     chaining --nocapture
 /// ```
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn chaining_the_halves_against_running_them_side_by_side() {
@@ -479,6 +482,7 @@ fn chaining_the_halves_against_running_them_side_by_side() {
 /// cargo test --release -p stemd-core --test separating -- --ignored \
 ///     polarformer_against --nocapture
 /// ```
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn polarformer_against_the_viperx_roformer() {
@@ -603,6 +607,7 @@ fn polarformer_against_the_viperx_roformer() {
 /// cargo test --release -p stemd-core --test separating -- --ignored \
 ///     the_quality_tier --nocapture
 /// ```
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
@@ -736,6 +741,7 @@ fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
 ///
 /// `STEMD_AB_MUSDB` holds `NN.mix.pcm`, `NN.drums.pcm` and `NN.vocals.pcm`: raw
 /// f32le stereo at 44.1 kHz, with the mix the sum of all four stems.
+#[cfg(feature = "research")]
 #[test]
 #[ignore]
 fn stemd_roformer_against_quality() {

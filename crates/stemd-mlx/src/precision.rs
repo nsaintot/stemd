@@ -1,10 +1,7 @@
 //! What precision a model runs at, said without naming a backend.
 //!
-//! [`mlx_rs::Dtype`] used to sit in both models' public config, which put `mlx_rs`
-//! in the signature of anything wanting to ask for half precision, and on a
-//! machine without Metal none of those can name one.
-//!
-//! Two values, because two is what the models were measured at.
+//! Keeps `mlx_rs::Dtype` out of the models' public config. Two values, the two the models
+//! are measured at.
 
 use std::fmt;
 

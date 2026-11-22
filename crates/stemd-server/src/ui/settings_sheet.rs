@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use parking_lot::Mutex;
 
-use crate::api::AppState;
+use crate::state::AppState;
 
 use super::blur::{self, Frosted};
 use super::header::PINNED_HINT;
@@ -517,14 +517,7 @@ fn cache(
     )
     .clicked()
     {
-        let cache = Arc::clone(&state.cache);
-        std::thread::spawn(move || {
-            let (tracks, freed) = cache.clear();
-            tracing::info!(
-                "cache emptied: {tracks} tracks, {:.0} MB",
-                freed as f64 / 1e6
-            );
-        });
+        state.empty_cache();
     }
 
     let track = Rect::from_min_size(
@@ -577,11 +570,8 @@ fn cache(
 /// Apply the saved size and age to the cache, off the window's thread: a lower
 /// limit deletes tracks. What it deleted goes in `note`.
 fn apply(state: &AppState, note: &Arc<Mutex<Option<(String, Instant)>>>) {
-    let (max_bytes, whole_max_age) = state.settings.get().cache_limits();
-    let cache = Arc::clone(&state.cache);
     let note = Arc::clone(note);
-    std::thread::spawn(move || {
-        let (tracks, freed) = cache.set_limits(max_bytes, whole_max_age);
+    state.apply_cache_limits(move |tracks, freed| {
         if tracks > 0 {
             let noun = if tracks == 1 { "track" } else { "tracks" };
             *note.lock() = Some((

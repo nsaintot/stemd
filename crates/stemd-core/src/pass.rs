@@ -151,14 +151,6 @@ pub(crate) fn source_planes(
     to_planes(&out.index((0, source)), channels, norm, to - from)
 }
 
-/// `mix` cut to samples `from..to`.
-pub(crate) fn excerpt(mix: &Audio, from: usize, to: usize) -> Audio {
-    Audio::new(
-        mix.data.iter().map(|c| c[from..to].to_vec()).collect(),
-        mix.sample_rate,
-    )
-}
-
 /// Separate a whole track through `separator`'s segments, in order.
 ///
 /// `between` runs before each segment, with the separator, so a caller can
@@ -187,7 +179,7 @@ pub fn whole_track<S: Separate + ?Sized>(
         sink.update(Progress::counted(Stage::Separating, count(k), count(total)));
         between(separator)?;
         let window = pass.window(k);
-        separator.run(&mut pass, &excerpt(mix, window.start, window.end), k)?;
+        separator.run(&mut pass, &mix.excerpt(window.start, window.end), k)?;
     }
     sink.update(Progress::counted(
         Stage::Separating,

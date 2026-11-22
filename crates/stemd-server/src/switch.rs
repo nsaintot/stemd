@@ -141,17 +141,12 @@ impl Switcher {
     /// artefact name plus [`ident::DIGEST_CHARS`] of digest, which keeps the property
     /// the digest is here for. Always within [`ident`]'s portable charset and length.
     ///
-    /// Deliberately narrower than [`Self::identity`], and this is the whole point
-    /// of there being two. Precision and overlap change the audio, so the
-    /// server's own key must carry them; but they are properties of the machine
-    /// and the command line, not of the model. Folded in here they made the
-    /// published id move whenever the same server came up on a different
-    /// accelerator, which on a client is a whole on-media cache thrown away
-    /// because a PATH changed. What a client is asking is "are these the same
-    /// weights, arranged the same way", and that is what this answers.
+    /// Narrower than [`Self::identity`]: it leaves out precision and overlap, which belong
+    /// to the machine and the command line, so the id stays the same when one server comes
+    /// up on another accelerator.
     pub fn published_identity(&self) -> String {
         let id = match self.current() {
-            // A digest *of* the model identity rather than a prefix of the
+            // A digest of the model identity rather than a prefix of the
             // weights', so the id moves when the arrangement moves and not only
             // when the file does. Same shape either way: `<artefact>-<8 hex>`.
             Some(preset) => format!(
@@ -221,7 +216,7 @@ impl Switcher {
         // everything below true rather than merely intended: the queue is the
         // one publishing what the model says about itself, and a build that
         // failed comes back here to become `Failed`.
-        self.queue.install(crate::startup::builder(
+        self.queue.install(crate::models::builder(
             &dir,
             preset.artefact(),
             Some(preset),
@@ -277,30 +272,17 @@ impl Switcher {
     }
 }
 
-/// The cache identity, built from its parts.
-///
-/// Free-standing because a [`Switcher`] owns a queue and a loaded separator, and
-/// the thing worth testing here is the string.
-///
-/// **Every input that changes the samples belongs in here.** [`crate::cache`]
-/// serves a hit without re-separating, which is only sound while this is
-/// complete. Precision and overlap both change the audio.
-///
-/// A `;`-separated `k=v` list, appended to rather than reshaped. Appending is safe
-/// because `m=` carries the only value not drawn from a closed set:
-/// `--demucs-model` is arbitrary operator input, and every field after it is
-/// `;`-free, so reading from the right is unambiguous. A second free-form field
-/// would have to be length-prefixed.
-/// Which weights, and what is done with them, and nothing else.
-///
-/// The second half matters because a preset can change how it uses a file
-/// without the file changing, and cached stems from before that are no longer
-/// what a fresh separation would produce. Nothing about the run belongs here:
-/// see [`Switcher::published_identity`] for why the two identities differ.
+/// The published model identity: the weights digest and the preset's recipe, nothing about
+/// the run. See [`Switcher::published_identity`].
 fn model_identity(preset: Preset) -> String {
     format!("m={};r={}", preset.digest(), preset.recipe())
 }
 
+/// The cache identity: `m=` (the model), `p=` (precisions) and `o=` (overlap), `;`-separated.
+///
+/// Every input that changes the samples belongs here, since a cache hit is served without
+/// separating again. Append new fields: only `m=` holds free-form text, so reading from the
+/// right stays unambiguous.
 fn identity_of(
     model: Option<Preset>,
     artefact: &str,
@@ -424,7 +406,7 @@ mod tests {
         let from = Preset::Fast;
         let to = Preset::Quality;
         let (queue, info) = Queue::start(
-            crate::startup::builder(
+            crate::models::builder(
                 &dir,
                 from.artefact(),
                 Some(from),
@@ -504,10 +486,8 @@ mod tests {
         }
     }
 
-    /// The property the README's word "provably" rests on. Both of these were
-    /// absent from the key, and a hit is served without re-separating: stems
-    /// made at f16 came back unchanged from a server restarted with
-    /// `--full-precision`, and likewise for a changed `--overlap`.
+    /// A cache hit is served without separating again, so precision and overlap must
+    /// each change the key.
     #[test]
     fn precision_and_overlap_each_change_the_identity() {
         let at = |forced, overlap| {
@@ -574,10 +554,8 @@ mod tests {
     /// This pins the value; the shape is `every_preset_publishes_a_portable_identity`.
     #[test]
     fn the_documented_model_id_is_what_a_default_server_reports() {
-        //  Derived the way `published_identity` derives it, not the way the
-        //  server's own cache key is built: this test asserted the latter for a
-        //  while after the two were separated, so it went on passing while
-        //  agreeing with nothing the server said.
+        //  Derived the way `published_identity` derives it, not from the server's
+        //  own cache key.
         let id = format!(
             "{}-{}",
             models::DEFAULT_PRESET.artefact(),

@@ -71,13 +71,6 @@ fn presets(dir: &Path) -> Vec<(&'static str, Box<dyn Separate>)> {
     ]
 }
 
-fn excerpt(mix: &Audio, from: usize, to: usize) -> Audio {
-    Audio::new(
-        mix.data.iter().map(|c| c[from..to].to_vec()).collect(),
-        mix.sample_rate,
-    )
-}
-
 fn named(stems: &Stems) -> Vec<(&'static str, &Audio)> {
     stems
         .shipped
@@ -133,11 +126,11 @@ fn segments_in_any_order_match_the_whole_track() {
         for k in order {
             let window = pass.window(k);
             separator
-                .run(&mut pass, &excerpt(&mix, window.start, window.end), k)
+                .run(&mut pass, &mix.excerpt(window.start, window.end), k)
                 .expect("running");
             if !checked_early && pass.is_final(from, to) {
                 let range = separator
-                    .stems(&pass, &excerpt(&mix, from, to), from, to)
+                    .stems(&pass, &mix.excerpt(from, to), from, to)
                     .expect("a range");
                 same_bits(&format!("{label} {from}..{to}"), &range, &whole, from, to);
                 checked_early = true;

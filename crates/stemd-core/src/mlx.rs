@@ -234,10 +234,7 @@ impl Separate for MlxSeparator {
             sample_rate: self.sample_rate,
             channels: self.channels,
             stems: crate::stems::SHIPPED.iter().map(|s| (*s).into()).collect(),
-            // Asked rather than asserted. This was the literal `"gpu"` for as
-            // long as Metal was the only backend and the answer could not be
-            // anything else; a CUDA build on a machine with no usable card
-            // falls back to the CPU and used to say otherwise.
+            // Detected: a CUDA build on a machine with no usable card runs on the CPU.
             device: stemd_mlx::Accelerator::detect().as_str().into(),
             parts: crate::stems::all_parts(),
         }

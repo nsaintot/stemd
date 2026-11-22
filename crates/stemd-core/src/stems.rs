@@ -40,11 +40,11 @@ use crate::pcm::Audio;
 pub const SHIPPED: [&str; 2] = ["harmonics", "vocals"];
 
 /// Source order used by the four-stem models (demucs, Open-Unmix).
-pub const FOUR_STEM_SOURCES: [&str; 4] = ["drums", "bass", "other", "vocals"];
+pub(crate) const FOUR_STEM_SOURCES: [&str; 4] = ["drums", "bass", "other", "vocals"];
 
 /// Which model sources make up each shipped stem. The model's `drums` is in
 /// neither, which is what makes it the part a player rebuilds for itself.
-pub const STEM_SOURCES: [(&str, &[&str]); 2] =
+pub(crate) const STEM_SOURCES: [(&str, &[&str]); 2] =
     [("harmonics", &["bass", "other"]), ("vocals", &["vocals"])];
 
 /// The three things a player puts a fader on.
@@ -82,7 +82,7 @@ pub fn remainder<'a>(mix: &Audio, parts: impl IntoIterator<Item = &'a Audio>) ->
 }
 
 /// Every part name, for a separator that can produce all of them.
-pub fn all_parts() -> Vec<String> {
+pub(crate) fn all_parts() -> Vec<String> {
     PART_NAMES.iter().map(|p| (*p).to_owned()).collect()
 }
 
@@ -187,7 +187,7 @@ impl Parts {
     }
 
     /// Model sources none of the parts cover.
-    pub fn left_out(self) -> Vec<&'static str> {
+    pub(crate) fn left_out(self) -> Vec<&'static str> {
         FOUR_STEM_SOURCES
             .into_iter()
             .filter(|source| {
@@ -273,7 +273,7 @@ impl PartGains {
     ///
     /// Exact equality is deliberate: the guarantee is bit-for-bit identity, so
     /// a UI must snap its faders to a literal `1.0` rather than land near it.
-    pub fn is_unity(self) -> bool {
+    pub(crate) fn is_unity(self) -> bool {
         self == Self::UNITY
     }
 }
@@ -364,7 +364,7 @@ fn at(audio: &Audio, c: usize, i: usize) -> f32 {
 }
 
 /// Level of `mix - sum(sources)` relative to `mix`, in dB.
-pub fn unexplained_db<'a>(mix: &Audio, sources: impl IntoIterator<Item = &'a Audio>) -> f64 {
+pub(crate) fn unexplained_db<'a>(mix: &Audio, sources: impl IntoIterator<Item = &'a Audio>) -> f64 {
     let sources: Vec<&Audio> = sources.into_iter().collect();
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (c, mix_ch) in mix.data.iter().enumerate() {
@@ -391,7 +391,7 @@ mod tests {
         Audio::new(vec![v.to_vec(), v.to_vec()], 44100)
     }
 
-    /// A mix whose parts deliberately do NOT sum to it, so the residual is real
+    /// A mix whose parts deliberately do not sum to it, so the residual is real
     /// and lands on [`DERIVED`].
     fn fixture() -> (Audio, Stems) {
         let mix = audio(&[1.0, 0.5, -0.25, 0.125]);

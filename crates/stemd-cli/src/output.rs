@@ -1,8 +1,6 @@
 //! Writing the assembled parts to disk, and the levels reported alongside them.
 //!
-//! The FLAC encoder mirrors the server's rather than sharing it. The block-size
-//! correction below is the part that must not drift, and
-//! `flac_declares_a_fixed_block_size` holds both copies to it.
+//! The FLAC encoder is the server's, from `stemd_audio::wire`, at the crate's default LPC order.
 
 use std::path::Path;
 
@@ -69,47 +67,10 @@ pub fn write(dir: &Path, part: &Part, sample_rate: u32, encoding: Encoding) -> R
     Ok(file)
 }
 
-/// Encode planar float to 16-bit FLAC.
+/// Encode planar float to 16-bit FLAC at the encoder's default settings.
 fn encode_flac(planar: &[Vec<f32>], sample_rate: u32, gain: f32) -> Result<Vec<u8>> {
-    use flacenc::component::BitRepr;
-    use flacenc::error::Verify;
-
-    let channels = planar.len();
-    anyhow::ensure!(channels > 0, "cannot encode zero channels to flac");
-
-    let mut interleaved = Vec::with_capacity(planar[0].len() * channels);
-    for i in 0..planar[0].len() {
-        for ch in planar {
-            interleaved.push(i32::from(quantise_s16(ch[i] * gain)));
-        }
-    }
-
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .map_err(|e| anyhow::anyhow!("flac encoder config: {e:?}"))?;
-    let source =
-        flacenc::source::MemSource::from_samples(&interleaved, channels, 16, sample_rate as usize);
-    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-        .map_err(|e| anyhow::anyhow!("flac encode: {e}"))?;
-
-    // The encoder folds the trailing partial block into STREAMINFO's minimum,
-    // which declares the stream variable-block-size while its frames are written
-    // fixed. Decoders that believe it locate frames by sample number and stop
-    // early.
-    stream
-        .stream_info_mut()
-        .set_block_sizes(config.block_size, config.block_size)
-        .map_err(|e| anyhow::anyhow!("flac block sizes: {e:?}"))?;
-
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| anyhow::anyhow!("flac serialise: {e}"))?;
-    Ok(sink.into_inner())
-}
-
-fn quantise_s16(v: f32) -> i16 {
-    (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
+    let config = stemd_audio::wire::flac_config(None)?;
+    stemd_audio::wire::encode_flac(planar, sample_rate, gain, &config)
 }
 
 fn write_wav_f32(path: &Path, planar: &[Vec<f32>], sample_rate: u32) -> Result<()> {
@@ -210,6 +171,19 @@ mod tests {
             name: name.to_owned(),
             samples,
         }
+    }
+
+    /// FNV-1a over `bytes`, to pin encoder output in a test.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn flac_encodes_to_the_recorded_bytes() {
+        let flac = encode_flac(&tone(4096 * 2 + 333), 44100, 0.8).expect("encoding");
+        assert_eq!(fnv(&flac), 8_896_136_748_871_060_963);
     }
 
     #[test]

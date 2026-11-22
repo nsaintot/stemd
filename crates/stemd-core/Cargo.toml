@@ -17,6 +17,8 @@ tracing.workspace = true
 # The model. mlx-rs is a direct dependency too because this crate marshals
 # audio into and out of its arrays.
 stemd-mlx = { path = "../stemd-mlx" }
+# 16-bit quantisation and the FLAC encoder, shared with the CLI.
+stemd-audio = { path = "../stemd-audio" }
 mlx-rs = { version = "0.25", features = ["metal", "safetensors"] }
 flacenc = { version = "0.5.1", default-features = false, features = ["log", "par"] }
 rubato = "5.0.0"
@@ -25,6 +27,8 @@ mp3lame-encoder = "0.2.4"
 [features]
 # A small model with no weights, for testing what drives a separator.
 toy = []
+# The RoFormer-and-demucs hybrid and the chained halves, reached only from the research tests.
+research = []
 
 [dev-dependencies]
 # A decoder written by someone else, so the FLAC round-trip test cannot agree

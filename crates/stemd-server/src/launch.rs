@@ -8,8 +8,8 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::api::AppState;
 use crate::models::Preset;
+use crate::state::AppState;
 
 /// What startup is doing, for the window to show.
 #[derive(Debug, Clone, PartialEq, Default)]

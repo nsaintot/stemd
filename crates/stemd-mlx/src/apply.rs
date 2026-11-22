@@ -5,10 +5,7 @@
 //! The crossfade is a triangular weight over each segment and a running sum of
 //! those weights to divide by at the end.
 //!
-//! This used to carry a bag as well: several models over the same audio, combined
-//! per source by a weight matrix, which is how `htdemucs_ft` is stored. Nothing
-//! runs one any more: every arrangement that wants more than one model wants
-//! specific sources from specific models. See `stemd_core::hybrid`.
+//! Arrangements of several models live in `stemd_core::hybrid`.
 
 use anyhow::{Result, bail};
 use mlx_rs::ops::indexing::{IndexOp, TryIndexMutOp};

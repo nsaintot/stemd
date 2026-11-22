@@ -112,7 +112,7 @@ impl Polyphase {
     }
 
     /// Output frames for `frames` input frames: `ceil(frames * L / M)`.
-    pub const fn out_frames(&self, frames: usize) -> usize {
+    pub(crate) const fn out_frames(&self, frames: usize) -> usize {
         (frames * self.l).div_ceil(self.m)
     }
 

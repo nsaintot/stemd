@@ -139,8 +139,7 @@ mod tests {
 
     #[test]
     fn streaming_hashes_and_counts_what_it_wrote() {
-        let dir = std::env::temp_dir().join(format!("stemd-stream-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::dir("stream");
         let path = dir.join("out");
 
         let (digest, written) = stream_to_file(&b"abc"[..], &path, |_| {}).unwrap();
@@ -156,8 +155,7 @@ mod tests {
 
     #[test]
     fn progress_is_reported_at_most_once_per_step() {
-        let dir = std::env::temp_dir().join(format!("stemd-progress-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::dir("progress");
 
         let payload = vec![0u8; (PROGRESS_STEP * 2) as usize + 1];
         let mut seen = Vec::new();

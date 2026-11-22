@@ -1,0 +1,41 @@
+# Architecture rules for `sentrux check`. A layer may import only layers with a higher order.
+
+[constraints]
+max_cycles = 0
+max_cc = 50
+max_fn_lines = 150
+
+[[layers]]
+name = "entry"
+order = 0
+paths = ["crates/stemd-server/src/main.rs", "crates/stemd-server/src/serve.rs", "crates/stemd-server/src/cli.rs"]
+
+[[layers]]
+name = "ui"
+order = 1
+paths = ["crates/stemd-server/src/ui/*"]
+
+[[layers]]
+name = "http"
+order = 2
+paths = ["crates/stemd-server/src/api/*", "crates/stemd-server/src/v1.rs", "crates/stemd-server/src/session_api.rs", "crates/stemd-server/src/separations.rs", "crates/stemd-server/src/stem_http.rs"]
+
+[[layers]]
+name = "app"
+order = 3
+paths = ["crates/stemd-server/src/state.rs", "crates/stemd-server/src/startup.rs", "crates/stemd-server/src/switch.rs", "crates/stemd-server/src/launch.rs", "crates/stemd-server/src/drops.rs", "crates/stemd-server/src/discovery.rs", "crates/stemd-server/src/serving.rs", "crates/stemd-server/src/shutdown.rs", "crates/stemd-server/src/endpoint.rs"]
+
+[[layers]]
+name = "domain"
+order = 4
+paths = ["crates/stemd-server/src/queue/*", "crates/stemd-server/src/sessions/*", "crates/stemd-server/src/jobs.rs", "crates/stemd-server/src/held.rs"]
+
+[[layers]]
+name = "storage"
+order = 5
+paths = ["crates/stemd-server/src/cache/*", "crates/stemd-server/src/whole.rs", "crates/stemd-server/src/migrate.rs"]
+
+[[layers]]
+name = "base"
+order = 6
+paths = ["crates/stemd-server/src/output.rs", "crates/stemd-server/src/filters.rs", "crates/stemd-server/src/ident.rs", "crates/stemd-server/src/disk.rs", "crates/stemd-server/src/panics.rs", "crates/stemd-server/src/logbuf.rs", "crates/stemd-server/src/precision.rs", "crates/stemd-server/src/cuda.rs", "crates/stemd-server/src/settings.rs", "crates/stemd-server/src/models/*", "crates/stemd-server/src/update/*"]

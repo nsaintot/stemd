@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+pub mod wire;
+
 use anyhow::{Context, Result, bail};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -38,8 +40,7 @@ impl Decoded {
                 if f32_output {
                     out.extend_from_slice(&ch[i].to_le_bytes());
                 } else {
-                    let q = (ch[i].clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                    out.extend_from_slice(&q.to_le_bytes());
+                    out.extend_from_slice(&wire::quantise_s16(ch[i]).to_le_bytes());
                 }
             }
         }
@@ -281,6 +282,34 @@ mod tests {
     use super::{elst_media_time, spread};
 
     /// The ordinary case: interleaved in, planar out, order preserved.
+    /// FNV-1a over `bytes`, to pin encoder output in a test.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn interleaving_for_upload_gives_the_recorded_bytes() {
+        let decoded = super::Decoded {
+            data: (0..2)
+                .map(|c| {
+                    (0..1000)
+                        .map(|i| ((i * 13 + c * 7) % 400) as f32 / 150.0 - 1.3)
+                        .collect()
+                })
+                .collect(),
+            sample_rate: 44_100,
+        };
+        assert_eq!(
+            [
+                fnv(&decoded.to_interleaved(false)),
+                fnv(&decoded.to_interleaved(true))
+            ],
+            [4_612_206_191_439_476_482, 9_576_015_741_111_340_747]
+        );
+    }
+
     #[test]
     fn whole_frames_are_spread_in_channel_order() {
         let mut channels = vec![Vec::new(), Vec::new()];
@@ -288,10 +317,8 @@ mod tests {
         assert_eq!(channels, vec![vec![1.0, 2.0], vec![-1.0, -2.0]]);
     }
 
-    /// The bug this guards. A packet holding a partial frame used to push the
-    /// remainder anyway, leaving channel 0 one sample longer than channel 1.
-    /// `frames()` reads channel 0, so that sample became an out-of-bounds index
-    /// in the model or the encoder, a crate or two away from the cause.
+    /// A packet holding a partial frame must not leave channel 0 one sample longer than
+    /// channel 1: `frames()` reads channel 0.
     #[test]
     fn a_partial_frame_leaves_the_channels_the_same_length() {
         for samples in 0..16usize {

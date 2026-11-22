@@ -48,8 +48,8 @@ use std::sync::OnceLock;
 use super::polyphase::Polyphase;
 use crate::pcm::Audio;
 
-pub const IN_RATE: u32 = 44_100;
-pub const OUT_RATE: u32 = 96_000;
+pub(crate) const IN_RATE: u32 = 44_100;
+pub(crate) const OUT_RATE: u32 = 96_000;
 
 /// The prototype at its native 320 × 44100 = 14.112 MHz grid, little-endian f32,
 /// normalised so a unit impulse in gives the prototype out. 18880 taps: 320

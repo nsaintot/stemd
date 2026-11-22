@@ -21,6 +21,9 @@ mod disk;
 mod drops;
 mod endpoint;
 mod filters;
+mod held;
+#[cfg(test)]
+mod http_tests;
 mod ident;
 mod jobs;
 mod launch;
@@ -31,14 +34,20 @@ mod output;
 mod panics;
 mod precision;
 mod queue;
+#[cfg(test)]
+mod scratch;
 mod separations;
 mod serve;
 mod serving;
 mod session_api;
+#[cfg(test)]
+mod session_tests;
 mod sessions;
 mod settings;
 mod shutdown;
 mod startup;
+mod state;
+mod stem_http;
 mod switch;
 #[cfg(test)]
 mod testkit;
@@ -66,11 +75,11 @@ fn main() -> Result<()> {
         return install_cuda();
     }
     // Before `prepare`, which clears the cache root. Held until the process ends.
-    let _instance = cache::lock(&cache::root(&args)?)?;
+    let _instance = cache::lock(&args.cache_root()?)?;
     let settings = std::sync::Arc::new(startup::open_settings(&args)?);
     let (listener, taken) = match args.bind {
-        Some(addr) => (serve::bind(addr)?, None),
-        None => serve::bind_saved(settings.get().port)?,
+        Some(addr) => (endpoint::bind(addr)?, None),
+        None => endpoint::bind_saved(settings.get().port)?,
     };
     if args.headless {
         serve::headless(&args, logs, settings, listener, taken)

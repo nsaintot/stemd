@@ -18,20 +18,22 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{self, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use stemd_core::{Audio, Normalisation, StemFormat};
 
-use crate::api::{ApiError, AppState, CreateParams, default_channels, default_rate, parse_output};
+use crate::api::error::ApiError;
+use crate::api::params::{CreateParams, default_channels, default_rate, parse_output};
 use crate::cache::Cache;
+use crate::output::{Output, output_span};
 use crate::sessions::{
     JoinError, OpenError, Request, Session, Sessions, TrackSpec, UploadError, WindowRequest,
-    output_index, served,
 };
-use crate::whole::Whole;
+use crate::state::AppState;
+use crate::stem_http::{audio_response, send_whole};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -113,7 +115,7 @@ fn session(state: &AppState, id: &str) -> Result<Arc<Session>, ApiError> {
 
 fn view_of(state: &AppState, session: &Session) -> Response {
     let view = state.queue.view_of(session);
-    ([(header::ETAG, etag(view.rev))], Json(view)).into_response()
+    ([(http::header::ETAG, etag(view.rev))], Json(view)).into_response()
 }
 
 /// The `ETag` of a view at `rev`.
@@ -158,26 +160,10 @@ async fn open(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (in_format, output, model_rate) = parse_output(&params.output_params(), &state)?;
-    if output.format == StemFormat::Mp3 {
-        return Err(ApiError::bad_request(
-            "mp3 does not cut into pieces; ask for flac, wav, s16le or f32le",
-        ));
-    }
-    if params.sample_rate != model_rate {
-        return Err(ApiError::bad_request(format!(
-            "a session takes the model's rate, {model_rate} Hz, not {}",
-            params.sample_rate
-        )));
-    }
     let info = state.queue.info();
-    if params.channels != info.channels {
-        return Err(ApiError::bad_request(format!(
-            "{} takes {} channels, not {}",
-            info.model, info.channels, params.channels
-        )));
-    }
+    check_shape(&params, &output, model_rate, &info)?;
     if let Some(key) = &params.file {
-        crate::separations::check_file_key(key)?;
+        crate::stem_http::check_file_key(key)?;
     }
     if let Some(id) = &params.track {
         return join(&state, &params, id, output, in_format, body).await;
@@ -197,37 +183,8 @@ async fn open(
             ),
         ));
     }
-    let Some(segmenting) = state.queue.segmenting() else {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!("{} separates whole tracks only", info.model),
-        ));
-    };
-    let grid = segmenting
-        .grid(frames)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    if !grid.order_free() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "this server's --overlap is above 0.5, so segments cannot run out of order",
-        ));
-    }
-    let norm = match (params.mean, params.std) {
-        (Some(mean), Some(std)) if mean.is_finite() && std.is_finite() && std >= 0.0 => {
-            Some(Normalisation::new(mean, std))
-        }
-        (None, None) => None,
-        _ => {
-            return Err(ApiError::bad_request(
-                "mean and std must be sent together, as finite numbers, with std at least 0",
-            ));
-        }
-    };
-    if params.peak.is_some_and(|p| !p.is_finite() || p < 0.0) {
-        return Err(ApiError::bad_request(
-            "peak must be a finite number, at least 0",
-        ));
-    }
+    let grid = session_grid(&state, &info, frames)?;
+    let norm = parse_levels(&params)?;
 
     let session = state
         .queue
@@ -247,13 +204,7 @@ async fn open(
             peak: params.peak,
             model_id: state.switcher.cache_id(),
         })
-        .map_err(|e| {
-            let status = match e {
-                OpenError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-                OpenError::TooMany(_) | OpenError::Full { .. } => StatusCode::TOO_MANY_REQUESTS,
-            };
-            ApiError::new(status, format!("{e}"))
-        })?;
+        .map_err(open_error)?;
     session.set_file(params.file.clone());
     tracing::info!(
         session = %session.id,
@@ -272,6 +223,96 @@ async fn open(
     Ok((StatusCode::CREATED, view_of(&state, &session)).into_response())
 }
 
+/// A 400 unless the output cuts into pieces and the upload has the model's rate and channels.
+fn check_shape(
+    params: &OpenParams,
+    output: &Output,
+    model_rate: u32,
+    info: &stemd_core::BackendInfo,
+) -> Result<(), ApiError> {
+    if output.format == StemFormat::Mp3 {
+        return Err(ApiError::bad_request(
+            "mp3 does not cut into pieces; ask for flac, wav, s16le or f32le",
+        ));
+    }
+    if params.sample_rate != model_rate {
+        return Err(ApiError::bad_request(format!(
+            "a session takes the model's rate, {model_rate} Hz, not {}",
+            params.sample_rate
+        )));
+    }
+    if params.channels != info.channels {
+        return Err(ApiError::bad_request(format!(
+            "{} takes {} channels, not {}",
+            info.model, info.channels, params.channels
+        )));
+    }
+    Ok(())
+}
+
+/// The segment grid of a `frames`-sample track, or a 409 when segments cannot run out of order.
+fn session_grid(
+    state: &AppState,
+    info: &stemd_core::BackendInfo,
+    frames: usize,
+) -> Result<stemd_core::Grid, ApiError> {
+    let Some(segmenting) = state.queue.segmenting() else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("{} separates whole tracks only", info.model),
+        ));
+    };
+    let grid = segmenting
+        .grid(frames)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if !grid.order_free() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "this server's --overlap is above 0.5, so segments cannot run out of order",
+        ));
+    }
+    Ok(grid)
+}
+
+/// The client's normalisation from `mean` and `std`, after checking those and `peak`.
+fn parse_levels(params: &OpenParams) -> Result<Option<Normalisation>, ApiError> {
+    let norm = match (params.mean, params.std) {
+        (Some(mean), Some(std)) if mean.is_finite() && std.is_finite() && std >= 0.0 => {
+            Some(Normalisation::new(mean, std))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::bad_request(
+                "mean and std must be sent together, as finite numbers, with std at least 0",
+            ));
+        }
+    };
+    if params.peak.is_some_and(|p| !p.is_finite() || p < 0.0) {
+        return Err(ApiError::bad_request(
+            "peak must be a finite number, at least 0",
+        ));
+    }
+    Ok(norm)
+}
+
+/// The status for a session the server has no room for.
+fn open_error(e: OpenError) -> ApiError {
+    let status = match e {
+        OpenError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        OpenError::TooMany(_) | OpenError::Full { .. } => StatusCode::TOO_MANY_REQUESTS,
+    };
+    ApiError::new(status, format!("{e}"))
+}
+
+/// The 404 for a join on a track that is not open.
+fn unknown_track(id: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        format!("no open track {id}; open a session with frames and upload it"),
+    )
+    .with_code("unknown_separation")
+}
+
 /// Open a session on the open track `id`, which needs no upload.
 async fn join(
     state: &Arc<AppState>,
@@ -287,13 +328,9 @@ async fn join(
         ));
     }
     let sessions = state.queue.sessions();
-    let track = sessions.open_track(id, output.parts).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("no open track {id}; open a session with frames and upload it"),
-        )
-        .with_code("unknown_separation")
-    })?;
+    let track = sessions
+        .open_track(id, output.parts)
+        .ok_or_else(|| unknown_track(id))?;
     if params.frames.is_some_and(|f| f != track.spec.frames) {
         return Err(ApiError::bad_request(format!(
             "track {id} is {} samples long",
@@ -309,11 +346,7 @@ async fn join(
     };
     let session = joined.map_err(|e| match e {
         JoinError::TooMany(e) => ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")),
-        JoinError::Gone => ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("no open track {id}; open a session with frames and upload it"),
-        )
-        .with_code("unknown_separation"),
+        JoinError::Gone => unknown_track(id),
     })?;
     session.set_file(params.file.clone());
     sessions.record_file(&session, id);
@@ -376,7 +409,7 @@ async fn view(
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
     let known = headers
-        .get(header::IF_NONE_MATCH)
+        .get(http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     // Half the idle timeout at most, so a client that only polls is not reaped mid-poll.
@@ -392,14 +425,14 @@ async fn view(
         let tag = etag(view.rev);
         if known.as_deref() != Some(tag.as_str()) {
             session.touch();
-            return Ok(([(header::ETAG, tag)], Json(view)).into_response());
+            return Ok(([(http::header::ETAG, tag)], Json(view)).into_response());
         }
         if tokio::time::timeout_at(deadline, changes.changed())
             .await
             .is_err()
         {
             session.touch();
-            return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
+            return Ok((StatusCode::NOT_MODIFIED, [(http::header::ETAG, tag)]).into_response());
         }
     }
 }
@@ -426,66 +459,6 @@ struct RangeParams {
     to: Option<usize>,
 }
 
-/// Headers every range and piece carries.
-pub(crate) fn audio_response(
-    format: StemFormat,
-    body: Body,
-    len: u64,
-    from: usize,
-    frames: usize,
-    gain: f32,
-    clipped: Option<usize>,
-) -> Response {
-    let mut response = Response::builder()
-        .header(header::CONTENT_TYPE, format.content_type())
-        .header(header::CONTENT_LENGTH, len)
-        .header("x-stemd-from", from)
-        .header("x-stemd-frames", frames)
-        .header("x-stemd-gain", gain.to_string());
-    if let Some(clipped) = clipped {
-        response = response.header("x-stemd-clipped", clipped);
-    }
-    response
-        .body(body)
-        .expect("response builder inputs are valid")
-}
-
-/// Open a stored whole file and give its length; one deleted since its lookup is `410`.
-pub(crate) async fn open_whole(whole: &Whole) -> Result<(tokio::fs::File, u64), ApiError> {
-    let path = whole.path.display();
-    let file = tokio::fs::File::open(&whole.path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            crate::separations::evicted()
-        } else {
-            ApiError::internal(format!("opening {path}: {e}"))
-        }
-    })?;
-    let len = file
-        .metadata()
-        .await
-        .map_err(|e| ApiError::internal(format!("reading {path}: {e}")))?
-        .len();
-    Ok((file, len))
-}
-
-/// Send a stored whole file as it is.
-pub(crate) async fn send_whole(
-    format: StemFormat,
-    gain: f32,
-    whole: Whole,
-) -> Result<Response, ApiError> {
-    let (file, len) = open_whole(&whole).await?;
-    Ok(audio_response(
-        format,
-        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
-        len,
-        0,
-        whole.meta.frames,
-        gain,
-        whole.meta.clipped,
-    ))
-}
-
 /// Encode `from..to` of `name` from memory or stored pieces; a whole-track read stores the file.
 pub(crate) fn encode_range(
     sessions: &Sessions,
@@ -502,10 +475,8 @@ pub(crate) fn encode_range(
     };
     let excerpt = excerpt.map_err(|e| ApiError::new(StatusCode::CONFLICT, format!("{e:#}")))?;
     let format = session.output.format;
-    let bytes = stemd_core::encode_stem(&excerpt.audio, format, gain)
+    let (bytes, clipped) = crate::whole::encode(&excerpt.audio, format, gain, !in_memory)
         .map_err(|e| ApiError::internal(format!("encoding {name}: {e:#}")))?;
-    let clipped =
-        (!format.has_headroom()).then(|| crate::whole::clipped(&excerpt.audio, gain, !in_memory));
     if from == 0
         && to == session.track().spec.frames
         && let Err(err) =
@@ -559,7 +530,7 @@ async fn piece(
     Path((id, name, k)): Path<(String, String, usize)>,
 ) -> Result<Response, ApiError> {
     let session = session(&state, &id)?;
-    if !served(&session.output).contains(&name.as_str()) {
+    if !session.output.served().contains(&name.as_str()) {
         return Err(ApiError::not_found());
     }
     // A stem stored whole: the client can fetch it in one read.
@@ -590,8 +561,8 @@ async fn piece_of(
         u64::from(track.spec.sample_rate),
         u64::from(session.output.rate.hz()),
     );
-    let from = output_index(samples.start, model, out);
-    let frames = output_index(samples.end, model, out) - from;
+    let span = output_span(&samples, model, out);
+    let (from, frames) = (span.start, span.len());
 
     // Stored: sent as it is. Otherwise encoded from what is ready in memory.
     let stored = state
@@ -636,86 +607,4 @@ async fn piece_of(
     })
     .await
     .map_err(|e| ApiError::internal(format!("encoding the piece: {e}")))?
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::http::{Method, StatusCode};
-    use axum::response::IntoResponse;
-
-    use super::open_whole;
-    use crate::testkit::{call, state};
-    use crate::whole::{Meta, Whole};
-
-    #[tokio::test]
-    async fn a_whole_file_deleted_since_its_lookup_is_410() {
-        let whole = Whole {
-            path: std::env::temp_dir().join("stemd-no-such-stem.flac"),
-            meta: Meta {
-                frames: 1,
-                clipped: None,
-                header: 0,
-                block: 0,
-                offsets: Vec::new(),
-            },
-        };
-        let err = open_whole(&whole).await.expect_err("no such file");
-        assert_eq!(err.into_response().status(), StatusCode::GONE);
-    }
-
-    #[tokio::test]
-    async fn an_open_past_the_memory_budget_is_413_alone_and_429_beside_others() {
-        let state = state();
-        let app = crate::api::router(std::sync::Arc::clone(&state));
-        let uri = "/v2/sessions?frames=30000";
-        let sessions = state.queue.sessions();
-        let first = call(&app, Method::POST, uri, Vec::new()).await;
-        assert_eq!(first.status, StatusCode::CREATED, "{}", first.json);
-        let id = first.json["id"].as_str().unwrap();
-        let one = sessions.get(id).unwrap().track().spec.memory();
-
-        sessions.set_memory_budget(2 * one - 1);
-        let beside = call(&app, Method::POST, uri, Vec::new()).await;
-        assert_eq!(
-            beside.status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "{}",
-            beside.json
-        );
-        sessions.set_memory_budget(one - 1);
-        let alone = call(&app, Method::POST, uri, Vec::new()).await;
-        assert_eq!(
-            alone.status,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "{}",
-            alone.json
-        );
-    }
-
-    #[tokio::test]
-    async fn a_malformed_window_is_a_400_with_a_json_error() {
-        let app = crate::api::router(state());
-        let opened = call(&app, Method::POST, "/v2/sessions?frames=30000", Vec::new()).await;
-        assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.json);
-        let uri = format!(
-            "/v2/sessions/{}/window",
-            opened.json["id"].as_str().unwrap()
-        );
-        for body in [
-            &b"not json"[..],
-            br#"{"regions": [{"at": "soon"}]}"#,
-            br#"{}"#,
-        ] {
-            let answer = call(&app, Method::PUT, &uri, body.to_vec()).await;
-            assert_eq!(
-                answer.status,
-                StatusCode::BAD_REQUEST,
-                "{:?}",
-                String::from_utf8_lossy(body)
-            );
-            assert!(answer.json["error"].is_string(), "{}", answer.json);
-        }
-        let fine = call(&app, Method::PUT, &uri, br#"{"regions": []}"#.to_vec()).await;
-        assert_eq!(fine.status, StatusCode::OK);
-    }
 }

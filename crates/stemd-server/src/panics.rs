@@ -1,23 +1,8 @@
-//! Where a panic happened, put somewhere the person who hit it can reach.
+//! A panic hook that logs the location and thread through `tracing`, then runs the previous hook.
 //!
-//! A caught panic gives up its location. [`std::panic::catch_unwind`] hands back
-//! the payload and nothing else, so [`crate::queue`]'s worker can say *what* a
-//! separation panicked with and never *where*. The default hook does print the
-//! location, but it prints it to stderr, and this ships as an `.app`, where
-//! stderr goes nowhere. The first bug report against a release accordingly read
-//! `the separation panicked: index out of bounds: the len is 0 but the index is
-//! 0` with no file, no line, and no way to narrow it from here.
-//!
-//! So the hook is replaced by one that logs the location through `tracing`, which
-//! puts it in the ring buffer behind the window's log view and `GET /v2/logs`.
-//! The hook that was there runs afterwards, so a launch from a terminal keeps the
-//! output it always had, `RUST_BACKTRACE` included.
-//!
-//! This is not only for the caught ones. A drop is decoded on its own thread and
-//! nothing catches that, so a panic before the job is submitted used to leave a
-//! row sitting at `Reading` for ever with nothing written anywhere. It is logged
-//! now, which is the difference between a puzzling hang and a report somebody can
-//! act on.
+//! [`std::panic::catch_unwind`] returns only the payload, and an `.app` has no stderr, so the
+//! location reaches the window's log view and `GET /v2/logs` only through this hook. It also
+//! covers threads nothing catches, such as the one that decodes a drop.
 
 use std::any::Any;
 use std::backtrace::{Backtrace, BacktraceStatus};

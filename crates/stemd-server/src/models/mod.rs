@@ -1,8 +1,7 @@
 //! Locating, verifying and fetching the model artefacts.
 //!
-//! The bundle ships without weights: they are ~170 MB, they are not source, and
-//! `models/` is gitignored, so a fresh clone would otherwise build a binary with
-//! no model to load and no way to make one. A pinned URL fixes both.
+//! The bundle ships without weights (~170 MB per preset); each is fetched from a
+//! pinned URL and checked against its digest.
 //!
 //! # Where they land
 //!
@@ -22,6 +21,7 @@
 
 mod download;
 mod integrity;
+mod load;
 mod preset;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 
 pub use download::fetch;
 pub use integrity::verify;
+pub use load::{BuildSeparator, builder};
 pub use preset::{DEFAULT_PRESET, ModelSource, Preset, RETIRED, WEIGHTS_EXTENSION};
 
 // One pinned file at a time, and the type describing one. Only `cuda` wants
@@ -66,8 +67,7 @@ const READ_CHUNK: usize = 1 << 20;
 /// controller at every logon, and 170 MB of weights that any machine can
 /// re-download is precisely what must not be in one. The extra `data` component
 /// is the other half of the split described on [`crate::cache::default_dir`]:
-/// local app data is also where the cache lands, and the cache root is emptied
-/// at every start.
+/// local app data is also where the cache lands.
 pub fn support_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
         .context("no data directory for this platform")?
@@ -96,7 +96,7 @@ pub fn locate(dirs: &[PathBuf], preset: Preset) -> Option<PathBuf> {
 
 /// True when every file of `source` is present in `dir`.
 ///
-/// Presence only: see [`mismatched`] for whether the contents are right.
+/// Presence only: see [`integrity::mismatched`] for whether the contents are right.
 pub fn is_complete(dir: &Path, source: &ModelSource) -> bool {
     source.files.iter().all(|f| dir.join(f.name).is_file())
 }
@@ -107,9 +107,7 @@ mod tests {
 
     #[test]
     fn completeness_needs_every_file() {
-        let dir = std::env::temp_dir().join(format!("stemd-models-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::dir("models");
         // Named from the preset rather than spelled out, so retiring or
         // renaming one moves this test with it instead of breaking it.
         let source = Preset::Fast.source();

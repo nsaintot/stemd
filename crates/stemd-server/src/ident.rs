@@ -18,6 +18,7 @@
 //! pass through unchanged.
 
 use sha2::{Digest, Sha256};
+use stemd_core::Audio;
 
 /// Longest id the server will emit, excluding the NUL a C client terminates with.
 ///
@@ -69,6 +70,43 @@ pub fn tagged(prefix: &str, name: &str) -> String {
     let room = MAX_ID.saturating_sub(overhead);
     let head: String = portable(name).chars().take(room).collect();
     format!("{prefix}-{head}-{}", short_digest(name))
+}
+
+/// Hex characters of a track id.
+pub const TRACK_ID_LEN: usize = 24;
+
+/// Changes when the track id's definition does, so old ids stop matching.
+const TRACK_ID_EPOCH: &str = "stemd-track-1";
+
+/// A track's identity: SHA-256 over its samples at the model's rate.
+///
+/// Length-prefixed fields `stemd-track-1`, the rate and the channel count, then
+/// every frame's samples as little-endian f32, channel by channel within a frame.
+/// The first [`TRACK_ID_LEN`] hex characters.
+pub fn track_id(audio: &Audio) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        TRACK_ID_EPOCH.to_owned(),
+        audio.sample_rate.to_string(),
+        audio.channels().to_string(),
+    ] {
+        hasher.update(u32::try_from(field.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let mut buffer = Vec::with_capacity(1 << 16);
+    for i in 0..audio.frames() {
+        for channel in &audio.data {
+            buffer.extend_from_slice(&channel[i].to_le_bytes());
+        }
+        if buffer.len() >= 1 << 16 {
+            hasher.update(&buffer);
+            buffer.clear();
+        }
+    }
+    hasher.update(&buffer);
+    let mut id = format!("{:x}", hasher.finalize());
+    id.truncate(TRACK_ID_LEN);
+    id
 }
 
 #[cfg(test)]
