@@ -175,8 +175,10 @@ mkdir -p "$out/usr/share/applications" "$out/usr/share/icons/hicolor/256x256/app
 install -m 0644 "$root/packaging/linux/stemd.desktop" "$out/usr/share/applications/"
 install -m 0644 "$root/resources/stemd-icon-win-256.png" \
     "$out/usr/share/icons/hicolor/256x256/apps/stemd.png"
-install -m 0644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" \
-    "$root/packaging/linux/THIRD-PARTY" "$prefix/share/doc/stemd/"
+while read -r notice; do
+    case "$notice" in ''|'#'*) continue ;; esac
+    install -m 0644 "$root/$notice" "$prefix/share/doc/stemd/"
+done < "$root/packaging/notices.list"
 
 # --- check ---------------------------------------------------------------
 unresolved="$(LD_LIBRARY_PATH="$stubs" ldd "$prefix/bin/stemd-server" | grep 'not found' || true)"

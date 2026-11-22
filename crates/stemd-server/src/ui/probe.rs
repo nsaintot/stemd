@@ -749,3 +749,50 @@ fn frame_cost() {
         );
     }
 }
+
+/// At the narrowest window, each preset's detail fits its first-run row, clear of the download
+/// size, and fits the drop zone's caption, where it shows after a switch.
+#[test]
+fn every_preset_detail_fits_the_narrowest_window() {
+    let ctx = themed();
+    let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let mut view = super::starting::View::default();
+    let stage = crate::launch::Stage::Choosing(vec![]);
+    let window = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(super::MIN_WINDOW_SIZE[0], screen().height()),
+    );
+    let shapes = frame(&ctx, None, false, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(window), |ui| {
+            let _ = super::starting::body(ui, &stage, &palette, &brushes, &mut view);
+        });
+    });
+    let texts = texts_of(&shapes);
+    let caption = window.width() - 2.0 * f32::from(super::PAD);
+    for preset in crate::models::Preset::ALL {
+        let find = |want: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{want:?} is not drawn: {texts:?}"))
+        };
+        let detail = find(preset.detail());
+        let size = find(&format!("{:.0} MB", preset.total_bytes() as f64 / 1e6));
+        assert!(
+            detail.right() + 8.0 < size.left(),
+            "{preset:?}: {detail:?} runs into {size:?}"
+        );
+        let width = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                preset.detail().to_owned(),
+                super::theme::font(12.5, super::theme::Weight::Regular),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        });
+        assert!(width < caption, "{preset:?}: {width} wide in {caption}");
+    }
+}

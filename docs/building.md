@@ -120,6 +120,31 @@ highest token available, which on an administrator account means one consent
 prompt even for a per-user install. Building the installer needs NSIS, which
 `winget install NSIS.NSIS` provides.
 
+### Notices
+
+Every package ships the files listed in `packaging/notices.list`: the two stemd
+licences, the notices and the licence texts. `bundle-app.sh` copies them into
+`Stemd.app/Contents/Resources`, `package-windows.ps1` beside the executables,
+and `stage.sh` into `/opt/stemd/share/doc/stemd`.
+
+| file | |
+| --- | --- |
+| `packaging/THIRD-PARTY` | every bundled component, its licence, and the platforms that ship it |
+| `packaging/THIRD-PARTY-CRATES` | the Rust crates and their licence texts, generated |
+| `packaging/licenses/` | licence texts the repository has no other copy of |
+| `packaging/about.toml`, `packaging/about.hbs` | the cargo-about config and template |
+| `scripts/crate-notices.sh` | regenerates `THIRD-PARTY-CRATES` |
+
+Rerun `scripts/crate-notices.sh` after a dependency change and commit the
+result. It needs cargo-about 0.9.3:
+
+```bash
+cargo install cargo-about --locked --version 0.9.3 --features cli
+```
+
+Edit `packaging/THIRD-PARTY` and `packaging/licenses/MLX.txt` by hand after an
+MLX, CUDA or Sparkle update.
+
 ### Release builds
 
 `.github/workflows/cd.yml` builds every artefact on GitHub's runners and checks
@@ -192,7 +217,6 @@ versions stemd fetches at run time.
 | `stage.sh` | `dist/linux/opt/stemd`: binaries, vendored libraries, the run-time headers |
 | `build.sh` | nfpm writes the `.deb` and `.rpm`, appimagetool the `.AppImage`, from that one tree |
 | `nfpm.yaml.in` | the package dependencies, which are only the display stack and D-Bus |
-| `THIRD-PARTY` | notices for the vendored NVIDIA, BLAS and avahi libraries |
 | `jit-headers.sh` | writes `jit-headers.txt`, the list of toolkit headers that MLX's run-time compiler reads; rerun it after an MLX or CUDA update |
 
 Every package carries CUDA, cuDNN, BLAS and avahi-compat in `/opt/stemd/lib`,

@@ -121,6 +121,32 @@ cp "$METALLIB" "$APP/Contents/Resources/mlx.metallib"
 ln -s ../Resources/mlx.metallib "$APP/Contents/MacOS/mlx.metallib"
 echo "  metal kernels: mlx.metallib ($(du -h "$APP/Contents/Resources/mlx.metallib" | cut -f1))"
 
+# The terms file of an artefact, from resources/model-terms. The mapping matches
+# crates/stemd-server/src/models/terms.rs.
+model_terms() {
+  case "$1" in
+    stemd_roformer) echo stemd_roformer ;;
+    htdemucs|htdemucs_ft) echo demucs ;;
+    bs_polarformer|bs_roformer_viperx) echo roformer-conversion ;;
+    *) return 1 ;;
+  esac
+}
+
+# Put <artefact>.LICENSE.txt beside each weights file in $1, as the server does
+# after a download.
+embed_model_terms() {
+  local weights artefact terms
+  for weights in "$1"/*.safetensors; do
+    [ -f "$weights" ] || continue
+    artefact="$(basename "$weights" .safetensors)"
+    if ! terms="$(model_terms "$artefact")"; then
+      echo "no terms for $artefact; add it to model_terms in $0" >&2
+      exit 1
+    fi
+    cp "$ROOT/resources/model-terms/$terms.txt" "${weights%.safetensors}.LICENSE.txt"
+  done
+}
+
 # Weights are fetched on first run into Application Support, so the bundle does
 # not carry 170 MB that never changes. STEMD_LINK_MODELS symlinks a local copy
 # for development; STEMD_EMBED_MODELS copies it in for an offline install.
@@ -129,10 +155,20 @@ if [ "${STEMD_LINK_MODELS:-0}" = "1" ]; then
   echo "  models: symlinked (dev)"
 elif [ "${STEMD_EMBED_MODELS:-0}" = "1" ]; then
   cp -R "$MODELS" "$APP/Contents/Resources/models"
-  echo "  models: embedded ($(du -sh "$MODELS" | cut -f1))"
+  embed_model_terms "$APP/Contents/Resources/models"
+  echo "  models: embedded ($(du -sh "$MODELS" | cut -f1)), each with its terms"
 else
   echo "  models: fetched on first run"
 fi
+
+# The licences and notices listed in packaging/notices.list.
+notices=0
+while read -r notice; do
+  case "$notice" in ''|'#'*) continue ;; esac
+  cp "$ROOT/$notice" "$APP/Contents/Resources/"
+  notices=$((notices + 1))
+done < "$ROOT/packaging/notices.list"
+echo "  notices: $notices files"
 
 # Sparkle, the updater. The app loads it from Contents/Frameworks; without it
 # the app runs with no updater. Its XPC services are for sandboxed apps and are

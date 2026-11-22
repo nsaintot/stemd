@@ -55,12 +55,13 @@ impl Preset {
         }
     }
 
-    /// One line about the model. Times are for a 6:38 track on an idle M1 Pro.
+    /// One line about the model: its name, the licence of stemd's own model, and the time for a
+    /// 6:38 track on an idle M1 Pro.
     pub const fn detail(self) -> &'static str {
         match self {
             Self::Fast => "htdemucs v4 · about 22 s per track",
             Self::Balanced => "htdemucs ft · about 48 s per track",
-            Self::Quality => "Stemd RoFormer · about 110 s per track",
+            Self::Quality => "Stemd RoFormer · CC BY-NC-SA · about 110 s per track",
         }
     }
 
@@ -135,7 +136,7 @@ pub const DEFAULT_PRESET: Preset = Preset::Fast;
 pub const WEIGHTS_EXTENSION: &str = ".safetensors";
 
 /// Artefacts a preset used to name, and the preset that replaced them.
-const FORMER: [(&str, Preset); 1] = [("bs_polarformer", Preset::Quality)];
+pub(super) const FORMER: [(&str, Preset); 1] = [("bs_polarformer", Preset::Quality)];
 
 /// Retired artefacts, still listed so that a settings file naming one gets an explanation when it
 /// falls back.

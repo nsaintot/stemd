@@ -12,13 +12,14 @@ use anyhow::{Context, Result, bail};
 use super::READ_CHUNK;
 use super::integrity::Hashing;
 use super::preset::{ModelSource, RemoteFile};
+use super::terms;
 
 /// The bytes between progress callbacks: often enough to drive a progress bar, and rarely enough
 /// not to flood a log.
 const PROGRESS_STEP: u64 = 8 << 20;
 
-/// Download the missing files into `dir`. Files already present are left alone; this is a first-run
-/// path and repairs nothing.
+/// Download the missing files into `dir`, each with its terms file. Files already present are left
+/// alone; this is a first-run path and repairs nothing.
 ///
 /// `on_progress` is called with `(file_name, bytes_done, bytes_total)`.
 pub fn fetch(
@@ -31,6 +32,9 @@ pub fn fetch(
             continue;
         }
         fetch_one(dir, file, &mut on_progress)?;
+        if let Err(err) = terms::write(dir, file.name) {
+            tracing::warn!("{err:#}");
+        }
     }
     Ok(())
 }

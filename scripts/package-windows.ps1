@@ -43,11 +43,17 @@ if (-not (Test-Path (Join-Path $Source 'stemd-server.exe'))) {
     throw "no stemd-server.exe in $Source; run bundle-windows.ps1 first, or drop -NoBuild"
 }
 
-# Both licences ship with the binaries, because the grant is either one, at the
-# user's choice.
-foreach ($name in 'LICENSE-MIT', 'LICENSE-APACHE') {
-    Copy-Item (Join-Path $root $name) (Join-Path $Source "$name.txt") -Force
+# The licences and notices listed in packaging/notices.list ship with the
+# binaries. A file without an extension gets .txt, so that it opens on a
+# double-click.
+$notices = Get-Content (Join-Path $root 'packaging\notices.list') |
+    Where-Object { $_ -and -not $_.StartsWith('#') }
+foreach ($notice in $notices) {
+    $name = Split-Path $notice -Leaf
+    if (-not [System.IO.Path]::HasExtension($name)) { $name = "$name.txt" }
+    Copy-Item (Join-Path $root $notice) (Join-Path $Source $name) -Force
 }
+Say "notices: $(@($notices).Count) files"
 
 $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
 if (-not $makensis) {

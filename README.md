@@ -175,12 +175,12 @@ cargo build --release
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE). Use
-whichever of the two you prefer.
+whichever of the two you prefer. The code may be reused in commercial projects.
 
-The model weights are not covered by either and state their own terms; see the
-[models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) and
-[models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) releases.
-`stemd_roformer`, which Quality runs, is CC BY-NC 4.0.
+The model weights are not covered by either. `stemd_roformer`, stemd's own
+model, which Quality runs, is CC BY-NC-SA 4.0. The other models keep the terms
+their authors give them. See [docs/models.md](docs/models.md) for the terms of
+each model.
 
 The MP3 encoder is LAME 3.100, which is under the GNU Library General Public
 License version 2 and is linked statically, so redistributing a built binary
