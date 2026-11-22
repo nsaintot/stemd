@@ -1,4 +1,5 @@
-//! The HTTP routes for health, jobs, logs and filters.
+//! The HTTP API. [`router`] builds every route: the ones below, and those of [`sessions`],
+//! [`separations`] and [`v1`].
 //!
 //! ```text
 //! GET    /v2/health                     runtime, model, queue and cache state
@@ -33,6 +34,10 @@ pub mod filters;
 pub mod health;
 pub mod jobs;
 pub mod params;
+pub mod separations;
+pub mod sessions;
+pub mod stem;
+pub mod v1;
 
 pub use error::ApiError;
 use filters::{get_filter, put_filter};
@@ -55,14 +60,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/v2/filters/{id}", get(get_filter))
-        .merge(crate::session_api::routes())
-        .merge(crate::separations::routes())
-        .merge(crate::v1::routes())
+        .merge(sessions::routes())
+        .merge(separations::routes())
+        .merge(v1::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             refuse_when_off,
         ))
-        .layer(axum::middleware::from_fn(crate::v1::deprecate))
+        .layer(axum::middleware::from_fn(v1::deprecate))
         .with_state(state)
 }
 

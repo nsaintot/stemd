@@ -157,7 +157,7 @@ fn request() -> Request {
         track: spec(),
         norm: None,
         peak: None,
-        model_id: "model".into(),
+        cache_id: "model".into(),
         claim: None,
     }
 }

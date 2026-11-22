@@ -55,7 +55,7 @@ const FILES: &str = ".files";
 /// The file in a track directory that a job writes its [`Separation`] to.
 const SEPARATION: &str = ".separation.json";
 /// The lock file in the root, which emptying the cache leaves in place.
-pub const LOCK_FILE: &str = "stemd.lock";
+const LOCK_FILE: &str = "stemd.lock";
 
 /// How often the age rules run.
 pub const CLEAN_EVERY: Duration = Duration::from_secs(3600);
@@ -374,9 +374,9 @@ impl Cache {
         self.publish_counted(&track_dir.join(INFO), &bytes)
     }
 
-    /// The type directories under `model_id`.
-    pub fn types(&self, model_id: &str) -> Vec<String> {
-        subdirs(&self.root.join(model_id))
+    /// The type directories under `cache_id`.
+    pub fn types(&self, cache_id: &str) -> Vec<String> {
+        subdirs(&self.root.join(cache_id))
             .iter()
             .filter_map(|dir| dir.file_name())
             .map(|name| name.to_string_lossy().into_owned())
@@ -399,8 +399,8 @@ impl Cache {
     }
 
     /// The directory of a verified track's pieces of one type.
-    pub fn verified_dir(&self, model_id: &str, type_dir: &str, track: &str) -> PathBuf {
-        self.root.join(model_id).join(type_dir).join(track)
+    pub fn verified_dir(&self, cache_id: &str, type_dir: &str, track: &str) -> PathBuf {
+        self.root.join(cache_id).join(type_dir).join(track)
     }
 
     /// The file for piece `k` of `stem` under `track_dir`, when it exists.
@@ -496,10 +496,7 @@ impl Cache {
     /// Write `path` through a staged file and a rename, so a reader never sees half of it.
     fn publish_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let staged = self.stage(path, bytes)?;
-        std::fs::rename(&staged, path).map_err(|err| {
-            let _ = std::fs::remove_file(&staged);
-            anyhow::Error::new(err).context(format!("publishing {}", path.display()))
-        })
+        crate::disk::publish(&staged, path)
     }
 }
 

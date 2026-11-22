@@ -82,7 +82,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn navy() -> Self {
+    fn navy() -> Self {
         Self {
             text: Color32::from_rgb(0xEE, 0xF0, 0xF6),
             muted: Color32::from_rgb(0xB4, 0xBB, 0xCC),
@@ -341,7 +341,7 @@ impl Brushes {
 }
 
 /// `box-shadow: 0 <dy> <blur> <colour>`.
-pub fn drop_shadow(rect: Rect, radius: f32, dy: f32, blur: f32, colour: Color32) -> egui::Shape {
+fn drop_shadow(rect: Rect, radius: f32, dy: f32, blur: f32, colour: Color32) -> egui::Shape {
     let shadow = Shadow {
         offset: [0, dy.round() as i8],
         blur: blur.round() as u8,
@@ -372,7 +372,7 @@ pub fn top_highlight(rect: Rect, radius: f32, colour: Color32) -> egui::Shape {
 }
 
 /// The outline of a rounded rectangle, clockwise from the top-left corner.
-pub fn rounded_outline(rect: Rect, radius: f32, steps: usize) -> Vec<Pos2> {
+fn rounded_outline(rect: Rect, radius: f32, steps: usize) -> Vec<Pos2> {
     use std::f32::consts::{FRAC_PI_2, PI};
     let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
     let corners = [

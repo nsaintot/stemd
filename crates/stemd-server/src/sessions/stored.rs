@@ -20,7 +20,7 @@ impl Sessions {
         let type_dir = type_dir(&session.output, session.gain);
         Some(
             self.cache
-                .verified_dir(&track.model_id, &type_dir, &track.stored_id()?),
+                .verified_dir(&track.cache_id, &type_dir, &track.stored_id()?),
         )
     }
 
@@ -65,7 +65,7 @@ impl Sessions {
         }
         for (name, output, gain) in outputs {
             let converts = output.rate.hz() != track.spec.sample_rate;
-            let dir = cache.verified_dir(&track.model_id, &name, &id);
+            let dir = cache.verified_dir(&track.cache_id, &name, &id);
             if let Err(err) = cache.write_info(&dir, &info) {
                 tracing::warn!(track = %id, "describing {name}: {err:#}");
                 continue;

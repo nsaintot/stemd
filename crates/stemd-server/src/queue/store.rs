@@ -86,7 +86,7 @@ pub(super) fn store_whole(
     let id = track_id(mix);
     let gain = output.gain(mix.peak().ok());
     let name = type_dir(output, gain);
-    let dir = cache.verified_dir(&work.model_id, &name, &id);
+    let dir = cache.verified_dir(&work.cache_id, &name, &id);
     let _writing = cache.writing(&dir);
     let frames = mix.frames();
     let info = TrackInfo {

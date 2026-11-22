@@ -17,6 +17,15 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     free_at(existing)
 }
 
+/// Move the finished file `partial` to `dest` in one rename, so a reader never sees half a file.
+/// On failure, delete `partial`.
+pub fn publish(partial: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::rename(partial, dest).map_err(|err| {
+        let _ = std::fs::remove_file(partial);
+        anyhow::Error::new(err).context(format!("publishing {}", dest.display()))
+    })
+}
+
 /// Work refused for want of disk space.
 #[derive(Debug, thiserror::Error)]
 #[error(

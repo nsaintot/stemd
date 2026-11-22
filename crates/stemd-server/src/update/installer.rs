@@ -152,7 +152,7 @@ pub fn download(release: &Release, mut progress: impl FnMut(f32)) -> Result<Setu
     }
     progress(1.0);
     let path = dir.join(&asset.name);
-    std::fs::rename(&partial, &path).with_context(|| format!("publishing {}", path.display()))?;
+    crate::disk::publish(&partial, &path)?;
     tracing::info!("downloaded {}", path.display());
     Ok(Setup {
         path,

@@ -19,11 +19,14 @@
 use sha2::{Digest, Sha256};
 use stemd_core::Audio;
 
+/// Behaviors added after protocol 2, listed in `/v2/health` and the TXT record.
+pub const FEATURES: &[&str] = &[];
+
 /// The longest id the server emits, excluding the NUL that a C client appends.
 ///
 /// 31 lets the id and its terminator fit a 32-byte buffer; a client that truncated an id would
 /// change it.
-pub const MAX_ID: usize = 31;
+const MAX_ID: usize = 31;
 
 /// The number of hex characters of a digest used to tell otherwise equal names apart.
 ///
@@ -31,7 +34,7 @@ pub const MAX_ID: usize = 31;
 pub const DIGEST_CHARS: usize = 8;
 
 /// True for characters a client keeps verbatim.
-pub const fn is_portable(c: char) -> bool {
+const fn is_portable(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
 }
 

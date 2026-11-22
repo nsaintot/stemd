@@ -128,17 +128,17 @@ impl TypeDir {
 
 /// `output`'s track directories for `id` at any gain: first those with every stem whole, then those
 /// holding only pieces, then the others.
-fn type_dirs(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Vec<TypeDir> {
+fn type_dirs(cache: &Cache, cache_id: &str, output: &Output, id: &str) -> Vec<TypeDir> {
     let prefix = type_prefix(output);
     let mut out: Vec<TypeDir> = cache
-        .types(model_id)
+        .types(cache_id)
         .into_iter()
         .filter_map(|name| {
             let gain: f32 = name.strip_prefix(&prefix)?.parse().ok()?;
             if !(gain.is_finite() && gain > 0.0) {
                 return None;
             }
-            let dir = cache.verified_dir(model_id, &name, id);
+            let dir = cache.verified_dir(cache_id, &name, id);
             let info = Cache::info(&dir)?;
             Some(TypeDir {
                 dir,
@@ -181,8 +181,8 @@ fn sources_of(output: &Output) -> Vec<(Output, Option<f32>)> {
 }
 
 /// A track directory of `output` for `id` with every stem stored whole, at any gain.
-pub fn whole_dir(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Option<TypeDir> {
-    let best = type_dirs(cache, model_id, output, id)
+pub fn whole_dir(cache: &Cache, cache_id: &str, output: &Output, id: &str) -> Option<TypeDir> {
+    let best = type_dirs(cache, cache_id, output, id)
         .into_iter()
         .find(TypeDir::all_whole)?;
     Cache::touch(&best.dir);
@@ -192,12 +192,12 @@ pub fn whole_dir(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Op
 /// A stored output that converts to `output`, and the gain the result has.
 pub fn derivable(
     cache: &Cache,
-    model_id: &str,
+    cache_id: &str,
     output: &Output,
     id: &str,
 ) -> Option<(TypeDir, f32)> {
     sources_of(output).into_iter().find_map(|(source, gain)| {
-        let found = type_dirs(cache, model_id, &source, id)
+        let found = type_dirs(cache, cache_id, &source, id)
             .into_iter()
             .find(TypeDir::all_whole)?;
         let gain = gain.unwrap_or(found.gain);
@@ -209,13 +209,13 @@ pub fn derivable(
 /// `gain` is preferred when it holds one.
 pub fn claimable(
     cache: &Cache,
-    model_id: &str,
+    cache_id: &str,
     output: &Output,
     id: &str,
     gain: f32,
 ) -> Option<TypeDir> {
-    let own = cache.verified_dir(model_id, &type_dir(output, gain), id);
-    let mut found: Vec<TypeDir> = type_dirs(cache, model_id, output, id)
+    let own = cache.verified_dir(cache_id, &type_dir(output, gain), id);
+    let mut found: Vec<TypeDir> = type_dirs(cache, cache_id, output, id)
         .into_iter()
         .filter(TypeDir::holds_any)
         .collect();
@@ -228,7 +228,7 @@ pub fn lookup(
     cache: &Arc<Cache>,
     sessions: &Sessions,
     jobs: &Jobs,
-    model_id: &str,
+    cache_id: &str,
     output: &Output,
     id: &str,
 ) -> Option<Lookup> {
@@ -249,7 +249,7 @@ pub fn lookup(
     };
     let answer = |state: Held, found: Option<&TypeDir>, mix: MixShape, gain: Option<f32>| Lookup {
         track: id.to_owned(),
-        model_id: model_id.to_owned(),
+        model_id: cache_id.to_owned(),
         frames: mix.frames,
         sample_rate: mix.sample_rate,
         channels: mix.channels,
@@ -260,7 +260,7 @@ pub fn lookup(
         stems: stem_states(found),
     };
 
-    let exact = type_dirs(cache, model_id, output, id);
+    let exact = type_dirs(cache, cache_id, output, id);
     if let Some(best) = exact.first() {
         Cache::touch(&best.dir);
         if best.all_whole() {
@@ -281,13 +281,13 @@ pub fn lookup(
             ));
         }
     }
-    if let Some((source, gain)) = derivable(cache, model_id, output, id) {
+    if let Some((source, gain)) = derivable(cache, cache_id, output, id) {
         Cache::touch(&source.dir);
         let mut lookup = answer(Held::Derivable, None, source.info.into(), Some(gain));
         lookup.from = Some(OutputView::of(&source.output, Some(source.gain)));
         return Some(lookup);
     }
-    if let Some(job) = jobs.running(&job_key(id, output, model_id)) {
+    if let Some(job) = jobs.running(&job_key(id, output, cache_id)) {
         let mut lookup = answer(Held::Separating, exact.first(), job.mix, None);
         lookup.job = Some(job.id.clone());
         return Some(lookup);
@@ -308,13 +308,13 @@ pub fn lookup(
 /// Convert `source` into `output` for track `id`, skipping stems already stored.
 pub fn derive(
     cache: &Cache,
-    model_id: &str,
+    cache_id: &str,
     id: &str,
     source: &TypeDir,
     output: &Output,
     gain: f32,
 ) -> Result<TypeDir> {
-    let dir = cache.verified_dir(model_id, &type_dir(output, gain), id);
+    let dir = cache.verified_dir(cache_id, &type_dir(output, gain), id);
     // A second request for the same output waits here, then finds the stems stored.
     let converting = cache.converting(&dir);
     let _held = converting.lock();

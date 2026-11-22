@@ -369,7 +369,7 @@ fn submit(queue: &Queue, job: Arc<Job>) {
                 dsp: DspMode::default().into(),
                 parts: stemd_core::Parts::DEFAULT,
             },
-            model_id: "test".into(),
+            cache_id: "test".into(),
             from_api: true,
         })
         .expect("queue has room");
@@ -817,7 +817,7 @@ fn a_stem_of_nan_fails_the_job() {
         job: jobs.create("diverged".into()),
         mix,
         output: crate::testkit::output(),
-        model_id: "model".into(),
+        cache_id: "model".into(),
         from_api: true,
     };
     let separation = Separation {
@@ -840,7 +840,7 @@ fn work_on(store: &crate::jobs::Jobs, mix: &Audio, output: Output) -> QueuedWork
         job: store.create(format!("{}-{}", output.rate, mix.frames())),
         mix: mix.clone(),
         output,
-        model_id: "model".into(),
+        cache_id: "model".into(),
         from_api: false,
     }
 }

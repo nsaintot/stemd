@@ -317,8 +317,7 @@ impl Filters {
         let path = self.path(id);
         let part = path.with_extension("part");
         std::fs::write(&part, body).with_context(|| format!("writing {}", part.display()))?;
-        std::fs::rename(&part, &path)
-            .with_context(|| format!("moving {} into place", part.display()))?;
+        crate::disk::publish(&part, &path)?;
 
         let fir = Arc::new(Fir {
             id: id.to_owned(),

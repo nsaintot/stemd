@@ -2,9 +2,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use anyhow::{Context, Result};
 use clap::Parser;
-use stemd_core::Precision;
+use stemd_core::{OutputRate, Precision, StemFormat};
+
+use crate::settings::SettingsFile;
+use crate::startup::Config;
 
 #[derive(Parser, Debug)]
 #[command(name = "stemd", about, version)]
@@ -157,39 +162,65 @@ impl Args {
         Self::parse_from(std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_")))
     }
 
-    /// A precision forced for every model, or `None` to let each model choose.
-    ///
-    /// The right precision depends on the model as much as on the backend, and a chained preset
-    /// runs two architectures that need different precisions. See [`crate::precision::Precisions`].
-    pub const fn forced_precision(&self) -> Option<Precision> {
-        if self.full_precision {
-            Some(Precision::F32)
-        } else {
-            None
-        }
-    }
-
-    pub fn unfetched_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.unfetched_ttl)
-    }
-
-    /// The cache root `--cache-dir` names, or [`crate::cache::default_dir`].
-    pub fn cache_root(&self) -> anyhow::Result<std::path::PathBuf> {
-        match self.cache_dir.clone() {
-            Some(dir) => Ok(dir),
-            None => crate::cache::default_dir(),
-        }
-    }
-
-    /// The cache's deletion rules, with the size and whole-track age `settings` holds.
-    pub fn cache_rules(&self, settings: &crate::settings::Settings) -> crate::cache::Rules {
-        let (max_bytes, whole_max_age) = settings.cache_limits();
-        crate::cache::Rules {
-            max_bytes,
+    /// What startup needs from these flags.
+    pub fn config(&self) -> Result<Config> {
+        let cache_root = match self.cache_dir.clone() {
+            Some(dir) => dir,
+            None => crate::cache::default_dir()?,
+        };
+        Ok(Config {
+            models: self.models.clone(),
+            demucs_model: self.demucs_model.clone(),
+            // The right precision depends on the model as much as on the backend; see
+            // [`crate::precision::Precisions`].
+            precision: self.full_precision.then_some(Precision::F32),
+            overlap: self.overlap,
+            cache_root,
+            cache_dir_given: self.cache_dir.is_some(),
+            queue_depth: self.queue_depth,
+            session_idle: Duration::from_secs(self.session_idle_secs),
+            max_sessions: self.max_sessions,
             partial_max_age: crate::settings::age(self.partial_max_hours * 3600.0),
-            whole_max_age,
-            unfetched_ttl: self.unfetched_ttl(),
-        }
+            unfetched_ttl: Duration::from_secs(self.unfetched_ttl),
+            ephemeral: self.ephemeral,
+            instance: self.instance.clone(),
+            mdns: !self.no_mdns,
+            offline: self.offline,
+            headless: self.headless,
+        })
+    }
+
+    /// Open the settings file and apply the flags that override it for this run.
+    ///
+    /// The flags are parsed here, so a typo fails at launch and quotes the flag.
+    pub fn open_settings(&self) -> Result<SettingsFile> {
+        let path = match self.settings.clone() {
+            Some(path) => path,
+            None => crate::settings::default_path()?,
+        };
+        let format = self
+            .output_format
+            .as_deref()
+            .map(|given| {
+                given
+                    .parse::<StemFormat>()
+                    .with_context(|| format!("bad --output-format {given:?}"))
+            })
+            .transpose()?;
+        let rate = self
+            .output_sample_rate
+            .as_deref()
+            .map(|given| {
+                given
+                    .parse::<OutputRate>()
+                    .with_context(|| format!("bad --output-sample-rate {given:?}"))
+            })
+            .transpose()?;
+
+        Ok(SettingsFile::open(path)
+            .pin(format, rate)
+            .pin_cache(self.cache_max_gb, self.whole_max_days)
+            .pin_server(self.bind.map(|addr| addr.port()), self.max_track_minutes))
     }
 }
 
@@ -199,15 +230,23 @@ mod tests {
 
     #[test]
     fn a_partial_age_past_what_a_duration_holds_keeps_partial_tracks_forever() {
-        let args = Args::parse_from(["stemd", "--partial-max-hours", "inf"]);
-        let rules = args.cache_rules(&crate::settings::Settings::default());
+        let args = Args::parse_from([
+            "stemd",
+            "--cache-dir",
+            "unused",
+            "--partial-max-hours",
+            "inf",
+        ]);
+        let config = args.config().unwrap();
+        let rules = config.cache_rules(&crate::settings::Settings::default());
         assert_eq!(rules.partial_max_age, std::time::Duration::MAX);
     }
 
     #[test]
     fn a_partial_age_of_zero_keeps_partial_tracks_until_the_cache_is_full() {
-        let args = Args::parse_from(["stemd", "--partial-max-hours", "0"]);
-        let rules = args.cache_rules(&crate::settings::Settings::default());
+        let args = Args::parse_from(["stemd", "--cache-dir", "unused", "--partial-max-hours", "0"]);
+        let config = args.config().unwrap();
+        let rules = config.cache_rules(&crate::settings::Settings::default());
         assert_eq!(rules.partial_max_age, std::time::Duration::MAX);
     }
 }

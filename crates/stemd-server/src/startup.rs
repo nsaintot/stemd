@@ -9,17 +9,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use stemd_core::{OutputRate, StemFormat};
 
 use crate::cache::Cache;
-use crate::cli::Args;
 use crate::jobs::Jobs;
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::models::{self, DEFAULT_PRESET, Preset};
 use crate::precision::Precisions;
 use crate::queue::Queue;
-use crate::settings::{self, SettingsFile};
+use crate::settings::SettingsFile;
 use crate::state::AppState;
 use crate::switch::{self, Switcher};
 
@@ -30,6 +28,45 @@ pub struct Server {
     pub cache_summary: String,
 }
 
+/// What startup takes from the command line.
+pub struct Config {
+    /// Directory holding the model artefacts.
+    pub models: PathBuf,
+    /// The artefact named on the command line, which overrides the saved model.
+    pub demucs_model: Option<String>,
+    /// A precision forced for every model, or `None` to let each model choose.
+    pub precision: Option<stemd_core::Precision>,
+    pub overlap: f32,
+    pub cache_root: PathBuf,
+    /// True when `--cache-dir` named the cache root.
+    pub cache_dir_given: bool,
+    pub queue_depth: usize,
+    pub session_idle: Duration,
+    pub max_sessions: usize,
+    pub partial_max_age: Duration,
+    pub unfetched_ttl: Duration,
+    pub ephemeral: bool,
+    /// The mDNS instance name.
+    pub instance: String,
+    /// Advertise over mDNS.
+    pub mdns: bool,
+    pub offline: bool,
+    pub headless: bool,
+}
+
+impl Config {
+    /// The cache's deletion rules, with the size and whole-track age `settings` holds.
+    pub fn cache_rules(&self, settings: &crate::settings::Settings) -> crate::cache::Rules {
+        let (max_bytes, whole_max_age) = settings.cache_limits();
+        crate::cache::Rules {
+            max_bytes,
+            partial_max_age: self.partial_max_age,
+            whole_max_age,
+            unfetched_ttl: self.unfetched_ttl,
+        }
+    }
+}
+
 /// Build every service the router depends on.
 ///
 /// The stem cache is opened before the model because the worker that loads the
@@ -38,7 +75,7 @@ pub struct Server {
 /// `endpoint` holds where the listener is already bound, which is the real port
 /// under `--bind :0`. Progress is reported through `launch`.
 pub fn prepare(
-    args: &Args,
+    config: &Config,
     logs: LogBuffer,
     settings: Arc<SettingsFile>,
     endpoint: crate::endpoint::Endpoint,
@@ -46,18 +83,17 @@ pub fn prepare(
 ) -> Result<Server> {
     // Detect once: the accelerator cannot change under a running server, so every model loaded
     // later uses the same answer.
-    let precisions = Precisions::detect(args.forced_precision());
+    let precisions = Precisions::detect(config.precision);
     // Warn here, before a model loads at CPU speed: in every later log line, a GPU whose runtime is
     // missing looks like no GPU, and only a missing runtime has a fix.
     warn_gpu_refused();
-    let (stems, cache_summary) = open_stem_cache(args, &settings.get())?;
-    let jobs = Arc::new(Jobs::new(args.unfetched_ttl()));
+    let (stems, cache_summary) = open_stem_cache(config, &settings.get())?;
+    let jobs = Arc::new(Jobs::new(config.unfetched_ttl));
 
-    let (model, queue, info) = load_model(args, &settings, &stems, precisions, launch)?;
-    queue.sessions().set_limits(
-        std::time::Duration::from_secs(args.session_idle_secs),
-        args.max_sessions,
-    );
+    let (model, queue, info) = load_model(config, &settings, &stems, precisions, launch)?;
+    queue
+        .sessions()
+        .set_limits(config.session_idle, config.max_sessions);
     stems.set_gate(queue.consolidation_gate());
     spawn_session_reaper(Arc::clone(&queue));
     let longest = crate::disk::longest_track_minutes();
@@ -73,8 +109,8 @@ pub fn prepare(
     // Build this before the app state so every exit path can reach it. A headless server has no
     // switch to turn it back on, so it always serves.
     let serving = crate::serving::Serving::new(
-        args.headless || settings.get().serving,
-        announce(args, endpoint.port()),
+        config.headless || settings.get().serving,
+        announce(config, endpoint.port()),
         &info.model,
     );
 
@@ -87,9 +123,9 @@ pub fn prepare(
         switch::SwitchConfig {
             dirs: model.search_dirs,
             cache: model.download_cache,
-            overlap: args.overlap,
+            overlap: config.overlap,
             precisions,
-            offline: args.offline,
+            offline: config.offline,
             artefact: model.artefact,
         },
     ));
@@ -113,7 +149,7 @@ pub fn prepare(
             settings,
             serving,
             filters,
-            ephemeral: args.ephemeral,
+            ephemeral: config.ephemeral,
             endpoint,
         }),
         cache_summary,
@@ -136,39 +172,6 @@ fn warn_gpu_refused() {
             "a GPU is installed but failed a test computation, so this runs on the CPU."
         );
     }
-}
-
-/// Open the settings file and apply the flags that override it for this run.
-///
-/// The flags are parsed here, so a typo fails at launch and quotes the flag.
-pub fn open_settings(args: &Args) -> Result<SettingsFile> {
-    let path = match args.settings.clone() {
-        Some(path) => path,
-        None => settings::default_path()?,
-    };
-    let format = args
-        .output_format
-        .as_deref()
-        .map(|given| {
-            given
-                .parse::<StemFormat>()
-                .with_context(|| format!("bad --output-format {given:?}"))
-        })
-        .transpose()?;
-    let rate = args
-        .output_sample_rate
-        .as_deref()
-        .map(|given| {
-            given
-                .parse::<OutputRate>()
-                .with_context(|| format!("bad --output-sample-rate {given:?}"))
-        })
-        .transpose()?;
-
-    Ok(SettingsFile::open(path)
-        .pin(format, rate)
-        .pin_cache(args.cache_max_gb, args.whole_max_days)
-        .pin_server(args.bind.map(|addr| addr.port()), args.max_track_minutes))
 }
 
 /// Where the model was found, and what the switcher needs to replace it later.
@@ -194,15 +197,15 @@ struct LoadedModel {
 //
 // [`Queue::start`] returns only once the worker has a model or has failed to get one.
 fn load_model(
-    args: &Args,
+    config: &Config,
     settings: &SettingsFile,
     stems: &Arc<Cache>,
     precisions: Precisions,
     launch: &Launch,
 ) -> Result<(LoadedModel, Arc<Queue>, stemd_core::BackendInfo)> {
     let saved = settings.get().preset;
-    if args.demucs_model.is_none() && launch.asks() && !args.offline {
-        let dirs = search_dirs(&args.models, &models::cache_dir()?);
+    if config.demucs_model.is_none() && launch.asks() && !config.offline {
+        let dirs = search_dirs(&config.models, &models::cache_dir()?);
         if models::locate(&dirs, saved).is_none() {
             let installed = Preset::ALL
                 .into_iter()
@@ -210,13 +213,13 @@ fn load_model(
                 .collect();
             tracing::info!("no {} model on disk; choose one", saved.label());
             let chosen = launch.choose(installed);
-            let loaded = load_artefact(args, chosen.artefact(), stems, precisions, launch)?;
+            let loaded = load_artefact(config, chosen.artefact(), stems, precisions, launch)?;
             settings.set_preset(chosen);
             return Ok(loaded);
         }
     }
-    let Some(requested) = args.demucs_model.clone() else {
-        return load_artefact(args, saved.artefact(), stems, precisions, launch).or_else(|err| {
+    let Some(requested) = config.demucs_model.clone() else {
+        return load_artefact(config, saved.artefact(), stems, precisions, launch).or_else(|err| {
             if saved == DEFAULT_PRESET {
                 return Err(err);
             }
@@ -225,14 +228,14 @@ fn load_model(
                 saved.artefact(),
                 DEFAULT_PRESET.artefact()
             );
-            load_artefact(args, DEFAULT_PRESET.artefact(), stems, precisions, launch)
+            load_artefact(config, DEFAULT_PRESET.artefact(), stems, precisions, launch)
         });
     };
-    load_artefact(args, &requested, stems, precisions, launch)
+    load_artefact(config, &requested, stems, precisions, launch)
 }
 
 fn load_artefact(
-    args: &Args,
+    config: &Config,
     artefact: &str,
     stems: &Arc<Cache>,
     precisions: Precisions,
@@ -241,21 +244,21 @@ fn load_artefact(
     let preset = Preset::from_artefact(artefact);
     let shown = preset.map_or_else(|| artefact.to_owned(), |p| p.label().to_owned());
     let download_cache = models::cache_dir()?;
-    let search_dirs = search_dirs(&args.models, &download_cache);
+    let search_dirs = search_dirs(&config.models, &download_cache);
     let dir = resolve_models(
         &search_dirs,
         &download_cache,
         preset,
         artefact,
-        args.offline,
+        config.offline,
         launch,
     )?;
 
     // Starting the worker loads the model: the worker builds what it runs.
     launch.set(Stage::Loading(shown));
     let (queue, info) = Queue::start(
-        models::builder(&dir, artefact, preset, args.overlap, precisions),
-        args.queue_depth,
+        models::builder(&dir, artefact, preset, config.overlap, precisions),
+        config.queue_depth,
         Arc::clone(stems),
     )?;
 
@@ -410,19 +413,19 @@ fn joined(dirs: &[PathBuf]) -> String {
 }
 
 fn open_stem_cache(
-    args: &Args,
+    config: &Config,
     settings: &crate::settings::Settings,
 ) -> Result<(Arc<Cache>, String)> {
-    let root = args.cache_root()?;
-    let rules = args.cache_rules(settings);
+    let root = config.cache_root.clone();
+    let rules = config.cache_rules(settings);
     let cache = Cache::open_with(root.clone(), rules)
         .with_context(|| format!("preparing the stem cache in {}", root.display()))?;
-    if args.ephemeral {
+    if config.ephemeral {
         cache.wipe();
     }
     // Remove the old pieces directory only next to the default root, since `--cache-dir` may name
     // that old directory.
-    if args.cache_dir.is_none() {
+    if !config.cache_dir_given {
         crate::migrate::remove_old_pieces_dir();
     }
     let stats = cache.stats();
@@ -451,12 +454,12 @@ fn open_filters() -> Result<Arc<crate::filters::Filters>> {
 }
 
 /// The name and port to announce over mDNS, unless asked not to.
-fn announce(args: &Args, port: u16) -> Option<(String, u16)> {
-    if args.no_mdns {
+fn announce(config: &Config, port: u16) -> Option<(String, u16)> {
+    if !config.mdns {
         tracing::info!("mDNS advertisement disabled");
         return None;
     }
-    Some((args.instance.clone(), port))
+    Some((config.instance.clone(), port))
 }
 
 /// Apply the cache's age rules every [`crate::cache::CLEAN_EVERY`], its

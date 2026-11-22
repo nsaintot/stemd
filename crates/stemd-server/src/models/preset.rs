@@ -157,7 +157,7 @@ pub const RETIRED: [&str; 4] = [
     "bs_roformer_viperx",
 ];
 
-pub const FAST_SOURCE: ModelSource = ModelSource {
+const FAST_SOURCE: ModelSource = ModelSource {
     files: &[RemoteFile {
         name: "htdemucs.safetensors",
         url: "https://github.com/nsaintot/stemd/releases/download/models-v2/htdemucs.safetensors",
@@ -166,7 +166,7 @@ pub const FAST_SOURCE: ModelSource = ModelSource {
     }],
 };
 
-pub const BALANCED_SOURCE: ModelSource = ModelSource {
+const BALANCED_SOURCE: ModelSource = ModelSource {
     files: &[BALANCED_WEIGHTS],
 };
 
@@ -181,7 +181,7 @@ const BALANCED_WEIGHTS: RemoteFile = RemoteFile {
 ///
 /// Converted by `tools/export/convert_stemd_roformer.py` and then
 /// `tools/export/convert_roformer.py`.
-pub const QUALITY_SOURCE: ModelSource = ModelSource {
+const QUALITY_SOURCE: ModelSource = ModelSource {
     files: &[RemoteFile {
         name: "stemd_roformer.safetensors",
         url: "https://github.com/nsaintot/stemd/releases/download/models-v3/stemd_roformer.safetensors",

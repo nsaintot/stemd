@@ -86,7 +86,8 @@ impl Cache {
     }
 
     /// True when `track_dir` failed to be stored whole less than [`RETRY_AFTER`] ago.
-    pub fn consolidation_failed(&self, track_dir: &Path) -> bool {
+    // pub(crate) for session_tests.rs.
+    pub(crate) fn consolidation_failed(&self, track_dir: &Path) -> bool {
         let mut failed = self.failed.lock();
         failed.retain(|_, at| at.elapsed() < RETRY_AFTER);
         failed.contains_key(track_dir)

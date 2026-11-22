@@ -7,7 +7,7 @@ use super::icons;
 use super::theme::{self, Brushes, Glass, Palette, Weight, white};
 
 /// Seconds a hover wash takes to come and go.
-pub const HOVER_SECS: f32 = 0.15;
+const HOVER_SECS: f32 = 0.15;
 
 /// The inner margin of every menu panel.
 const MENU_MARGIN: i8 = 6;
@@ -54,7 +54,7 @@ pub fn glass_list(
         });
 }
 
-pub fn fade_zone(panel: Rect, row_height: f32) -> Rect {
+fn fade_zone(panel: Rect, row_height: f32) -> Rect {
     let part = (panel.height() / row_height).fract();
     let cut = if part < 0.05 { 0.5 } else { part };
     Rect::from_x_y_ranges(
@@ -64,12 +64,12 @@ pub fn fade_zone(panel: Rect, row_height: f32) -> Rect {
 }
 
 /// Where the next shape painted on `ui`'s layer will go, for [`fade_out`].
-pub fn paint_mark(ui: &egui::Ui) -> egui::layers::ShapeIdx {
+fn paint_mark(ui: &egui::Ui) -> egui::layers::ShapeIdx {
     ui.ctx().graphics_mut(|g| g.entry(ui.layer_id()).next_idx())
 }
 
 /// Fade what `painter`'s layer received since `from` out to invisible across `zone`.
-pub fn fade_out(painter: &egui::Painter, from: egui::layers::ShapeIdx, zone: Rect) {
+fn fade_out(painter: &egui::Painter, from: egui::layers::ShapeIdx, zone: Rect) {
     let bands = (zone.height().ceil() as usize).max(2);
     let above = Rect::everything_above(zone.top());
     let caught: Vec<egui::epaint::ClippedShape> = painter.ctx().graphics_mut(|g| {
@@ -134,7 +134,7 @@ fn faded(shape: &egui::Shape, opacity: f32) -> egui::Shape {
 }
 
 /// Opacity of band `band` of `bands`: 1 on the first, 0 on the last, linear between.
-pub fn fade_at(band: usize, bands: usize) -> f32 {
+fn fade_at(band: usize, bands: usize) -> f32 {
     1.0 - band as f32 / (bands.max(2) - 1) as f32
 }
 
@@ -238,7 +238,7 @@ pub fn pill(
 }
 
 /// The panel every menu sits on.
-pub const fn menu_look(palette: &Palette) -> Frosted {
+const fn menu_look(palette: &Palette) -> Frosted {
     Frosted {
         radius: 14.0,
         margin: MENU_MARGIN,

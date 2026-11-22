@@ -35,7 +35,7 @@ use crate::models::RemoteFile;
 /// binary can call: the full archives total 2404 MB, of which these components are 1090 MB.
 /// `cuda_cudart` is listed although the binary does not import it, because it is 2.6 MB and several
 /// other components load it.
-pub const COMPONENTS: &[RemoteFile] = &[
+const COMPONENTS: &[RemoteFile] = &[
     RemoteFile {
         name: "libcublas.zip",
         url: concat!(
@@ -128,7 +128,7 @@ pub fn install(into: &Path, mut on_progress: impl FnMut(&str, u64, u64)) -> Resu
 
     let mut placed = 0;
     for component in COMPONENTS {
-        crate::models::fetch_file(&staging, component, &mut on_progress)?;
+        crate::models::fetch_one(&staging, component, &mut on_progress)?;
         let archive = staging.join(component.name);
         placed += unpack_libraries(&archive, into)
             .with_context(|| format!("unpacking {}", component.name))?;
@@ -178,7 +178,7 @@ fn unpack_libraries(archive: &Path, into: &Path) -> Result<usize> {
         drop(out);
         // Rename into place only once the file is whole, so an interrupted install cannot leave a
         // truncated library that the probe loads.
-        std::fs::rename(&partial, into.join(name)).with_context(|| format!("publishing {name}"))?;
+        crate::disk::publish(&partial, &into.join(name))?;
         tracing::debug!("installed {name}");
         placed += 1;
     }

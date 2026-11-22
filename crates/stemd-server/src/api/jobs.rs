@@ -105,7 +105,7 @@ pub(crate) async fn submit(
     body: Bytes,
 ) -> Result<(StatusCode, Arc<crate::jobs::Job>), ApiError> {
     if let Some(key) = &params.file {
-        crate::stem_http::check_file_key(key)?;
+        crate::api::stem::check_file_key(key)?;
     }
     let submission = Submission::parse(params, &body, state)?;
     let mix = decode_upload(body, submission.clone()).await?;
@@ -164,7 +164,7 @@ pub(super) fn enqueue(
             job: Arc::clone(job),
             mix,
             output: submission.output.clone(),
-            model_id: state.switcher.cache_id(),
+            cache_id: state.switcher.cache_id(),
             from_api: true,
         })
         .map_err(|refused| match refused {

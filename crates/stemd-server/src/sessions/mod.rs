@@ -41,7 +41,7 @@ pub use track::{Track, TrackSpec, UploadError, Verdict};
 pub use view::{Activity, Ended, GridView, StemView, TrackView, View};
 
 /// Samples of context resampled on each side of a range that is read at another rate.
-pub const RESAMPLE_CONTEXT: usize = 8192;
+const RESAMPLE_CONTEXT: usize = 8192;
 
 /// The number of ended sessions kept for the window.
 const ENDED_KEPT: usize = 8;
@@ -126,7 +126,7 @@ impl Session {
 
     /// Record the pieces of this output on disk now, and drop the planned
     /// segments they make unnecessary.
-    pub fn set_cached(&self, pieces: impl IntoIterator<Item = usize>) {
+    fn set_cached(&self, pieces: impl IntoIterator<Item = usize>) {
         *self.cached.lock() = pieces.into_iter().collect();
         let mut state = self.state.lock();
         let plan = std::mem::take(&mut state.plan);
@@ -171,7 +171,7 @@ impl Session {
     }
 
     /// An error naming why the session is closed, if it is.
-    pub fn ensure_open(&self) -> Result<()> {
+    fn ensure_open(&self) -> Result<()> {
         if let Some(reason) = self.closed() {
             bail!("this session is closed: {reason}");
         }
@@ -399,7 +399,7 @@ pub struct Request {
     pub track: TrackSpec,
     pub norm: Option<Normalisation>,
     pub peak: Option<f32>,
-    pub model_id: String,
+    pub cache_id: String,
     /// The stored track that the open names with `track=`, if any.
     pub claim: Option<Claim>,
 }
@@ -543,7 +543,7 @@ impl Sessions {
             .map_or_else(|| request.output.gain(request.peak), |c| c.gain);
         let track = Arc::new(Track::new(
             seq,
-            request.model_id.clone(),
+            request.cache_id.clone(),
             request.track,
             request.norm,
             request.claim.map(|c| c.id),
@@ -765,7 +765,7 @@ impl Sessions {
     }
 
     /// The sessions playing `track`.
-    pub fn of_track(&self, track: &Track) -> Vec<Arc<Session>> {
+    fn of_track(&self, track: &Track) -> Vec<Arc<Session>> {
         self.sessions
             .lock()
             .values()

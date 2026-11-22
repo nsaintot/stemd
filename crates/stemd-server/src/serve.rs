@@ -10,16 +10,16 @@ use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Request, State};
 
 use crate::api::{self};
-use crate::cli::Args;
 use crate::endpoint::{Endpoint, Moves};
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
 use crate::settings::SettingsFile;
+use crate::startup::Config;
 use crate::state::AppState;
 
 /// Prepare the server, then serve until a signal arrives.
 pub fn headless(
-    args: &Args,
+    config: &Config,
     logs: LogBuffer,
     settings: Arc<SettingsFile>,
     listener: std::net::TcpListener,
@@ -28,7 +28,7 @@ pub fn headless(
     let addr = listener.local_addr().context("reading the bound address")?;
     let (endpoint, moves) = Endpoint::new(addr, taken);
     let launch = Arc::new(Launch::default());
-    let server = crate::startup::prepare(args, logs, settings, endpoint, &launch)?;
+    let server = crate::startup::prepare(config, logs, settings, endpoint, &launch)?;
     let runtime = runtime()?;
     launch.finish(Arc::clone(&server.state));
     watch_for_signals(&runtime, &launch);
@@ -43,7 +43,7 @@ pub fn headless(
 /// download and the load. Serving starts when the model is loaded. A failed
 /// startup is shown in the window until it is closed.
 pub fn windowed(
-    args: Args,
+    config: Config,
     logs: LogBuffer,
     settings: Arc<SettingsFile>,
     listener: std::net::TcpListener,
@@ -66,7 +66,7 @@ pub fn windowed(
         .name("stemd-startup".into())
         .spawn(move || {
             let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::startup::prepare(&args, logs, settings, endpoint, &behind)
+                crate::startup::prepare(&config, logs, settings, endpoint, &behind)
             }));
             match prepared {
                 Ok(Ok(server)) => {

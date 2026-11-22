@@ -79,8 +79,8 @@ pub(super) struct TrackState {
 pub struct Track {
     /// Identifies the track while it is open; it stays the same when sessions join.
     pub uid: u64,
-    /// The `model_id` of the model that separates it.
-    pub model_id: String,
+    /// The cache id of the model that separates it, such as `htdemucs-22c7f2c9-1f2e3d4c`.
+    pub cache_id: String,
     pub spec: TrackSpec,
     /// The id that the open named with `track=`. Until the upload hashes to it, it is trusted only
     /// for reading stored pieces.
@@ -91,7 +91,7 @@ pub struct Track {
 impl Track {
     pub(super) fn new(
         uid: u64,
-        model_id: String,
+        cache_id: String,
         spec: TrackSpec,
         norm: Option<Normalisation>,
         claim: Option<String>,
@@ -104,7 +104,7 @@ impl Track {
         };
         Self {
             uid,
-            model_id,
+            cache_id,
             claim,
             state: Mutex::new(TrackState {
                 mix: Arc::new(silent()),

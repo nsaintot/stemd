@@ -108,7 +108,7 @@ pub fn length(frames: usize, sample_rate: u32) -> String {
 
 /// The number of session segments waiting, shown at the right of the heading; empty when none are
 /// waiting.
-pub fn queue_text(snapshot: &Snapshot) -> String {
+fn queue_text(snapshot: &Snapshot) -> String {
     let high: usize = snapshot.sessions.iter().map(|s| s.high).sum();
     let normal: usize = snapshot.sessions.iter().map(|s| s.normal).sum();
     if high + normal == 0 {
@@ -129,7 +129,7 @@ pub enum SessionState {
     Idle,
 }
 
-pub fn session_state(session: &Activity) -> SessionState {
+fn session_state(session: &Activity) -> SessionState {
     let planned = session.high + session.normal > 0;
     if session.runnable {
         SessionState::Separating
@@ -145,7 +145,7 @@ pub fn session_state(session: &Activity) -> SessionState {
 }
 
 /// A session's row detail, such as `uploading 25% · 20/40 pieces`.
-pub fn session_detail(session: &Activity) -> String {
+fn session_detail(session: &Activity) -> String {
     let dot = theme::DOT;
     let pieces = format!("{}/{} pieces", session.ready, session.pieces);
     match session_state(session) {
@@ -174,7 +174,7 @@ fn session_tooltip(session: &Activity) -> String {
 }
 
 /// An ended session's detail, and whether it ended on a failure.
-pub fn ended_detail(ended: &Ended) -> (String, bool) {
+fn ended_detail(ended: &Ended) -> (String, bool) {
     match ended.reason.as_str() {
         "idle" => ("ended: idle".to_owned(), false),
         reason if reason.starts_with("segment ") => (format!("failed: {reason}"), true),
@@ -185,7 +185,7 @@ pub fn ended_detail(ended: &Ended) -> (String, bool) {
 
 /// A client job's detail, such as `separating · 39% · about 40 s left`. A
 /// waiting job reads `waiting for the worker`, as a waiting drop does.
-pub fn job_detail(progress: &Progress, left: Option<f64>) -> String {
+fn job_detail(progress: &Progress, left: Option<f64>) -> String {
     let dot = theme::DOT;
     if progress.stage == stemd_core::Stage::Queued {
         return super::dropzone::stage_label(progress.stage).to_owned();

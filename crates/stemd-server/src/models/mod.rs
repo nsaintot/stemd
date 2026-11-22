@@ -36,7 +36,7 @@ pub use preset::{DEFAULT_PRESET, ModelSource, Preset, RETIRED, WEIGHTS_EXTENSION
 // them; everything else downloads a whole `ModelSource`. They are exported only on Windows, where
 // CUDA can be installed.
 #[cfg(windows)]
-pub use download::fetch_one as fetch_file;
+pub use download::fetch_one;
 /// Used by the updater to download Setup.
 #[cfg(windows)]
 pub use download::stream_to_file;

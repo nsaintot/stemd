@@ -17,10 +17,7 @@ use objc2::{AllocAnyThread, define_class, msg_send, sel};
 use objc2_foundation::{NSBundle, NSString};
 use parking_lot::Mutex;
 
-use super::{Status, repaint};
-
-/// How long "Up to date" and "Check failed" stay in the slot.
-const NOTICE: Duration = Duration::from_millis(2600);
+use super::{Notice, Status, repaint};
 
 /// Sparkle's error code for a check that found nothing newer.
 const NO_UPDATE: isize = 1001;
@@ -36,11 +33,11 @@ enum Phase {
         since: Instant,
     },
     UpToDate {
-        until: Instant,
+        until: Notice,
     },
     Failed {
         error: String,
-        until: Instant,
+        until: Notice,
     },
     Available(String),
 }
@@ -83,7 +80,7 @@ define_class!(
             let checking = matches!(*PHASE.lock(), Phase::Checking { .. });
             set(if checking {
                 Phase::UpToDate {
-                    until: Instant::now() + NOTICE,
+                    until: Notice::now(),
                 }
             } else {
                 Phase::Idle
@@ -108,7 +105,7 @@ define_class!(
                     tracing::warn!("update check failed: {error}");
                     Phase::Failed {
                         error,
-                        until: Instant::now() + NOTICE,
+                        until: Notice::now(),
                     }
                 }
                 None => Phase::Idle,
@@ -214,7 +211,7 @@ pub fn status() -> Status {
             let error = format!("no answer from Sparkle in {} s", NO_ANSWER.as_secs());
             *phase = Phase::Failed {
                 error: error.clone(),
-                until: Instant::now() + NOTICE,
+                until: Notice::now(),
             };
             Status::Failed {
                 title: "Check failed",
@@ -222,7 +219,7 @@ pub fn status() -> Status {
             }
         }
         Phase::Checking { .. } => Status::Checking,
-        Phase::UpToDate { until } | Phase::Failed { until, .. } if Instant::now() >= *until => {
+        Phase::UpToDate { until } | Phase::Failed { until, .. } if until.expired() => {
             *phase = Phase::Idle;
             Status::Idle
         }

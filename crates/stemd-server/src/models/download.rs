@@ -77,7 +77,7 @@ pub fn fetch_one(
     }
 
     let dest = dir.join(file.name);
-    std::fs::rename(&partial, &dest).with_context(|| format!("publishing {}", dest.display()))?;
+    crate::disk::publish(&partial, &dest)?;
     tracing::info!("{} ready", file.name);
     Ok(())
 }

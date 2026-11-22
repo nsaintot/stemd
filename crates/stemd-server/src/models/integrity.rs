@@ -49,7 +49,7 @@ impl<W: Write> Write for Hashing<W> {
 }
 
 /// SHA-256 of a file, streamed so a 675 MB artefact is not read into memory.
-pub fn digest_of(path: &Path) -> Result<String> {
+fn digest_of(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hashing = Hashing::new(std::io::sink());
     std::io::copy(

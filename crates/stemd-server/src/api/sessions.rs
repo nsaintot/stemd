@@ -27,13 +27,13 @@ use stemd_core::{Audio, Normalisation, StemFormat};
 
 use crate::api::error::ApiError;
 use crate::api::params::{CreateParams, default_channels, default_rate, parse_output};
+use crate::api::stem::{audio_response, send_whole};
 use crate::cache::{Cache, TrackInfo};
 use crate::output::{Output, output_span};
 use crate::sessions::{
     Claim, JoinError, OpenError, Request, Session, Sessions, TrackSpec, UploadError, WindowRequest,
 };
 use crate::state::AppState;
-use crate::stem_http::{audio_response, send_whole};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -163,7 +163,7 @@ async fn open(
     let info = state.queue.info();
     check_shape(&params, &output, model_rate, &info)?;
     if let Some(key) = &params.file {
-        crate::stem_http::check_file_key(key)?;
+        crate::api::stem::check_file_key(key)?;
     }
     let norm = parse_levels(&params)?;
     let (frames, stored) = match &params.track {
@@ -222,7 +222,7 @@ async fn open(
             track: spec,
             norm,
             peak: params.peak,
-            model_id: state.switcher.cache_id(),
+            cache_id: state.switcher.cache_id(),
             claim,
         })
         .map_err(open_error)?;
@@ -348,13 +348,13 @@ async fn stored_claim(
     output: &Output,
     id: &str,
 ) -> Result<(TrackInfo, Claim), ApiError> {
-    if crate::stem_http::check_id(id).is_err() {
+    if crate::api::stem::check_id(id).is_err() {
         return Err(unknown_track(id));
     }
-    let (cache, model_id) = (Arc::clone(&state.cache), state.switcher.cache_id());
+    let (cache, cache_id) = (Arc::clone(&state.cache), state.switcher.cache_id());
     let (output, claimed, gain) = (output.clone(), id.to_owned(), output.gain(params.peak));
     let found = tokio::task::spawn_blocking(move || {
-        crate::held::claimable(&cache, &model_id, &output, &claimed, gain)
+        crate::held::claimable(&cache, &cache_id, &output, &claimed, gain)
     })
     .await
     .map_err(|e| ApiError::internal(format!("looking up the stored pieces: {e}")))?
