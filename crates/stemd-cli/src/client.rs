@@ -91,7 +91,8 @@ pub struct Output {
 pub struct JobResult {
     pub output: Output,
     pub stems: Vec<StemRef>,
-    pub model_residual_db: f64,
+    /// `None` for stems a session stored.
+    pub model_residual_db: Option<f64>,
     pub separation_secs: f64,
     pub realtime_factor: f64,
 }

@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stemd_core::{Audio, Grid, Normalisation, Parts, PcmFormat, Stems};
 
-use crate::cache::Output;
-use crate::pieces::{Consolidation, Pieces, TrackInfo, stems_of, type_dir};
+use crate::cache::{Cache, Consolidation, TrackInfo, stems_of, type_dir};
+use crate::output::Output;
 use crate::whole::Whole;
 
 /// Samples of context resampled either side of a range read at another rate.
@@ -296,7 +296,8 @@ pub enum Verdict {
 }
 
 struct TrackState {
-    mix: Audio,
+    /// Shared once the whole upload is in, so it is hashed outside the lock.
+    mix: Arc<Audio>,
     arrived: Spans,
     norm: Option<Normalisation>,
     /// True when `norm` came from a client and has not been checked.
@@ -331,7 +332,7 @@ impl Track {
             uid,
             model_id,
             state: Mutex::new(TrackState {
-                mix: silent(),
+                mix: Arc::new(silent()),
                 arrived: Spans::default(),
                 norm: norm.filter(|_| spec.normalises),
                 norm_from_client: norm.is_some() && spec.normalises,
@@ -388,18 +389,24 @@ impl Track {
                 }
             }
         }
-        let was_complete = state.arrived.covers(&(0..self.spec.frames));
-        for (dst, src) in state.mix.data.iter_mut().zip(&audio.data) {
+        if state.arrived.covers(&(0..self.spec.frames)) {
+            return Ok(None);
+        }
+        let mix = Arc::make_mut(&mut state.mix);
+        for (dst, src) in mix.data.iter_mut().zip(&audio.data) {
             dst[offset..end].copy_from_slice(src);
         }
         state.arrived.insert(offset..end);
-        if was_complete || !state.arrived.covers(&(0..self.spec.frames)) {
+        if !state.arrived.covers(&(0..self.spec.frames)) {
             return Ok(None);
         }
 
         // The whole track is here: settle its statistics and its identity.
-        let computed = Normalisation::of(&state.mix);
-        let actual = track_id(&state.mix);
+        let mix = Arc::clone(&state.mix);
+        drop(state);
+        let computed = Normalisation::of(&mix);
+        let actual = track_id(&mix);
+        let mut state = self.state.lock();
         let client_norm_differs = self.spec.normalises
             && state.norm_from_client
             && state.norm.is_some_and(|n| {
@@ -544,15 +551,21 @@ impl Track {
             }
             let model = self.spec.sample_rate;
             let out = output.rate.hz();
-            let (start, end) = if model == out {
-                (from, to)
+            let (start, end, ready) = if model == out {
+                (from, to, from)
             } else {
                 let span = state.ready.span_of(from).cloned().unwrap_or(from..to);
                 let step = (model / gcd(model, out)) as usize;
+                // A multiple of `step` keeps the output grid; unready samples read as silence.
                 let start = from.saturating_sub(RESAMPLE_CONTEXT).max(span.start) / step * step;
-                (start, (to + RESAMPLE_CONTEXT).min(span.end))
+                (start, (to + RESAMPLE_CONTEXT).min(span.end), span.start)
             };
-            (Self::part(&state, name, start, end), start)
+            let mut audio = Self::part(&state, name, start, end);
+            let unready = ready.saturating_sub(start);
+            for channel in &mut audio.data {
+                channel[..unready].fill(0.0);
+            }
+            (audio, start)
         };
 
         let model = u64::from(self.spec.sample_rate);
@@ -712,7 +725,7 @@ pub struct Activity {
     pub sample_rate: u32,
     /// Pieces in the track.
     pub pieces: usize,
-    /// Pieces ready in memory or in the piece store.
+    /// Pieces ready in memory or in the cache.
     pub ready: usize,
     /// Samples uploaded.
     pub arrived: usize,
@@ -1060,7 +1073,7 @@ pub struct Sessions {
     /// Tracks whose whole upload has been hashed, by id and part set.
     by_id: Mutex<BTreeMap<String, u64>>,
     limits: Mutex<(Duration, usize)>,
-    pieces: Mutex<Option<Arc<Pieces>>>,
+    cache: Arc<Cache>,
     /// The last [`ENDED_KEPT`] sessions to end, oldest first.
     ended: Mutex<VecDeque<Ended>>,
     seq: AtomicU64,
@@ -1068,24 +1081,32 @@ pub struct Sessions {
     changes: tokio::sync::watch::Sender<u64>,
 }
 
-impl Default for Sessions {
-    fn default() -> Self {
-        Self::new(Duration::from_secs(30), 4)
-    }
-}
-
 impl Sessions {
-    pub fn new(idle: Duration, max: usize) -> Self {
-        Self {
+    /// Sessions on `cache`, which keeps the tracks they play from eviction.
+    pub fn new(idle: Duration, max: usize, cache: Arc<Cache>) -> Arc<Self> {
+        let sessions = Arc::new(Self {
             sessions: Mutex::new(BTreeMap::new()),
             tracks: Mutex::new(BTreeMap::new()),
             by_id: Mutex::new(BTreeMap::new()),
             limits: Mutex::new((idle, max)),
-            pieces: Mutex::new(None),
+            cache,
             ended: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
             changes: tokio::sync::watch::Sender::new(0),
-        }
+        });
+        let weak = Arc::downgrade(&sessions);
+        sessions.cache.set_in_use(Box::new(move || {
+            weak.upgrade()
+                .map(|s| s.open_track_ids())
+                .unwrap_or_default()
+        }));
+        let weak = Arc::downgrade(&sessions);
+        sessions.cache.set_on_change(Box::new(move || {
+            if let Some(sessions) = weak.upgrade() {
+                sessions.changed();
+            }
+        }));
+        sessions
     }
 
     /// Record that a view may have changed, and wake the long polls.
@@ -1135,7 +1156,7 @@ impl Sessions {
                     stem.stored = Storage::Whole;
                     stem.bytes = std::fs::metadata(&whole.path).map(|m| m.len()).ok();
                 } else if let Some(dir) = &dir {
-                    let stored = Pieces::stem_pieces(dir, name, extension, track.spec.grid.len());
+                    let stored = Cache::stem_pieces(dir, name, extension, track.spec.grid.len());
                     if !stored.is_empty() {
                         stem.stored = Storage::Pieces;
                         stem.pieces = spans_of(&stored);
@@ -1154,32 +1175,14 @@ impl Sessions {
         self.limits.lock().0
     }
 
-    /// Use `pieces` as the cache, and keep the tracks of open sessions from eviction.
-    pub fn set_pieces(self: &Arc<Self>, pieces: Arc<Pieces>) {
-        let sessions = Arc::downgrade(self);
-        pieces.set_in_use(Box::new(move || {
-            sessions
-                .upgrade()
-                .map(|s| s.open_track_ids())
-                .unwrap_or_default()
-        }));
-        let sessions = Arc::downgrade(self);
-        pieces.set_on_change(Box::new(move || {
-            if let Some(sessions) = sessions.upgrade() {
-                sessions.changed();
-            }
-        }));
-        *self.pieces.lock() = Some(pieces);
-    }
-
     /// The ids of the verified tracks open sessions play.
     fn open_track_ids(&self) -> HashSet<String> {
         let tracks: Vec<Arc<Track>> = self.tracks.lock().values().cloned().collect();
         tracks.iter().filter_map(|t| t.verified()).collect()
     }
 
-    pub fn pieces(&self) -> Option<Arc<Pieces>> {
-        self.pieces.lock().clone()
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
     }
 
     /// The track directory of `session`'s output, once its track id is known.
@@ -1187,7 +1190,7 @@ impl Sessions {
         let track = session.track();
         let type_dir = type_dir(&session.output, session.gain);
         Some(
-            self.pieces()?
+            self.cache
                 .verified_dir(&track.model_id, &type_dir, &track.verified()?),
         )
     }
@@ -1304,8 +1307,8 @@ impl Sessions {
     /// Record `session`'s file key against `track_id`, when it sent one.
     pub fn record_file(&self, session: &Session, track_id: &str) {
         let key = session.file.lock().clone();
-        if let (Some(pieces), Some(key)) = (self.pieces(), key)
-            && let Err(err) = pieces.record_file(&key, track_id)
+        if let Some(key) = key
+            && let Err(err) = self.cache.record_file(&key, track_id)
         {
             tracing::warn!(session = %session.id, "recording file key {key}: {err:#}");
         }
@@ -1326,7 +1329,7 @@ impl Sessions {
         let Some(dir) = self.track_dir(session) else {
             return Vec::new();
         };
-        Pieces::cached(
+        Cache::cached(
             &dir,
             &served(&session.output),
             session.output.format.extension(),
@@ -1336,11 +1339,12 @@ impl Sessions {
 
     /// Encode and write the pieces near `touched` that are complete in `track`, once it is hashed.
     pub fn store_pieces(&self, track: &Track, touched: Range<usize>) {
-        let (Some(pieces), Some(id)) = (self.pieces(), track.verified()) else {
+        let Some(id) = track.verified() else {
             return;
         };
+        let cache = &self.cache;
         // Pieces are a cache, so a nearly full disk skips them and the job goes on.
-        if crate::disk::low(pieces.root()) {
+        if crate::disk::low(cache.root()) {
             tracing::debug!(track = %id, "disk nearly full, not writing pieces");
             return;
         }
@@ -1361,8 +1365,8 @@ impl Sessions {
         }
         for (name, output, gain) in outputs {
             let converts = output.rate.hz() != track.spec.sample_rate;
-            let dir = pieces.verified_dir(&track.model_id, &name, &id);
-            if let Err(err) = pieces.write_info(&dir, &info) {
+            let dir = cache.verified_dir(&track.model_id, &name, &id);
+            if let Err(err) = cache.write_info(&dir, &info) {
                 tracing::warn!(track = %id, "describing {name}: {err:#}");
                 continue;
             }
@@ -1374,7 +1378,7 @@ impl Sessions {
                 let written = stems_of(&output).into_iter().try_for_each(|stem| {
                     let excerpt = track.read(&output, stem, piece.start, piece.end)?;
                     let bytes = stemd_core::encode_stem(&excerpt.audio, output.format, gain)?;
-                    pieces.write_verified(&dir, stem, k, output.format.extension(), &bytes)
+                    cache.write_verified(&dir, stem, k, output.format.extension(), &bytes)
                 });
                 match written {
                     Ok(()) => track.mark_written(k, &name),
@@ -1388,8 +1392,8 @@ impl Sessions {
                 info,
                 stems: stems_of(&output),
             };
-            if Pieces::needs_consolidation(&task) {
-                pieces.consolidate_later(task);
+            if Cache::needs_consolidation(&task) {
+                cache.consolidate_later(task);
             }
         }
     }
@@ -1423,7 +1427,7 @@ impl Sessions {
             if whole.is_some() {
                 return Some(Source::Whole);
             }
-            Pieces::lookup(dir.as_ref()?, name, k, output.format.extension()).map(Source::Piece)
+            Cache::lookup(dir.as_ref()?, name, k, output.format.extension()).map(Source::Piece)
         };
 
         // A chunk comes from memory when it is ready with the context a rate
@@ -1494,7 +1498,7 @@ impl Sessions {
                         let k = run.start / stride;
                         let piece_at = output_index(track.piece(k).start, model, out);
                         let piece_len = output_index(track.piece(k).end, model, out) - piece_at;
-                        let audio = crate::pieces::decode(
+                        let audio = crate::cache::decode(
                             bytes,
                             output.format,
                             track.spec.channels,
@@ -1546,7 +1550,7 @@ impl Sessions {
         let frames = TrackInfo::from(&session.track().spec).frames_at(session.output.rate.hz());
         let whole =
             crate::whole::find_track(&dir, name, session.output.format.extension(), frames)?;
-        Pieces::touch(&dir);
+        Cache::touch(&dir);
         Some(whole)
     }
 
@@ -1561,12 +1565,11 @@ impl Sessions {
         clipped: Option<usize>,
     ) -> Result<()> {
         let track = session.track();
-        let (Some(pieces), Some(dir), Some(id)) =
-            (self.pieces(), self.track_dir(session), track.verified())
-        else {
+        let (Some(dir), Some(id)) = (self.track_dir(session), track.verified()) else {
             return Ok(());
         };
-        if crate::disk::low(pieces.root()) {
+        let cache = &self.cache;
+        if crate::disk::low(cache.root()) {
             return Ok(());
         }
         let task = Consolidation {
@@ -1576,7 +1579,7 @@ impl Sessions {
             info: TrackInfo::from(&track.spec),
             stems: stems_of(&session.output),
         };
-        pieces.consolidate(&task, name, bytes, frames, clipped)?;
+        cache.consolidate(&task, name, bytes, frames, clipped)?;
         tracing::info!(track = %id, "stored {name} whole");
         Ok(())
     }
@@ -1753,6 +1756,15 @@ mod tests {
     use super::*;
     use stemd_core::{DspMode, OutputRate, StemFormat};
 
+    /// Sessions on a cache no other test touches.
+    fn sessions(idle: Duration) -> Arc<Sessions> {
+        Sessions::new(
+            idle,
+            4,
+            crate::testkit::cache(1 << 30, Duration::from_secs(60)),
+        )
+    }
+
     #[test]
     fn spans_merge_what_touches_and_cover_only_within_one_span() {
         let mut spans = Spans::default();
@@ -1910,7 +1922,7 @@ mod tests {
 
     #[test]
     fn two_sessions_at_one_rank_take_turns_and_a_better_rank_goes_first() {
-        let sessions = Sessions::new(Duration::from_secs(30), 4);
+        let sessions = sessions(Duration::from_secs(30));
         let a = sessions.open(request()).expect("open");
         let b = sessions.open(request()).expect("open");
         for (i, session) in [&a, &b].into_iter().enumerate() {
@@ -1954,7 +1966,7 @@ mod tests {
 
     #[test]
     fn two_sessions_on_the_same_audio_end_up_on_one_track() {
-        let sessions = Sessions::default();
+        let sessions = sessions(Duration::from_secs(30));
         let mix = audio(100_000, 0.01);
         let a = sessions.open(request()).expect("open");
         let b = sessions.open(request()).expect("open");
@@ -1986,7 +1998,7 @@ mod tests {
 
     #[test]
     fn an_upload_that_differs_from_what_the_track_holds_is_refused() {
-        let sessions = Sessions::default();
+        let sessions = sessions(Duration::from_secs(30));
         let a = sessions.open(request()).expect("open");
         let mix = audio(100_000, 0.01);
         let track = a.track();
@@ -2002,7 +2014,7 @@ mod tests {
 
     #[test]
     fn client_statistics_that_differ_from_the_mix_keep_the_track_unshared() {
-        let sessions = Sessions::default();
+        let sessions = sessions(Duration::from_secs(30));
         let mix = audio(100_000, 0.01);
         let mut wrong = request();
         wrong.norm = Some(Normalisation::new(0.5, 2.0));
@@ -2014,7 +2026,7 @@ mod tests {
 
     #[test]
     fn a_range_not_ready_is_refused() {
-        let sessions = Sessions::default();
+        let sessions = sessions(Duration::from_secs(30));
         let session = sessions.open(request()).expect("open");
         let err = session
             .read("vocals", 0, 10)
@@ -2050,7 +2062,7 @@ mod tests {
         let mut req = request();
         req.output.rate = OutputRate::Hz96000;
         req.output.dsp = DspMode::Mode1.into();
-        let sessions = Sessions::default();
+        let sessions = sessions(Duration::from_secs(30));
         let session = sessions.open(req).expect("open");
         let track = session.track();
         track.upload(0, &audio(frames, 0.01)).expect("upload");
@@ -2068,8 +2080,47 @@ mod tests {
     }
 
     #[test]
+    fn a_read_at_another_rate_takes_nothing_from_before_the_ready_span() {
+        let (frames, ready) = (100_000, 50_000);
+        assert_ne!(ready % 147, 0);
+        let mut req = request();
+        req.output.rate = OutputRate::Hz48000;
+        req.output.derived = true;
+        let sessions = sessions(Duration::from_secs(30));
+        let session = sessions.open(req).expect("open");
+        let track = session.track();
+        let mix = audio(frames, 0.01);
+        track.upload(0, &mix).expect("upload");
+        // From `ready` on the parts sum to the mix, so the derived part is silent there.
+        let half = Audio::new(
+            mix.data
+                .iter()
+                .map(|c| c[ready..].iter().map(|v| v * 0.5).collect())
+                .collect(),
+            44_100,
+        );
+        let stems = Stems {
+            shipped: stemd_core::SHIPPED
+                .iter()
+                .map(|name| (*name, half.clone()))
+                .collect(),
+            model_residual_db: 0.0,
+            more: Vec::new(),
+        };
+        track.store(ready, frames, &stems).expect("store");
+        let got = session.read("drums", ready, ready + 10_000).expect("read");
+        let peak = got
+            .audio
+            .data
+            .iter()
+            .flatten()
+            .fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 1e-6, "the unseparated mix leaked in at {peak}");
+    }
+
+    #[test]
     fn the_activity_counts_uploads_plans_and_stored_pieces() {
-        let sessions = Sessions::new(Duration::from_secs(30), 4);
+        let sessions = sessions(Duration::from_secs(30));
         let session = sessions.open(request()).expect("open");
         let track = session.track();
         track
@@ -2102,7 +2153,7 @@ mod tests {
 
     #[test]
     fn an_ended_session_is_kept_with_its_reason() {
-        let sessions = Sessions::new(Duration::from_millis(20), 4);
+        let sessions = sessions(Duration::from_millis(20));
         let first = sessions.open(request()).expect("open");
         let second = sessions.open(request()).expect("open");
         let third = sessions.open(request()).expect("open");
@@ -2131,7 +2182,7 @@ mod tests {
 
     #[test]
     fn a_quiet_session_with_nothing_to_run_is_reaped() {
-        let sessions = Sessions::new(Duration::from_millis(20), 4);
+        let sessions = sessions(Duration::from_millis(20));
         let session = sessions.open(request()).expect("open");
         assert_eq!(sessions.reap(), 0, "reaped at once");
         std::thread::sleep(Duration::from_millis(40));

@@ -303,9 +303,12 @@ launch.
 | `--settings` | user data directory | |
 | `--overlap` | `0.25` | segment overlap fraction |
 | `--full-precision` | off | float32 model, 1.3x slower |
-| `--cache-dir` | user cache directory | emptied at every start |
-| `--cache-max-gb` | `4` | about 80 tracks as flac, 37 as pcm16 |
-| `--unfetched-ttl` | `300` | seconds |
+| `--cache-dir` | user cache directory | kept across restarts; alias `--pieces-dir` |
+| `--cache-max-gb` | `8` | about 200 six-minute tracks as 44.1 kHz flac; alias `--pieces-max-gb` |
+| `--partial-max-hours` | `24` | a track with a stem still in pieces, unused |
+| `--whole-max-days` | `30` | a track with every stem whole, unused |
+| `--ephemeral` | off | empty the cache at start and at quit |
+| `--unfetched-ttl` | `300` | seconds a job result is held for its client |
 | `--max-track-minutes` | `10` | the only size limit, body cap derived |
 | `--queue-depth` | `16` | `429` past this |
 | `--models` | `models` | searched before the download cache |

@@ -74,6 +74,19 @@ impl Meta {
     }
 }
 
+/// Samples of `audio` over full scale at `gain`; with `stored`, samples at full scale count too.
+pub fn clipped(audio: &Audio, gain: f32, stored: bool) -> usize {
+    audio
+        .data
+        .iter()
+        .flatten()
+        .filter(|v| {
+            let v = (*v * gain).abs();
+            if stored { v >= 1.0 } else { v > 1.0 }
+        })
+        .count()
+}
+
 /// The whole file of `stem` under `track_dir`, when it holds `frames` samples.
 pub fn find_track(track_dir: &Path, stem: &str, extension: &str, frames: usize) -> Option<Whole> {
     find(track_dir, stem, extension).filter(|whole| whole.meta.frames == frames)
@@ -142,7 +155,7 @@ pub fn read(
             let mut bytes = take(0, meta.header)?;
             unknown_length(&mut bytes)?;
             bytes.extend(take(start, (end - start) as usize)?);
-            let audio = crate::pieces::decode(bytes, format, channels, rate)?;
+            let audio = crate::cache::decode(bytes, format, channels, rate)?;
             let skip = from - a * meta.block;
             ensure!(
                 audio.frames() >= skip + (to - from),
@@ -159,9 +172,9 @@ pub fn read(
             };
             let per_frame = channels * size;
             let bytes = take((header + from * per_frame) as u64, (to - from) * per_frame)?;
-            crate::pieces::decode(bytes, raw, channels, rate)
+            crate::cache::decode(bytes, raw, channels, rate)
         }
-        StemFormat::Mp3 => bail!("mp3 is never stored"),
+        StemFormat::Mp3 => bail!("an mp3 stem is not read by range"),
     }
 }
 
@@ -370,7 +383,7 @@ mod tests {
                 StemFormat::Pcm32,
             ] {
                 let whole = stored(&dir, format, &audio);
-                let all = crate::pieces::decode(
+                let all = crate::cache::decode(
                     std::fs::read(&whole.path).expect("reading"),
                     format,
                     2,

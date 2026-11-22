@@ -125,6 +125,16 @@ impl Switcher {
         )
     }
 
+    /// The cache's directory for the loaded model: [`Self::published_identity`] plus a
+    /// digest of [`Self::identity`].
+    pub fn cache_id(&self) -> String {
+        format!(
+            "{}-{}",
+            self.published_identity(),
+            ident::short_digest(&self.identity())
+        )
+    }
+
     /// The same identity as clients see and store it.
     ///
     /// A client keys its own stem cache on this, so it becomes a directory name: the
@@ -280,8 +290,7 @@ impl Switcher {
 /// because `m=` carries the only value not drawn from a closed set:
 /// `--demucs-model` is arbitrary operator input, and every field after it is
 /// `;`-free, so reading from the right is unambiguous. A second free-form field
-/// would have to be length-prefixed the way [`crate::cache::key`] prefixes its
-/// ingredients.
+/// would have to be length-prefixed.
 /// Which weights, and what is done with them, and nothing else.
 ///
 /// The second half matters because a preset can change how it uses a file
@@ -331,8 +340,8 @@ mod tests {
     #[test]
     #[ignore]
     fn separating_works_across_a_preset_switch() {
-        use crate::cache::Output;
         use crate::jobs::JobStore;
+        use crate::output::Output;
         use crate::queue::{Queue, QueuedWork};
         use stemd_core::{Audio, DspMode, OutputRate, StemFormat};
 
@@ -389,7 +398,6 @@ mod tests {
                     },
                     model_id: "test".into(),
                     from_api: true,
-                    file: None,
                 })
                 .expect("queue has room");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
@@ -408,7 +416,7 @@ mod tests {
             println!(
                 "  {key}: {} stems, residual {:.1} dB, {:.1}x realtime",
                 names.len(),
-                entry.model_residual_db,
+                entry.model_residual_db.unwrap_or(f64::NAN),
                 entry.realtime_factor()
             );
         };

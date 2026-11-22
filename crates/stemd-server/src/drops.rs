@@ -1,10 +1,10 @@
 //! Files dropped on the window.
 //!
-//! A drop is the same job a `POST /v2/jobs` makes: hashed the same way, claimed in
-//! the same store, separated by the same worker. Dropping a track a deck already
-//! asked for joins that separation, and dropping the same file twice is a cache
-//! hit. What differs is the two ends: the audio comes from a file rather than a
-//! socket, and the stems are copied to a folder rather than served.
+//! A drop is the same job a `POST /v2/jobs` makes: identified by the same track
+//! id, claimed in the same store, separated by the same worker, kept in the same
+//! cache. Dropping a track a deck already asked for joins that separation, and
+//! dropping the same file twice is a cache hit. What differs is the two ends:
+//! the audio comes from a file, and the stems are written to a folder.
 //!
 //! Local output always includes the derived part. Over the wire it is left out
 //! because a client holding the mix can rebuild it for free; a folder of stems has
@@ -19,11 +19,11 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
-use stemd_core::{Audio, DspMode, PART_NAMES, PcmFormat, Progress, Stage};
+use stemd_core::{Audio, DspMode, PART_NAMES, Progress, Stage};
 
 use crate::api::AppState;
-use crate::cache::{Entry, Ingredients, Output};
-use crate::jobs::Job;
+use crate::jobs::{CachedStem, Entry, Job};
+use crate::output::Output;
 use crate::queue::QueuedWork;
 use crate::settings::{DropParts, Settings};
 
@@ -512,11 +512,8 @@ fn run(
         matches!(origin, Origin::Cached),
         settings.drop_parts,
     );
-    // The folder is the drop's only copy. The last drop waiting on the job
-    // deletes the entry, unless an API client holds the job or fetched the
-    // entry. Kept when writing failed, so a second drop needs no separation.
-    if matches!(origin, Origin::Queued) && item.release(state) && written.is_ok() {
-        state.cache.discard_unshared(&entry);
+    if matches!(origin, Origin::Queued) {
+        item.release(state);
     }
     let finished = written?;
     tracing::info!(
@@ -587,26 +584,15 @@ fn separate(
     output: Output,
     turn: &mut Turn,
 ) -> Result<(Arc<Entry>, Origin)> {
-    // Hashed from the same bytes an upload would have carried, so a drop and a
-    // deck asking for the same track land on the same cache entry.
-    let pcm = mix.to_interleaved(PcmFormat::S16le);
-    let key = crate::cache::key(&Ingredients {
-        pcm: &pcm,
-        sample_rate: mix.sample_rate,
-        channels: mix.channels(),
-        in_format: PcmFormat::S16le,
-        out_format: output.format,
-        out_rate: output.rate,
-        include_derived: output.derived,
-        parts: output.parts,
-        dsp: &output.dsp,
-        model: &state.switcher.identity(),
-    });
-    std::mem::drop(pcm);
+    // The same track id an upload of these samples gets, so a drop and a deck
+    // asking for the same track land on the same stems.
+    let cache_id = state.switcher.cache_id();
+    let id = crate::sessions::track_id(&mix);
+    let key = crate::jobs::job_key(&id, &output, &cache_id);
 
     // Ahead of the turn: a cache hit queues nothing, so it need not wait for
     // the drops before it. It still passes its turn when it ends.
-    if let Some(entry) = state.cache.get(&key) {
+    if let Some(entry) = crate::api::cached_entry(&state.cache, &cache_id, &output, &id) {
         // The row in the window already says "already separated"; this is only
         // for reading afterwards.
         tracing::debug!("{}: already separated, reusing it", item.title);
@@ -620,9 +606,9 @@ fn separate(
 
     // Claim before enqueuing, exactly as the HTTP path does: it is the same
     // store, so a drop can join a separation a deck already started.
-    let job = match state.store.claim(&key) {
+    let job = match state.store.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Ok(job) => {
-            // The stems pass through the cache first. The folder beside the
+            // The stems are stored in the cache first. The folder beside the
             // track is checked for the stems' own size once they exist.
             let queued = crate::disk::ensure_room(state.cache.root())
                 .map_err(anyhow::Error::from)
@@ -633,9 +619,8 @@ fn separate(
                             job: Arc::clone(&job),
                             mix,
                             output,
-                            model_id: state.switcher.published_identity(),
+                            model_id: cache_id,
                             from_api: false,
-                            file: None,
                         })
                         .map_err(anyhow::Error::from)
                 });
@@ -704,7 +689,7 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
     let mut files = Vec::new();
     let mut scaled = Vec::new();
     for stem in &entry.stems {
-        // Not ticked: count it as fetched so the reaper treats the entry as consumed.
+        // Not ticked: counts as fetched, so the cache stops holding it.
         if !wanted.has(&stem.name) {
             entry.mark_fetched(&stem.name);
             continue;
@@ -713,16 +698,18 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
             .path
             .file_name()
             .map_or_else(|| stem.name.clone(), |n| n.to_string_lossy().into_owned());
-        if let Err(err) = std::fs::copy(&stem.path, dir.join(&name)) {
-            // Half a set of stems reads as a finished one.
-            let _ = clear_parts(&dir);
-            return Err(err).with_context(|| format!("copying {} into {}", name, dir.display()));
-        }
-        // Tells the cache this entry was collected, so the rule that reaps
-        // separations nobody pulled leaves it alone.
+        let gain = match write_part(entry, stem, &dir.join(&name)) {
+            Ok(gain) => gain,
+            Err(err) => {
+                // Remove the parts already written: a partial folder looks finished.
+                let _ = clear_parts(&dir);
+                return Err(err)
+                    .with_context(|| format!("writing {} into {}", name, dir.display()));
+            }
+        };
         entry.mark_fetched(&stem.name);
-        if stem.gain != 1.0 {
-            scaled.push((stem.name.clone(), stem.gain));
+        if gain != 1.0 {
+            scaled.push((stem.name.clone(), gain));
         }
         parts.push(stem.name.clone());
         files.push(dir.join(&name));
@@ -740,6 +727,29 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
         cached,
         files,
     })
+}
+
+/// Write `stem` to `path` at unity, or scaled down so it does not clip, and return the scale.
+fn write_part(entry: &Entry, stem: &CachedStem, path: &Path) -> Result<f32> {
+    let format = entry.output.format;
+    if entry.gain == 1.0 || format == stemd_core::StemFormat::Mp3 {
+        std::fs::copy(&stem.path, path)?;
+        return Ok(entry.gain);
+    }
+    let bytes = std::fs::read(&stem.path)?;
+    let mut audio = crate::cache::decode(bytes, format, entry.channels, entry.output.rate.hz())?;
+    let restore = 1.0 / entry.gain;
+    for v in audio.data.iter_mut().flatten() {
+        *v *= restore;
+    }
+    let peak = audio
+        .data
+        .iter()
+        .flatten()
+        .fold(0f32, |m, v| m.max(v.abs()));
+    let gain = if peak <= 1.0 { 1.0 } else { 1.0 / peak };
+    std::fs::write(path, stemd_core::encode_stem(&audio, format, gain)?)?;
+    Ok(gain)
 }
 
 /// Remove the part files and gains note an earlier drop of this track wrote.
@@ -852,6 +862,36 @@ mod tests {
 
     /// The folder goes beside the file, not into the working directory: an
     /// `.app` is launched with its cwd set to `/`.
+    #[test]
+    fn a_part_stored_below_unity_is_written_at_unity() {
+        let cache = crate::testkit::cache(1 << 30, std::time::Duration::from_secs(60));
+        let output = crate::testkit::output();
+        let dir = cache.verified_dir("model", &crate::cache::type_dir(&output, 0.5), "track");
+        let task = crate::cache::Consolidation::at_44100(dir.clone(), output.format, 3);
+        let stem = Audio::new(vec![vec![0.6, -0.3, 0.0], vec![0.1, 0.2, -0.6]], 44100);
+        for name in ["harmonics", "vocals"] {
+            let bytes = stemd_core::encode_stem(&stem, output.format, 0.5).expect("encode");
+            cache
+                .consolidate(&task, name, &bytes, 3, Some(0))
+                .expect("store");
+        }
+        let entry = Entry::stored(&dir, &output, 0.5, 2, None).expect("whole");
+        let path = std::env::temp_dir().join(format!("stemd-part-{}.raw", std::process::id()));
+        let gain = write_part(&entry, &entry.stems[0], &path).expect("written");
+        assert_eq!(gain, 1.0);
+        let written =
+            crate::cache::decode(std::fs::read(&path).unwrap(), output.format, 2, 44100).unwrap();
+        for (got, want) in written
+            .data
+            .iter()
+            .flatten()
+            .zip(stem.data.iter().flatten())
+        {
+            assert!((got - want).abs() < 1e-4, "{got} for {want}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn stems_land_beside_the_track() {
         assert_eq!(

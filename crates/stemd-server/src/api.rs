@@ -7,6 +7,7 @@
 //! GET    /v2/jobs/{id}                  progress, then the result object
 //! GET    /v2/jobs/{id}/stems/{name}     raw interleaved PCM stream
 //! DELETE /v2/jobs/{id}                  stop the job, drop the handle
+//! POST   /v2/jobs/{id}/join             one more waiter on a job found by lookup
 //! GET    /v2/logs                       recent log lines
 //! PUT    /v2/filters/{id}               store a conversion filter, see [`crate::filters`]
 //! GET    /v2/filters/{id}               a stored filter's summary
@@ -33,16 +34,18 @@ use serde::{Deserialize, Serialize};
 use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, Stage, resample};
 use tokio_util::io::ReaderStream;
 
-use crate::cache::{Cache, Ingredients, Output};
+use crate::cache::Cache;
 use crate::filters::{Dsp, Filters};
-use crate::jobs::JobStore;
+use crate::jobs::{Entry, JobStore};
 use crate::logbuf::LogBuffer;
 use crate::models::Preset;
+use crate::output::Output;
 use crate::queue::{Queue, QueuedWork};
 use crate::settings::SettingsStore;
 
 pub struct AppState {
     pub store: Arc<JobStore>,
+    /// The one cache of separated stems; the same as the sessions'.
     pub cache: Arc<Cache>,
     pub queue: Arc<Queue>,
     pub switcher: Arc<crate::switch::Switcher>,
@@ -61,6 +64,8 @@ pub struct AppState {
     pub serving: crate::serving::Serving,
     /// Conversion filters clients uploaded.
     pub filters: Arc<Filters>,
+    /// Empty the cache at quit, from `--ephemeral`.
+    pub ephemeral: bool,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -69,6 +74,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v2/jobs", post(create_job))
         .route("/v2/jobs/{id}", get(get_job))
         .route("/v2/jobs/{id}", delete(delete_job))
+        .route("/v2/jobs/{id}/join", post(join_job))
         .route("/v2/jobs/{id}/stems/{name}", get(get_stem))
         .route("/v2/logs", get(get_logs))
         .route("/v2/filters/{id}", put(put_filter))
@@ -516,40 +522,6 @@ impl Submission {
             model_rate,
         })
     }
-
-    fn ingredients<'a>(&'a self, pcm: &'a [u8], model: &'a str) -> Ingredients<'a> {
-        Ingredients {
-            pcm,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            in_format: self.in_format,
-            out_format: self.output.format,
-            out_rate: self.output.rate,
-            include_derived: self.output.derived,
-            parts: self.output.parts,
-            dsp: &self.output.dsp,
-            model,
-        }
-    }
-}
-
-/// Hash the upload into a cache key, off the async runtime.
-///
-/// Hashing a five-minute upload takes about 160 ms, which would stall every other
-/// connection this runtime thread is serving. It happens before decoding because
-/// the samples on the wire are what identifies the work, so a hit skips converting
-/// a hundred megabytes to float.
-async fn hash_upload(
-    body: Bytes,
-    submission: Submission,
-    model: String,
-) -> Result<(String, Bytes), ApiError> {
-    tokio::task::spawn_blocking(move || {
-        let key = crate::cache::key(&submission.ingredients(&body, &model));
-        (key, body)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("hashing the upload: {e}")))
 }
 
 /// Decode the upload to planar float at the model's rate, off the async runtime.
@@ -559,14 +531,7 @@ async fn hash_upload(
 /// The conversion is the general resampler: a client that wants a particular
 /// filter is asking about the stems on the way out, not about the mix on the way
 /// in, which the model consumes and never returns.
-///
-/// The job is already visible to other requests by now, so a bad payload has to
-/// reach a terminal stage rather than vanish: a joiner is polling it.
-async fn decode_upload(
-    body: Bytes,
-    submission: Submission,
-    job: &crate::jobs::Job,
-) -> Result<Audio, ApiError> {
+async fn decode_upload(body: Bytes, submission: Submission) -> Result<Audio, ApiError> {
     let model_rate = submission.model_rate;
     let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Audio> {
         let audio = Audio::from_interleaved(
@@ -591,10 +556,52 @@ async fn decode_upload(
     .await
     .map_err(|e| ApiError::internal(format!("decoding the upload: {e}")))?;
 
-    decoded.map_err(|err| {
-        job.fail(format!("{err:#}"));
-        ApiError::bad_request(format!("{err:#}"))
+    decoded.map_err(|err| ApiError::bad_request(format!("{err:#}")))
+}
+
+/// The track id of `mix`, off the async runtime.
+async fn identify(mix: Audio) -> Result<(Audio, String), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let id = crate::sessions::track_id(&mix);
+        (mix, id)
     })
+    .await
+    .map_err(|e| ApiError::internal(format!("hashing the upload: {e}")))
+}
+
+/// The job result for track `id` at `output` when the cache holds every stem
+/// whole, at any gain, held for the client to fetch.
+pub fn cached_entry(
+    cache: &Arc<Cache>,
+    cache_id: &str,
+    output: &Output,
+    id: &str,
+) -> Option<Arc<Entry>> {
+    let found = crate::separations::whole_dir(cache, cache_id, output, id)?;
+    let _writing = cache.writing(&found.dir);
+    let entry = Arc::new(Entry::stored(
+        &found.dir,
+        output,
+        found.gain,
+        found.info.channels,
+        Cache::separation(&found.dir),
+    )?);
+    cache.hold(&entry);
+    entry.present().then_some(entry)
+}
+
+/// [`cached_entry`], off the async runtime.
+async fn cached_result(
+    cache: &Arc<Cache>,
+    cache_id: String,
+    output: Output,
+    id: String,
+) -> Option<Arc<Entry>> {
+    let cache = Arc::clone(cache);
+    tokio::task::spawn_blocking(move || cached_entry(&cache, &cache_id, &output, &id))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A job as the client should see it right now.
@@ -630,31 +637,40 @@ pub(crate) async fn submit(
         crate::separations::check_file_key(key)?;
     }
     let submission = Submission::parse(params, &body, state)?;
-    let (key, body) = hash_upload(body, submission.clone(), state.switcher.identity()).await?;
+    let mix = decode_upload(body, submission.clone()).await?;
+    let (mix, id) = identify(mix).await?;
+    // Before the claim, so a lookup by the file key finds the job while it runs.
+    if let Some(key) = &params.file
+        && let Err(err) = state.cache.record_file(key, &id)
+    {
+        tracing::warn!("recording file key {key}: {err:#}");
+    }
+    let cache_id = state.switcher.cache_id();
+    let key = crate::jobs::job_key(&id, &submission.output, &cache_id);
 
-    // Claim the key before the decode, not after: `claim` registers the job
-    // under the same lock that looks for one, so simultaneous requests for the
-    // same track collapse onto a single separation instead of racing through
-    // the gap a decode would leave between lookup and insert.
-    let job = match state.store.claim(&key) {
+    // Claim before the lookup: `claim` registers the job under the same lock
+    // that looks for one, so simultaneous requests for the same track collapse
+    // onto a single separation.
+    let job = match state.store.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Err(existing) => {
             tracing::debug!(
                 job = %existing.id,
-                "joining a separation already under way for {}",
-                crate::cache::short(&key)
+                "joining a separation already under way for track {id}"
             );
             return Ok((StatusCode::ACCEPTED, existing));
         }
         Ok(job) => job,
     };
 
-    if let Some(entry) = state.cache.get(&key) {
-        tracing::debug!(
-            job = %job.id,
-            "serving {} from cache, separated in {:.2}s",
-            crate::cache::short(&key),
-            entry.separation_secs
-        );
+    if let Some(entry) = cached_result(
+        &state.cache,
+        cache_id,
+        submission.output.clone(),
+        id.clone(),
+    )
+    .await
+    {
+        tracing::debug!(job = %job.id, "serving track {id} from the cache");
         job.complete(entry, true);
         return Ok((StatusCode::OK, job));
     }
@@ -669,8 +685,7 @@ pub(crate) async fn submit(
         ));
     }
 
-    let mix = decode_upload(body, submission.clone(), &job).await?;
-    enqueue(state, &job, mix, submission, params.file.clone())?;
+    enqueue(state, &job, mix, submission)?;
     Ok((StatusCode::ACCEPTED, job))
 }
 
@@ -680,7 +695,6 @@ fn enqueue(
     job: &Arc<crate::jobs::Job>,
     mix: Audio,
     submission: Submission,
-    file: Option<String>,
 ) -> Result<(), ApiError> {
     let duration = mix.duration_secs();
     let position = state
@@ -689,9 +703,8 @@ fn enqueue(
             job: Arc::clone(job),
             mix,
             output: submission.output.clone(),
-            model_id: state.switcher.published_identity(),
+            model_id: state.switcher.cache_id(),
             from_api: true,
-            file,
         })
         .map_err(|full| {
             job.fail(format!("{full}"));
@@ -716,6 +729,16 @@ async fn get_job(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    Ok(Json(live_view(&state, &job)).into_response())
+}
+
+/// Add a waiter to a job, so another client's DELETE leaves it running.
+async fn join_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    job.join();
     Ok(Json(live_view(&state, &job)).into_response())
 }
 
@@ -762,11 +785,10 @@ pub(crate) async fn get_stem(
 
     let file = tokio::fs::File::open(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            // Reaped between the lookup and the open. Everything here is
-            // reproducible, so say so plainly and let the client resubmit.
+            // Deleted from the cache between the lookup and the open.
             ApiError::new(
                 StatusCode::GONE,
-                "these stems have been reaped; resubmit the track",
+                "these stems have left the cache; resubmit the track",
             )
         } else {
             ApiError::internal(format!("opening {}: {e}", path.display()))
@@ -778,13 +800,12 @@ pub(crate) async fn get_stem(
         .map(|m| m.len())
         .map_err(|e| ApiError::internal(format!("stat {}: {e}", path.display())))?;
 
-    // Only once the bytes are provably readable. Marking on request would let a
-    // failed fetch count as consumption and keep an entry nobody can use.
-    entry.hand_out();
+    // Only once the bytes are provably readable, so a failed fetch keeps the
+    // stems held.
     entry.mark_fetched(&name);
 
     Ok(Response::builder()
-        .header(header::CONTENT_TYPE, entry.format.content_type())
+        .header(header::CONTENT_TYPE, entry.output.format.content_type())
         .header(header::CONTENT_LENGTH, len)
         .body(Body::from_stream(ReaderStream::new(file)))
         .expect("response builder inputs are valid"))

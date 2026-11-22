@@ -26,8 +26,9 @@ use stemd_core::StemFormat;
 use tokio::io::AsyncReadExt;
 
 use crate::api::{ApiError, AppState, CreateParams, parse_output};
-use crate::cache::Output;
-use crate::pieces::{Consolidation, Pieces, TrackInfo, stems_of, type_dir, type_prefix};
+use crate::cache::{Cache, Consolidation, TrackInfo, stems_of, type_dir, type_prefix};
+use crate::jobs::{JobStore, MixShape, job_key};
+use crate::output::Output;
 use crate::session_api::{open_whole, send_whole};
 use crate::sessions::{Sessions, TRACK_ID_LEN, gain, served};
 use crate::whole::Whole;
@@ -50,6 +51,8 @@ pub enum Held {
     Derivable,
     /// Every piece is stored, and the whole files are being written.
     Consolidating,
+    /// A job for this output is running; `job` is its id.
+    Separating,
     /// The mix is in memory: a session can join it without an upload.
     Open,
     /// Some pieces are stored, and the mix is not in memory.
@@ -114,6 +117,9 @@ pub struct Lookup {
     /// The stored output a `derivable` one is converted from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<OutputView>,
+    /// The running job, when `state` is `separating`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     pub stems: Vec<StemState>,
 }
 
@@ -189,15 +195,15 @@ impl Found {
 }
 
 /// `output`'s track directories for `id` at any gain: all whole, then all pieces, then the rest.
-fn found(pieces: &Pieces, model_id: &str, output: &Output, id: &str) -> Vec<Found> {
+fn found(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Vec<Found> {
     let prefix = type_prefix(output);
-    let mut out: Vec<Found> = pieces
+    let mut out: Vec<Found> = cache
         .types(model_id)
         .into_iter()
         .filter_map(|name| {
             let gain: f32 = name.strip_prefix(&prefix)?.parse().ok()?;
-            let dir = pieces.verified_dir(model_id, &name, id);
-            let info = Pieces::info(&dir)?;
+            let dir = cache.verified_dir(model_id, &name, id);
+            let info = Cache::info(&dir)?;
             Some(Found {
                 dir,
                 output: output.clone(),
@@ -209,7 +215,7 @@ fn found(pieces: &Pieces, model_id: &str, output: &Output, id: &str) -> Vec<Foun
     out.sort_by_key(|f| {
         if f.all_whole() {
             0
-        } else if Pieces::needs_consolidation(&f.consolidation()) {
+        } else if Cache::needs_consolidation(&f.consolidation()) {
             1
         } else {
             2
@@ -239,18 +245,18 @@ fn sources_of(output: &Output) -> Vec<(Output, Option<f32>)> {
 }
 
 /// A track directory of `output` for `id` with every stem stored whole, at any gain.
-fn whole_dir(pieces: &Pieces, model_id: &str, output: &Output, id: &str) -> Option<Found> {
-    let best = found(pieces, model_id, output, id)
+pub fn whole_dir(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Option<Found> {
+    let best = found(cache, model_id, output, id)
         .into_iter()
         .find(Found::all_whole)?;
-    Pieces::touch(&best.dir);
+    Cache::touch(&best.dir);
     Some(best)
 }
 
 /// A stored output that converts to `output`, and the gain the result has.
-fn derivable(pieces: &Pieces, model_id: &str, output: &Output, id: &str) -> Option<(Found, f32)> {
+fn derivable(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Option<(Found, f32)> {
     sources_of(output).into_iter().find_map(|(source, gain)| {
-        let found = found(pieces, model_id, &source, id)
+        let found = found(cache, model_id, &source, id)
             .into_iter()
             .find(Found::all_whole)?;
         let gain = gain.unwrap_or(found.gain);
@@ -260,8 +266,9 @@ fn derivable(pieces: &Pieces, model_id: &str, output: &Output, id: &str) -> Opti
 
 /// What the server holds for `id` at `output`, queueing consolidation once every piece is stored.
 pub fn lookup(
-    pieces: Option<&Arc<Pieces>>,
+    cache: &Arc<Cache>,
     sessions: &Sessions,
+    jobs: &JobStore,
     model_id: &str,
     output: &Output,
     id: &str,
@@ -281,69 +288,78 @@ pub fn lookup(
             })
             .collect()
     };
-    let answer = |state: Held, found: Option<&Found>, info: TrackInfo, gain: Option<f32>| Lookup {
+    let answer = |state: Held, found: Option<&Found>, mix: MixShape, gain: Option<f32>| Lookup {
         track: id.to_owned(),
         model_id: model_id.to_owned(),
-        frames: info.frames,
-        sample_rate: info.sample_rate,
-        channels: info.channels,
+        frames: mix.frames,
+        sample_rate: mix.sample_rate,
+        channels: mix.channels,
         output: OutputView::of(output, gain),
         state,
         from: None,
+        job: None,
         stems: stem_states(found),
     };
 
-    let exact = pieces
-        .map(|p| found(p, model_id, output, id))
-        .unwrap_or_default();
-    if let (Some(pieces), Some(best)) = (pieces, exact.first()) {
-        Pieces::touch(&best.dir);
+    let exact = found(cache, model_id, output, id);
+    if let Some(best) = exact.first() {
+        Cache::touch(&best.dir);
         if best.all_whole() {
-            return Some(answer(Held::Stored, Some(best), best.info, Some(best.gain)));
+            return Some(answer(
+                Held::Stored,
+                Some(best),
+                best.info.into(),
+                Some(best.gain),
+            ));
         }
         let task = best.consolidation();
-        if Pieces::needs_consolidation(&task) && pieces.consolidate_later(task) {
+        if Cache::needs_consolidation(&task) && cache.consolidate_later(task) {
             return Some(answer(
                 Held::Consolidating,
                 Some(best),
-                best.info,
+                best.info.into(),
                 Some(best.gain),
             ));
         }
     }
-    if let Some((source, gain)) = pieces.and_then(|p| derivable(p, model_id, output, id)) {
-        Pieces::touch(&source.dir);
-        let mut lookup = answer(Held::Derivable, None, source.info, Some(gain));
+    if let Some((source, gain)) = derivable(cache, model_id, output, id) {
+        Cache::touch(&source.dir);
+        let mut lookup = answer(Held::Derivable, None, source.info.into(), Some(gain));
         lookup.from = Some(OutputView::of(&source.output, Some(source.gain)));
+        return Some(lookup);
+    }
+    if let Some(job) = jobs.running(&job_key(id, output, model_id)) {
+        let mut lookup = answer(Held::Separating, exact.first(), job.mix, None);
+        lookup.job = Some(job.id.clone());
         return Some(lookup);
     }
     if let Some(track) = sessions.open_track(id, output.parts) {
         let info = TrackInfo::from(&track.spec);
-        return Some(answer(Held::Open, exact.first(), info, None));
+        return Some(answer(Held::Open, exact.first(), info.into(), None));
     }
     let best = exact.iter().find(|f| f.holds_any())?;
     Some(answer(
         Held::Partial,
         Some(best),
-        best.info,
+        best.info.into(),
         Some(best.gain),
     ))
 }
 
 /// Convert `source` into `output` for track `id`, skipping stems already stored.
 pub fn derive(
-    pieces: &Pieces,
+    cache: &Cache,
     model_id: &str,
     id: &str,
     source: &Found,
     output: &Output,
     gain: f32,
 ) -> Result<Found> {
-    let dir = pieces.verified_dir(model_id, &type_dir(output, gain), id);
+    let dir = cache.verified_dir(model_id, &type_dir(output, gain), id);
     // A second request for the same output waits here, then finds the stems stored.
-    let converting = pieces.converting(&dir);
+    let converting = cache.converting(&dir);
     let _held = converting.lock();
-    pieces.write_info(&dir, &source.info)?;
+    cache.write_info(&dir, &source.info)?;
     let target = Found {
         dir,
         output: output.clone(),
@@ -360,18 +376,12 @@ pub fn derive(
             .with_context(|| format!("{stem} is not stored whole"))?;
         let bytes = std::fs::read(&whole.path)
             .with_context(|| format!("reading {}", whole.path.display()))?;
-        let audio = crate::pieces::decode(bytes, source.output.format, source.info.channels, rate)
+        let audio = crate::cache::decode(bytes, source.output.format, source.info.channels, rate)
             .with_context(|| format!("decoding {}", whole.path.display()))?;
         let (bytes, clipped) = if source.output.format.has_headroom() {
-            let clipped = audio
-                .data
-                .iter()
-                .flatten()
-                .filter(|v| (*v * gain).abs() > 1.0)
-                .count();
             (
                 stemd_core::encode_stem(&audio, output.format, gain)?,
-                Some(clipped),
+                Some(crate::whole::clipped(&audio, gain, false)),
             )
         } else {
             (
@@ -379,7 +389,7 @@ pub fn derive(
                 whole.meta.clipped,
             )
         };
-        pieces.consolidate(
+        cache.consolidate(
             &target.consolidation(),
             stem,
             &bytes,
@@ -485,12 +495,12 @@ fn unknown(id: &str) -> ApiError {
     .with_code("unknown_separation")
 }
 
-/// The output `params` ask for. `mp3` is never stored, so it is refused.
+/// The output `params` ask for. `mp3` is stored for jobs only, so it is refused.
 fn output_of(state: &AppState, params: &CreateParams) -> Result<Output, ApiError> {
     let (_, output, _) = parse_output(params, state)?;
     if output.format == StemFormat::Mp3 {
         return Err(ApiError::bad_request(
-            "mp3 is never stored; ask for flac, wav, s16le or f32le",
+            "mp3 is served to jobs only; ask for flac, wav, s16le or f32le",
         ));
     }
     Ok(output)
@@ -515,11 +525,7 @@ async fn view_by_file(
         .clone()
         .ok_or_else(|| ApiError::bad_request("name a track id in the path, or file="))?;
     check_file_key(&key)?;
-    let pieces = state.queue.sessions().pieces();
-    let id = pieces
-        .as_ref()
-        .and_then(|p| p.file_track(&key))
-        .ok_or_else(|| unknown(&key))?;
+    let id = state.cache.file_track(&key).ok_or_else(|| unknown(&key))?;
     answer_for(&state, id, &params).await
 }
 
@@ -530,20 +536,18 @@ async fn answer_for(
     params: &CreateParams,
 ) -> Result<Response, ApiError> {
     let output = output_of(state, params)?;
-    let model_id = state.switcher.published_identity();
-    let sessions = Arc::clone(state.queue.sessions());
+    let model_id = state.switcher.cache_id();
+    let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
+    let jobs = Arc::clone(&state.store);
     let found = tokio::task::spawn_blocking(move || {
-        lookup(
-            sessions.pieces().as_ref(),
-            &sessions,
-            &model_id,
-            &output,
-            &id,
-        )
-        .ok_or_else(|| unknown(&id))
+        lookup(&cache, &sessions, &jobs, &model_id, &output, &id).ok_or_else(|| unknown(&id))
     })
     .await
     .map_err(|e| ApiError::internal(format!("looking up the separation: {e}")))??;
+    let found = Lookup {
+        model_id: state.switcher.published_identity(),
+        ..found
+    };
     Ok(Json(found).into_response())
 }
 
@@ -555,18 +559,18 @@ async fn resolve(
 ) -> Result<Found, ApiError> {
     check_id(&id)?;
     let output = output_of(state, params)?;
-    let model_id = state.switcher.published_identity();
-    let sessions = Arc::clone(state.queue.sessions());
+    let model_id = state.switcher.cache_id();
+    let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
+    let jobs = Arc::clone(&state.store);
     tokio::task::spawn_blocking(move || {
-        let pieces = sessions.pieces().ok_or_else(|| unknown(&id))?;
-        if let Some(best) = whole_dir(&pieces, &model_id, &output, &id) {
+        if let Some(best) = whole_dir(&cache, &model_id, &output, &id) {
             return Ok(best);
         }
-        if let Some((source, gain)) = derivable(&pieces, &model_id, &output, &id) {
-            return derive(&pieces, &model_id, &id, &source, &output, gain)
+        if let Some((source, gain)) = derivable(&cache, &model_id, &output, &id) {
+            return derive(&cache, &model_id, &id, &source, &output, gain)
                 .map_err(|e| ApiError::internal(format!("converting: {e:#}")));
         }
-        match lookup(Some(&pieces), &sessions, &model_id, &output, &id) {
+        match lookup(&cache, &sessions, &jobs, &model_id, &output, &id) {
             Some(held) => Err(ApiError::new(
                 StatusCode::CONFLICT,
                 format!(
@@ -647,7 +651,11 @@ async fn bundle(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::Method;
+    use serde_json::json;
+
     use super::*;
+    use crate::testkit::{Answer, call, state};
 
     #[test]
     fn a_part_holds_its_sources_as_bits() {
@@ -718,5 +726,166 @@ mod tests {
         ] {
             assert!(check_id(bad).is_err(), "{bad:?}");
         }
+    }
+
+    const TRACK: &str = "f9c29cbfe3466b674f9903d9";
+    const FILE: &str = "3b0c55e19a7d42f08c6e1d2a";
+
+    /// The output a request with `query` names.
+    fn output_for(state: &AppState, query: serde_json::Value) -> Output {
+        let params: CreateParams = serde_json::from_value(query).expect("params");
+        output_of(state, &params).expect("an output")
+    }
+
+    /// A queued job for `TRACK` at `output`, with `FILE` naming the track.
+    fn queued_job(state: &AppState, output: &Output) -> Arc<crate::jobs::Job> {
+        let key = job_key(TRACK, output, &state.switcher.cache_id());
+        let mix = MixShape {
+            frames: 44_100,
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let Ok(job) = state.store.claim(&key, mix) else {
+            panic!("a job already holds {key}");
+        };
+        state.cache.record_file(FILE, TRACK).expect("recorded");
+        job
+    }
+
+    /// `GET /v2/separations?file=FILE` for 16-bit stems.
+    async fn by_file(app: &Router) -> Answer {
+        let uri = format!("/v2/separations?file={FILE}&output_format=s16le");
+        call(app, Method::GET, &uri, Vec::new()).await
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_file_key_while_a_job_runs_answers_its_job() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        let job = queued_job(
+            &state,
+            &output_for(&state, json!({"output_format": "s16le"})),
+        );
+        let answer = by_file(&app).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
+        assert_eq!(answer.json["state"], "separating");
+        assert_eq!(answer.json["job"], job.id.as_str());
+        assert_eq!(answer.json["track"], TRACK);
+        assert_eq!(answer.json["frames"], 44_100);
+        assert!(
+            answer.json["output"].get("gain").is_none(),
+            "{}",
+            answer.json
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_after_the_job_ends_answers_stored_without_a_job() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        let body: Vec<u8> = (0..44_100 * 2)
+            .flat_map(|i: i32| (((i * 37) % 2000 - 1000) as i16 * 8).to_le_bytes())
+            .collect();
+        let uri = format!("/v2/jobs?file={FILE}&format=s16le&output_format=s16le");
+        let posted = call(&app, Method::POST, &uri, body).await;
+        assert!(posted.status.is_success(), "{}", posted.json);
+        let id = posted.json["id"].as_str().expect("a job id").to_owned();
+        let early = by_file(&app).await;
+        assert!(
+            early.json["state"] == "stored" || early.json["job"] == id.as_str(),
+            "{}",
+            early.json
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let job = call(&app, Method::GET, &format!("/v2/jobs/{id}"), Vec::new()).await;
+            let stage = &job.json["progress"]["stage"];
+            if stage == "done" {
+                break;
+            }
+            assert!(stage != "failed", "{}", job.json);
+            assert!(std::time::Instant::now() < deadline, "the job never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let answer = by_file(&app).await;
+        assert_eq!(answer.json["state"], "stored", "{}", answer.json);
+        assert!(answer.json.get("job").is_none(), "{}", answer.json);
+    }
+
+    #[tokio::test]
+    async fn a_running_job_for_another_output_is_not_reported() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        queued_job(
+            &state,
+            &output_for(&state, json!({"output_format": "flac"})),
+        );
+        let answer = by_file(&app).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.json);
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_is_no_longer_reported_as_separating() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        let job = queued_job(
+            &state,
+            &output_for(&state, json!({"output_format": "s16le"})),
+        );
+        assert_eq!(by_file(&app).await.json["state"], "separating");
+        job.fail("the model failed");
+        let answer = by_file(&app).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.json);
+    }
+
+    #[tokio::test]
+    async fn after_a_join_only_the_last_delete_cancels_the_job() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        let job = queued_job(
+            &state,
+            &output_for(&state, json!({"output_format": "s16le"})),
+        );
+        let uri = format!("/v2/jobs/{}", job.id);
+        let joined = call(&app, Method::POST, &format!("{uri}/join"), Vec::new()).await;
+        assert_eq!(joined.status, StatusCode::OK, "{}", joined.json);
+
+        let submitter = call(&app, Method::DELETE, &uri, Vec::new()).await;
+        assert_eq!(submitter.status, StatusCode::NO_CONTENT);
+        let running = call(&app, Method::GET, &uri, Vec::new()).await;
+        assert_eq!(running.status, StatusCode::OK, "{}", running.json);
+        assert_eq!(by_file(&app).await.json["state"], "separating");
+
+        let joiner = call(&app, Method::DELETE, &uri, Vec::new()).await;
+        assert_eq!(joiner.status, StatusCode::NO_CONTENT);
+        let gone = call(&app, Method::GET, &uri, Vec::new()).await;
+        assert_eq!(gone.status, StatusCode::NOT_FOUND, "{}", gone.json);
+        assert_eq!(by_file(&app).await.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_join_on_an_unknown_job_is_not_found() {
+        let app = crate::api::router(state());
+        let answer = call(&app, Method::POST, "/v2/jobs/nope-1/join", Vec::new()).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.json);
+    }
+
+    #[tokio::test]
+    async fn a_join_answers_the_job_view() {
+        let state = state();
+        let app = crate::api::router(Arc::clone(&state));
+        let job = queued_job(
+            &state,
+            &output_for(&state, json!({"output_format": "s16le"})),
+        );
+        let uri = format!("/v2/jobs/{}/join", job.id);
+        let answer = call(&app, Method::POST, &uri, Vec::new()).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
+        assert_eq!(answer.json["id"], job.id.as_str());
+        assert_eq!(
+            answer.json["progress"]["stage"], "queued",
+            "{}",
+            answer.json
+        );
     }
 }

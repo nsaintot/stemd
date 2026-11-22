@@ -12,29 +12,34 @@ use stemd_core::{Audio, DspMode, OutputRate, StemFormat, Stems};
 use tower::ServiceExt as _;
 
 use crate::api::AppState;
-use crate::cache::{Cache, Entry, Output};
+use crate::cache::{Cache, Rules, Separation};
+use crate::jobs::Entry;
+use crate::output::Output;
 
 /// Makes each test root unique. A timestamp alone is not enough: tests run in
 /// parallel within one process, and two starting inside the same clock tick
-/// would share a root and reap each other's entries.
+/// would share a root.
 static ROOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A cache rooted somewhere no other test will touch.
+/// A cache rooted somewhere no other test will touch, holding job results
+/// for `ttl`.
 pub fn cache(max_bytes: u64, ttl: Duration) -> Arc<Cache> {
     let root = std::env::temp_dir().join(format!(
         "stemd-test-{}-{}",
         std::process::id(),
         ROOT_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let cache = Cache::new(root, max_bytes, ttl).expect("cache root");
-    cache.ignore_disk();
-    cache
+    Cache::open_with(
+        root,
+        Rules {
+            unfetched_ttl: ttl,
+            ..Rules::sized(max_bytes)
+        },
+    )
+    .expect("cache root")
 }
 
 /// A mix and its three parts, each `frames` long.
-///
-/// Two stems ship, so an entry costs `frames * channels * 2 * 2` bytes at
-/// s16le: the cap tests depend on that arithmetic.
 pub fn stems(frames: usize) -> (Audio, Stems) {
     let mix = Audio::new(vec![vec![0.25; frames], vec![0.25; frames]], 44100);
     let shipped = stemd_core::SHIPPED
@@ -56,23 +61,41 @@ pub fn stems(frames: usize) -> (Audio, Stems) {
     )
 }
 
-pub fn publish(cache: &Cache, key: &str, frames: usize, separation_secs: f64) -> Arc<Entry> {
-    let (mix, parts) = stems(frames);
+/// The output [`publish`] stores.
+pub fn output() -> Output {
+    Output {
+        format: StemFormat::Pcm16,
+        rate: OutputRate::default(),
+        derived: false,
+        dsp: DspMode::default().into(),
+        parts: stemd_core::Parts::DEFAULT,
+    }
+}
+
+/// Store [`stems`] of `frames` whole as track `track`, and return the job
+/// result held in `cache`.
+pub fn publish(cache: &Cache, track: &str, frames: usize, separation_secs: f64) -> Arc<Entry> {
+    let (_, parts) = stems(frames);
+    let output = output();
+    let dir = cache.verified_dir("model", &crate::cache::type_dir(&output, 1.0), track);
+    let task = crate::cache::Consolidation::at_44100(dir.clone(), output.format, frames);
+    for (name, audio) in &parts.shipped {
+        let bytes = stemd_core::encode_stem(audio, output.format, 1.0).expect("encode");
+        cache
+            .consolidate(&task, name, &bytes, frames, Some(0))
+            .expect("store");
+    }
+    let separation = Separation {
+        model_residual_db: parts.model_residual_db,
+        separation_secs,
+    };
     cache
-        .publish(
-            key,
-            &mix,
-            &parts,
-            Output {
-                format: StemFormat::Pcm16,
-                rate: OutputRate::default(),
-                derived: false,
-                dsp: DspMode::default().into(),
-                parts: stemd_core::Parts::DEFAULT,
-            },
-            separation_secs,
-        )
-        .expect("publish")
+        .write_separation(&dir, &separation)
+        .expect("separation");
+    let entry =
+        Arc::new(Entry::stored(&dir, &output, 1.0, 2, Some(separation)).expect("every stem whole"));
+    cache.hold(&entry);
+    entry
 }
 
 /// A server on the toy model, with nothing stored.
@@ -118,6 +141,7 @@ pub fn state() -> Arc<AppState> {
         max_track_secs: 600.0,
         serving: crate::serving::Serving::new(true, None, "toy"),
         filters: crate::filters::Filters::open(dir.join("filters"), 4).expect("filters"),
+        ephemeral: false,
     })
 }
 

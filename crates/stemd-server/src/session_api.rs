@@ -1,4 +1,4 @@
-//! HTTP surface for sessions. See [`crate::sessions`] and [`crate::pieces`].
+//! HTTP surface for sessions. See [`crate::sessions`] and [`crate::cache`].
 //!
 //! ```text
 //! POST   /v2/sessions                          open: track length and output;
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use stemd_core::{Audio, Normalisation, StemFormat};
 
 use crate::api::{ApiError, AppState, CreateParams, default_channels, default_rate, parse_output};
-use crate::pieces::Pieces;
+use crate::cache::Cache;
 use crate::sessions::{
     JoinError, Request, Session, Sessions, TooMany, TrackSpec, UploadError, WindowRequest,
     output_index, served,
@@ -244,7 +244,7 @@ async fn open(
             },
             norm,
             peak: params.peak,
-            model_id: state.switcher.published_identity(),
+            model_id: state.switcher.cache_id(),
         })
         .map_err(|e: TooMany| ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{e}")))?;
     session.set_file(params.file.clone());
@@ -270,7 +270,7 @@ async fn join(
     state: &Arc<AppState>,
     params: &OpenParams,
     id: &str,
-    output: crate::cache::Output,
+    output: crate::output::Output,
     in_format: stemd_core::PcmFormat,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -497,19 +497,8 @@ pub(crate) fn encode_range(
     let format = session.output.format;
     let bytes = stemd_core::encode_stem(&excerpt.audio, format, gain)
         .map_err(|e| ApiError::internal(format!("encoding {name}: {e:#}")))?;
-    // Stored samples do not record clipping, so one at full scale counts as clipped.
-    let clipped = (!format.has_headroom()).then(|| {
-        excerpt
-            .audio
-            .data
-            .iter()
-            .flatten()
-            .filter(|v| {
-                let v = (*v * gain).abs();
-                if in_memory { v > 1.0 } else { v >= 1.0 }
-            })
-            .count()
-    });
+    let clipped =
+        (!format.has_headroom()).then(|| crate::whole::clipped(&excerpt.audio, gain, !in_memory));
     if from == 0
         && to == session.track().spec.frames
         && let Err(err) =
@@ -602,7 +591,7 @@ async fn piece_of(
         .queue
         .sessions()
         .track_dir(&session)
-        .and_then(|dir| Pieces::lookup(&dir, &name, k, session.output.format.extension()));
+        .and_then(|dir| Cache::lookup(&dir, &name, k, session.output.format.extension()));
     // A piece stored whole since the lookup is cut from the whole file below.
     let bytes = match stored {
         Some(path) => match tokio::fs::read(&path).await {
