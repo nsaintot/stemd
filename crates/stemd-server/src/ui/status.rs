@@ -80,21 +80,72 @@ pub fn bar(
     settings_open: bool,
     logs_open: bool,
 ) -> Option<Action> {
-    let port = state.endpoint.port();
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEIGHT), Sense::hover());
     let rect = rect.shrink2(vec2(6.0, 0.0));
-    let font = theme::font(TEXT, Weight::Regular);
     let y = rect.center().y;
     let mut action = None;
 
+    let switch = server_switch(ui, state, palette, rect);
+    if switch.clicked() {
+        action = Some(Action::ToggleServer);
+    }
+
+    // From right to left: the log button, then the settings button.
+    let logs = icons::square(pos2(rect.right() + 5.0 - 12.0, y), 24.0);
+    let gear = icons::square(pos2(logs.left() - 4.0 - 12.0, y), 24.0);
+    for (pane, button, hint) in [
+        (Pane::Logs, logs, ["Show the log", "Hide the log"]),
+        (
+            Pane::Settings,
+            gear,
+            ["Show the settings", "Hide the settings"],
+        ),
+    ] {
+        let shown = match pane {
+            Pane::Settings => settings_open,
+            Pane::Logs => logs_open,
+        };
+        if pane_button(ui, palette, pane, button, hint[usize::from(shown)], shown) {
+            action = Some(Action::Toggle(pane));
+        }
+    }
+
+    // Linux has no title bar of its own to carry the version, so a newer
+    // release shows here, between the two groups, where it fits.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = crate::update::status();
+        if status.opens()
+            && let Some(x) =
+                super::update::fits(ui, &status, switch.rect.right(), gear.left() - GAP)
+        {
+            let anchor = pos2(x, y);
+            super::update::slot(ui, anchor, egui::Align2::LEFT_CENTER, palette, 1.0);
+        }
+    }
+
+    action
+}
+
+/// The server switch and its status at the left of `rect`. Returns its response.
+fn server_switch(
+    ui: &egui::Ui,
+    state: &AppState,
+    palette: &Palette,
+    rect: egui::Rect,
+) -> egui::Response {
+    let port = state.endpoint.port();
+    let y = rect.center().y;
     let on = state.serving.is_on();
     let separating = state.queue.running().map(|_| state.queue.depth());
     let free = free_space(ui.ctx(), state);
     let full = free.filter(|free| *free < crate::disk::FLOOR);
     let status = status_text(port, on, separating, full);
-    let text = ui
-        .painter()
-        .layout_no_wrap(status, font.clone(), egui::Color32::PLACEHOLDER);
+    let text = ui.painter().layout_no_wrap(
+        status,
+        theme::font(TEXT, Weight::Regular),
+        egui::Color32::PLACEHOLDER,
+    );
 
     // The switch and its label are one control.
     let track = egui::Rect::from_center_size(pos2(rect.left() + SWITCH.x / 2.0, y), SWITCH);
@@ -136,67 +187,38 @@ pub fn bar(
         text,
         colour,
     );
-    if response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The icon button that shows or hides `pane`. Returns whether it was clicked.
+fn pane_button(
+    ui: &egui::Ui,
+    palette: &Palette,
+    pane: Pane,
+    button: egui::Rect,
+    hint: &str,
+    shown: bool,
+) -> bool {
+    let response = ui
+        .interact(button, ui.id().with(("pane", pane as u8)), Sense::click())
+        .on_hover_text(hint);
+    let lit = ui.ctx().animate_bool_with_time(
+        response.id.with("hover"),
+        response.hovered() || shown,
+        0.15,
+    );
+    if lit > 0.0 {
+        ui.painter().rect_filled(button, 7.0, white(0.1 * lit));
+    }
+    let colour = theme::mix(palette.muted, egui::Color32::WHITE, lit);
+    let icon = icons::square(button.center(), 14.0);
+    match pane {
+        Pane::Logs => icons::lines(ui.painter(), icon, colour, 1.4),
+        Pane::Settings => icons::gear(ui.painter(), icon, colour, 1.3),
+    }
+    response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
-    {
-        action = Some(Action::ToggleServer);
-    }
-
-    // From right to left: the log button, then the settings button.
-    let logs = icons::square(pos2(rect.right() + 5.0 - 12.0, y), 24.0);
-    let gear = icons::square(pos2(logs.left() - 4.0 - 12.0, y), 24.0);
-    for (pane, button, hint) in [
-        (Pane::Logs, logs, ["Show the log", "Hide the log"]),
-        (
-            Pane::Settings,
-            gear,
-            ["Show the settings", "Hide the settings"],
-        ),
-    ] {
-        let shown = match pane {
-            Pane::Settings => settings_open,
-            Pane::Logs => logs_open,
-        };
-        let response = ui
-            .interact(button, ui.id().with(("pane", pane as u8)), Sense::click())
-            .on_hover_text(hint[usize::from(shown)]);
-        let lit = ui.ctx().animate_bool_with_time(
-            response.id.with("hover"),
-            response.hovered() || shown,
-            0.15,
-        );
-        if lit > 0.0 {
-            ui.painter().rect_filled(button, 7.0, white(0.1 * lit));
-        }
-        let colour = theme::mix(palette.muted, egui::Color32::WHITE, lit);
-        let icon = icons::square(button.center(), 14.0);
-        match pane {
-            Pane::Logs => icons::lines(ui.painter(), icon, colour, 1.4),
-            Pane::Settings => icons::gear(ui.painter(), icon, colour, 1.3),
-        }
-        if response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            action = Some(Action::Toggle(pane));
-        }
-    }
-
-    // Linux has no title bar of its own to carry the version, so a newer
-    // release shows here, between the two groups, where it fits.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let status = crate::update::status();
-        if status.opens()
-            && let Some(x) = super::update::fits(ui, &status, hit.right(), gear.left() - GAP)
-        {
-            let anchor = pos2(x, y);
-            super::update::slot(ui, anchor, egui::Align2::LEFT_CENTER, palette, 1.0);
-        }
-    }
-
-    action
 }
 
 #[cfg(test)]

@@ -237,19 +237,9 @@ impl Resources {
         radius: f32,
     ) {
         let gl = painter.gl().clone();
-        let ppp = info.pixels_per_point;
-        let [width, height] = info.screen_size_px.map(|v| v as f32);
-        // The rect in pixels, with the origin at the bottom left as GL counts it.
-        let region = rect.expand(MARGIN);
-        let left = (region.left() * ppp).floor().max(0.0);
-        let right = (region.right() * ppp).ceil().min(width);
-        let top = (region.top() * ppp).floor().max(0.0);
-        let bottom = (region.bottom() * ppp).ceil().min(height);
-        let size = [(right - left) as i32, (bottom - top) as i32];
-        if size[0] < 8 || size[1] < 8 {
+        let Some((origin, size)) = pixel_region(info, rect) else {
             return;
-        }
-        let origin = [left as i32, (height - bottom) as i32];
+        };
 
         unsafe {
             if let Err(err) = self.fit(&gl, size) {
@@ -274,30 +264,54 @@ impl Resources {
                 size[1],
             );
 
-            let pass = |program: &Program, from: usize, to: Option<usize>| {
-                let source = &self.levels[from];
-                gl.use_program(Some(program.program));
-                gl.uniform_2_f32(
-                    program.step.as_ref(),
-                    SPREAD / source.size[0] as f32,
-                    SPREAD / source.size[1] as f32,
-                );
-                gl.bind_texture(glow::TEXTURE_2D, Some(source.texture));
-                if let Some(to) = to {
-                    let target = &self.levels[to];
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
-                    gl.viewport(0, 0, target.size[0], target.size[1]);
-                    gl.draw_arrays(glow::TRIANGLES, 0, 3);
-                }
-            };
             for i in 1..=LEVELS {
-                pass(&self.down, i - 1, Some(i));
+                self.pass(&gl, &self.down, i - 1, Some(i));
             }
             for i in (1..LEVELS).rev() {
-                pass(&self.up, i + 1, Some(i));
+                self.pass(&gl, &self.up, i + 1, Some(i));
             }
 
-            pass(&self.last, 1, None);
+            self.pass(&gl, &self.last, 1, None);
+            self.composite(&gl, painter, info, rect, radius, (origin, size));
+
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+    }
+
+    /// Run `program` on level `from`, drawing into level `to` when there is one.
+    unsafe fn pass(&self, gl: &glow::Context, program: &Program, from: usize, to: Option<usize>) {
+        unsafe {
+            let source = &self.levels[from];
+            gl.use_program(Some(program.program));
+            gl.uniform_2_f32(
+                program.step.as_ref(),
+                SPREAD / source.size[0] as f32,
+                SPREAD / source.size[1] as f32,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(source.texture));
+            if let Some(to) = to {
+                let target = &self.levels[to];
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+                gl.viewport(0, 0, target.size[0], target.size[1]);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            }
+        }
+    }
+
+    /// Draw the blurred level into `rect` on the frame, clipped and with rounded corners.
+    unsafe fn composite(
+        &self,
+        gl: &glow::Context,
+        painter: &egui_glow::Painter,
+        info: &egui::PaintCallbackInfo,
+        rect: Rect,
+        radius: f32,
+        (origin, size): ([i32; 2], [i32; 2]),
+    ) {
+        let ppp = info.pixels_per_point;
+        let height = info.screen_size_px[1] as f32;
+        unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
             gl.viewport(origin[0], origin[1], size[0], size[1]);
             let clip = info.clip_rect_in_pixels();
@@ -332,11 +346,25 @@ impl Resources {
             );
             gl.uniform_1_f32(self.last.radius.as_ref(), radius * ppp);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
-
-            gl.bind_vertex_array(None);
-            gl.bind_texture(glow::TEXTURE_2D, None);
         }
     }
+}
+
+/// The origin and size in pixels of `rect` and its margin, or `None` when too small to blur.
+fn pixel_region(info: &egui::PaintCallbackInfo, rect: Rect) -> Option<([i32; 2], [i32; 2])> {
+    let ppp = info.pixels_per_point;
+    let [width, height] = info.screen_size_px.map(|v| v as f32);
+    // The rect in pixels, with the origin at the bottom left as GL counts it.
+    let region = rect.expand(MARGIN);
+    let left = (region.left() * ppp).floor().max(0.0);
+    let right = (region.right() * ppp).ceil().min(width);
+    let top = (region.top() * ppp).floor().max(0.0);
+    let bottom = (region.bottom() * ppp).ceil().min(height);
+    let size = [(right - left) as i32, (bottom - top) as i32];
+    if size[0] < 8 || size[1] < 8 {
+        return None;
+    }
+    Some(([left as i32, (height - bottom) as i32], size))
 }
 
 impl Program {

@@ -465,19 +465,8 @@ pub fn paint(
     let meridians = motion.meridians();
     let colours = [palette.red, palette.green, palette.blue];
     for (i, &(x0, x1)) in STRIPS.iter().enumerate() {
-        let [tx, ty, rot, sx, sy] = motion.slice(i);
-        let spread = match i {
-            0 => vec2(-7.0 * look.spread, 0.0),
-            1 => vec2(0.0, 7.0),
-            _ => vec2(7.0 * look.spread, 0.0),
-        };
-        let wave = Affine::translate(vec2(tx, ty))
-            .after(Affine::rotate(rot))
-            .after(Affine::scale(1.0 + sx, 1.0 + sy))
-            .about(CENTRE);
-        let local = globe.after(Affine::translate(spread)).after(wave);
+        let local = slice_pose(globe, motion, i, look.spread);
         let map = |p: Pos2| to_screen(local.apply(p));
-        let grid = Stroke::new(0.7 * K * local.scale_factor(), theme::white(0.5));
 
         let outline = clip_x(&disc, x0, x1);
         painter.add(egui::Shape::convex_polygon(
@@ -485,32 +474,8 @@ pub fn paint(
             colours[i],
             Stroke::NONE,
         ));
-
-        for rx in meridians {
-            let rx = RADIUS * rx;
-            if rx < 0.5 {
-                continue;
-            }
-            let ellipse: Vec<Pos2> = (0..=72)
-                .map(|n| {
-                    let a = TAU * n as f32 / 72.0;
-                    pos2(CENTRE.x + rx * a.cos(), CENTRE.y + RADIUS * a.sin())
-                })
-                .collect();
-            for run in runs_within(&ellipse, x0, x1) {
-                painter.add(egui::Shape::line(
-                    run.into_iter().map(map).collect(),
-                    Stroke::new(0.7, theme::white(0.5)),
-                ));
-            }
-        }
-        for y in PARALLELS {
-            let half = (RADIUS * RADIUS - (y - CENTRE.y).powi(2)).sqrt();
-            let (a, b) = ((CENTRE.x - half).max(x0), (CENTRE.x + half).min(x1));
-            if a < b {
-                painter.line_segment([map(pos2(a, y)), map(pos2(b, y))], grid);
-            }
-        }
+        let grid = Stroke::new(0.7 * K * local.scale_factor(), theme::white(0.5));
+        grid_lines(painter, meridians, (x0, x1), &map, grid);
 
         let band = clip_y(&outline, BAND.0, BAND.1);
         if band.len() >= 3 {
@@ -520,23 +485,77 @@ pub fn paint(
                 Stroke::NONE,
             ));
         }
-
-        let mut shade = egui::Mesh::with_texture(brushes.shade.id());
-        let side = 2.0 * RADIUS;
-        let corner = CENTRE - Vec2::splat(RADIUS);
-        for p in &outline {
-            let uv = (*p - corner) / side;
-            shade.vertices.push(egui::epaint::Vertex {
-                pos: map(*p),
-                uv: uv.to_pos2(),
-                color: Color32::WHITE,
-            });
-        }
-        for k in 1..outline.len().saturating_sub(1) as u32 {
-            shade.add_triangle(0, k, k + 1);
-        }
-        painter.add(shade);
+        painter.add(shade_mesh(brushes, &outline, &map));
     }
+}
+
+/// `globe` moved by slice `i`'s offset for `spread` and by its wave from `motion`.
+fn slice_pose(globe: Affine, motion: &Motion, i: usize, spread: f32) -> Affine {
+    let [tx, ty, rot, sx, sy] = motion.slice(i);
+    let spread = match i {
+        0 => vec2(-7.0 * spread, 0.0),
+        1 => vec2(0.0, 7.0),
+        _ => vec2(7.0 * spread, 0.0),
+    };
+    let wave = Affine::translate(vec2(tx, ty))
+        .after(Affine::rotate(rot))
+        .after(Affine::scale(1.0 + sx, 1.0 + sy))
+        .about(CENTRE);
+    globe.after(Affine::translate(spread)).after(wave)
+}
+
+/// The meridians and parallels of the slice between `x0` and `x1`, placed by `map`.
+fn grid_lines(
+    painter: &egui::Painter,
+    meridians: [f32; 3],
+    (x0, x1): (f32, f32),
+    map: &impl Fn(Pos2) -> Pos2,
+    grid: Stroke,
+) {
+    for rx in meridians {
+        let rx = RADIUS * rx;
+        if rx < 0.5 {
+            continue;
+        }
+        let ellipse: Vec<Pos2> = (0..=72)
+            .map(|n| {
+                let a = TAU * n as f32 / 72.0;
+                pos2(CENTRE.x + rx * a.cos(), CENTRE.y + RADIUS * a.sin())
+            })
+            .collect();
+        for run in runs_within(&ellipse, x0, x1) {
+            painter.add(egui::Shape::line(
+                run.into_iter().map(map).collect(),
+                Stroke::new(0.7, theme::white(0.5)),
+            ));
+        }
+    }
+    for y in PARALLELS {
+        let half = (RADIUS * RADIUS - (y - CENTRE.y).powi(2)).sqrt();
+        let (a, b) = ((CENTRE.x - half).max(x0), (CENTRE.x + half).min(x1));
+        if a < b {
+            painter.line_segment([map(pos2(a, y)), map(pos2(b, y))], grid);
+        }
+    }
+}
+
+/// The shading texture over `outline`, placed by `map`.
+fn shade_mesh(brushes: &Brushes, outline: &[Pos2], map: &impl Fn(Pos2) -> Pos2) -> egui::Mesh {
+    let mut shade = egui::Mesh::with_texture(brushes.shade.id());
+    let side = 2.0 * RADIUS;
+    let corner = CENTRE - Vec2::splat(RADIUS);
+    for p in outline {
+        let uv = (*p - corner) / side;
+        shade.vertices.push(egui::epaint::Vertex {
+            pos: map(*p),
+            uv: uv.to_pos2(),
+            color: Color32::WHITE,
+        });
+    }
+    for k in 1..outline.len().saturating_sub(1) as u32 {
+        shade.add_triangle(0, k, k + 1);
+    }
+    shade
 }
 
 /// The Quality halo: a blurred colour wheel turning once every seven seconds.

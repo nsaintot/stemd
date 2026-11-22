@@ -308,6 +308,18 @@ fn general(
     card: Rect,
     now: f64,
 ) {
+    max_track_row(ui, sheet, state, palette, card);
+    port_row(ui, sheet, state, palette, card, now);
+}
+
+/// The longest track accepted, typed in minutes.
+fn max_track_row(
+    ui: &mut egui::Ui,
+    sheet: &mut Sheet,
+    state: &AppState,
+    palette: &Palette,
+    card: Rect,
+) {
     let pinned = state.settings.pinned();
     let current = state.settings.get();
 
@@ -354,7 +366,18 @@ fn general(
         Edit::Revert => sheet.minutes = minutes_text(current.max_track_minutes),
         _ => {}
     }
+}
 
+/// The port the server listens on. Committing a new port restarts the server on it.
+fn port_row(
+    ui: &mut egui::Ui,
+    sheet: &mut Sheet,
+    state: &AppState,
+    palette: &Palette,
+    card: Rect,
+    now: f64,
+) {
+    let pinned = state.settings.pinned();
     let port = state.endpoint.port();
     if pinned.port {
         sheet.port = port.to_string();
@@ -367,29 +390,10 @@ fn general(
         ui.ctx()
             .request_repaint_after(Duration::from_secs_f64(MOVED_SECS - (now - at)));
     }
-    let moved_text = format!("Server restarted on {port}.");
-    let taken_text;
-    let (hint, colour) = if pinned.port {
-        ("Set by --bind for this run.", palette.muted)
-    } else if let Some(error) = typed {
-        (error, palette.danger)
-    } else if let Some(failed) = &sheet.port_failed {
-        (failed.as_str(), palette.danger)
-    } else if moved.is_some() {
-        (moved_text.as_str(), palette.good)
-    } else if let Some(taken) = state.endpoint.taken()
-        && sheet.port == port.to_string()
-    {
-        taken_text = format!("Port {taken} was busy at launch; serving on {port}.");
-        (taken_text.as_str(), palette.danger)
-    } else if sheet.port != port.to_string() {
-        ("Press Return to restart the server on it.", palette.muted)
-    } else {
-        ("Players connect here.", palette.muted)
-    };
+    let (hint, colour) = port_hint(sheet, state, palette, port, typed, moved.is_some());
     let field = Field {
         name: "Server port",
-        hint,
+        hint: &hint,
         hint_colour: colour,
         check: moved.is_some(),
         placeholder: "8420",
@@ -405,21 +409,58 @@ fn general(
         &mut sheet.port,
     ) {
         Edit::Changed => sheet.port_failed = None,
-        Edit::Commit if typed.is_none() => {
-            if let Ok(wanted) = sheet.port.parse::<u16>()
-                && wanted != port
-            {
-                match state.move_to_port(wanted) {
-                    Ok(()) => sheet.moved_at = Some(now),
-                    Err(err) => sheet.port_failed = Some(err.to_string()),
-                }
-            }
-        }
+        Edit::Commit if typed.is_none() => move_port(sheet, state, port, now),
         Edit::Revert => {
             sheet.port = port.to_string();
             sheet.port_failed = None;
         }
         _ => {}
+    }
+}
+
+/// The line under the port, and its colour.
+fn port_hint(
+    sheet: &Sheet,
+    state: &AppState,
+    palette: &Palette,
+    port: u16,
+    typed: Option<&str>,
+    moved: bool,
+) -> (String, Color32) {
+    if state.settings.pinned().port {
+        ("Set by --bind for this run.".to_owned(), palette.muted)
+    } else if let Some(error) = typed {
+        (error.to_owned(), palette.danger)
+    } else if let Some(failed) = &sheet.port_failed {
+        (failed.clone(), palette.danger)
+    } else if moved {
+        (format!("Server restarted on {port}."), palette.good)
+    } else if let Some(taken) = state.endpoint.taken()
+        && sheet.port == port.to_string()
+    {
+        (
+            format!("Port {taken} was busy at launch; serving on {port}."),
+            palette.danger,
+        )
+    } else if sheet.port != port.to_string() {
+        (
+            "Press Return to restart the server on it.".to_owned(),
+            palette.muted,
+        )
+    } else {
+        ("Players connect here.".to_owned(), palette.muted)
+    }
+}
+
+/// Restart the server on the typed port when it differs from `port`.
+fn move_port(sheet: &mut Sheet, state: &AppState, port: u16, now: f64) {
+    if let Ok(wanted) = sheet.port.parse::<u16>()
+        && wanted != port
+    {
+        match state.move_to_port(wanted) {
+            Ok(()) => sheet.moved_at = Some(now),
+            Err(err) => sheet.port_failed = Some(err.to_string()),
+        }
     }
 }
 
@@ -432,13 +473,34 @@ fn cache(
     brushes: &Brushes,
     card: Rect,
 ) {
-    let current = state.settings.get();
-    let pinned = state.settings.pinned();
     let stats = state.cache.stats();
-    let painter = ui.painter().clone();
     let left = card.left() + 14.0;
     let top = card.top() + 12.0;
+    let used = if stats.max_bytes == 0 {
+        0.0
+    } else {
+        (stats.bytes as f64 / stats.max_bytes as f64).min(1.0) as f32
+    };
+    usage_text(ui, sheet, palette, &stats, pos2(left, top), used);
+    empty_cache_button(ui, state, palette, brushes, card, top, stats.tracks > 0);
+    let track = Rect::from_min_size(
+        pos2(left, top + 34.0 + 10.0),
+        vec2(card.right() - 12.0 - left, 6.0),
+    );
+    usage_meter(ui, brushes, track, used);
+    limits(ui, sheet, state, palette, card);
+}
 
+/// What the cache holds against its limit, and the line under it, from `at`.
+fn usage_text(
+    ui: &egui::Ui,
+    sheet: &Sheet,
+    palette: &Palette,
+    stats: &crate::cache::Stats,
+    at: egui::Pos2,
+    used: f32,
+) {
+    let painter = ui.painter();
     let mut usage = egui::text::LayoutJob::default();
     usage.append(
         &usage_label(stats.tracks, stats.bytes),
@@ -451,13 +513,8 @@ fn cache(
         egui::TextFormat::simple(theme::font(13.0, Weight::Regular), palette.muted),
     );
     let usage = painter.layout_job(usage);
-    painter.galley(pos2(left, top), usage, palette.text);
+    painter.galley(at, usage, palette.text);
 
-    let used = if stats.max_bytes == 0 {
-        0.0
-    } else {
-        (stats.bytes as f64 / stats.max_bytes as f64).min(1.0) as f32
-    };
     let note = sheet
         .note
         .lock()
@@ -476,13 +533,24 @@ fn cache(
         None => (format!("{:.0}% used", used * 100.0), palette.muted),
     };
     painter.text(
-        pos2(left, top + 26.0),
+        at + vec2(0.0, 26.0),
         Align2::LEFT_CENTER,
         note,
         theme::font(11.5, Weight::Regular),
         colour,
     );
+}
 
+/// The button at the top right of `card` that empties the cache.
+fn empty_cache_button(
+    ui: &egui::Ui,
+    state: &AppState,
+    palette: &Palette,
+    brushes: &Brushes,
+    card: Rect,
+    top: f32,
+    enabled: bool,
+) {
     let label = "Empty cache";
     let pill_width = widgets::pill_width(ui, label, CONTROL.y);
     let button = Rect::from_min_size(
@@ -499,7 +567,7 @@ fn cache(
         ui.id().with("empty-cache"),
         label,
         Pill::Danger,
-        stats.tracks > 0,
+        enabled,
         palette,
         brushes,
     )
@@ -508,21 +576,26 @@ fn cache(
     {
         state.empty_cache();
     }
+}
 
-    let track = Rect::from_min_size(
-        pos2(left, top + 34.0 + 10.0),
-        vec2(card.right() - 12.0 - left, 6.0),
-    );
+/// The meter in `track`, filled to the `used` share of the cache.
+fn usage_meter(ui: &egui::Ui, brushes: &Brushes, track: Rect, used: f32) {
+    let painter = ui.painter();
     painter.rect_filled(track, 3.0, theme::black(0.3));
     let shown = ui
         .ctx()
         .animate_value_with_time(ui.id().with("used"), used, 0.4);
     let fill = Rect::from_min_size(track.min, vec2(track.width() * shown, track.height()));
-    brushes.spectrum(&painter, track, fill, 3.0, Color32::WHITE);
+    brushes.spectrum(painter, track, fill, 3.0, Color32::WHITE);
     if fill.width() > 0.0 {
-        brushes.gloss(&painter, fill, 3.0);
+        brushes.gloss(painter, fill, 3.0);
     }
+}
 
+/// The size limit and the age limit, under the usage block.
+fn limits(ui: &mut egui::Ui, sheet: &Sheet, state: &AppState, palette: &Palette, card: Rect) {
+    let current = state.settings.get();
+    let pinned = state.settings.pinned();
     let picked = menu_row(
         ui,
         palette,
@@ -666,7 +739,6 @@ fn text_row(
 
     let id = ui.id().with(("field", field.name));
     let around = ui.interact(control, id.with("around"), Sense::click());
-    let font = theme::font(13.0, Weight::Medium);
     let suffix = field.suffix.map(|suffix| {
         painter.layout_no_wrap(
             suffix.to_owned(),
@@ -679,6 +751,31 @@ fn text_row(
         pos2(control.left() + 12.0, control.top()),
         pos2(control.right() - 12.0 - suffix_width, control.bottom()),
     );
+    let response = text_edit(ui, palette, field, text, id, inside);
+    if around.clicked() && !field.pinned {
+        response.request_focus();
+    }
+    let focused = response.has_focus();
+    painter.set(behind, field_frame(palette, control, field.bad, focused));
+    if let Some(suffix) = suffix {
+        let at = pos2(
+            control.right() - 12.0 - suffix.size().x,
+            control.center().y - suffix.size().y / 2.0,
+        );
+        painter.galley(at, suffix, palette.muted);
+    }
+    edit_outcome(ui, &response, around, field.pinned, row, id)
+}
+
+/// The text field of `field` inside `inside`, right-aligned and frameless.
+fn text_edit(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    field: &Field<'_>,
+    text: &mut String,
+    id: egui::Id,
+    inside: Rect,
+) -> egui::Response {
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inside)
@@ -687,31 +784,30 @@ fn text_row(
     if field.pinned {
         child.multiply_opacity(0.45);
     }
-    let response = child.add(
+    child.add(
         egui::TextEdit::singleline(text)
             .id(id)
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
-            .font(font)
+            .font(theme::font(13.0, Weight::Medium))
             .text_color(palette.text)
             .hint_text(egui::RichText::new(field.placeholder).color(FAINT))
             .horizontal_align(egui::Align::RIGHT)
             .desired_width(inside.width())
             .char_limit(5)
             .interactive(!field.pinned),
-    );
-    if around.clicked() && !field.pinned {
-        response.request_focus();
-    }
-    let focused = response.has_focus();
+    )
+}
 
+/// The pill behind a text field: its fill, its edge, and a ring when it has focus or a bad value.
+fn field_frame(palette: &Palette, control: Rect, bad: bool, focused: bool) -> egui::Shape {
     let r = CONTROL.y / 2.0;
     let mut shapes = vec![egui::Shape::rect_filled(
         control,
         r,
         white(if focused { 0.09 } else { 0.06 }),
     )];
-    let (edge, ring) = if field.bad {
+    let (edge, ring) = if bad {
         (palette.danger, Some(BAD_RING))
     } else if focused {
         (FOCUS.gamma_multiply(0.8), Some(FOCUS_RING))
@@ -732,21 +828,24 @@ fn text_row(
         Stroke::new(1.0, edge),
         egui::StrokeKind::Inside,
     )));
-    painter.set(behind, egui::Shape::Vec(shapes));
-    if let Some(suffix) = suffix {
-        let at = pos2(
-            control.right() - 12.0 - suffix.size().x,
-            control.center().y - suffix.size().y / 2.0,
-        );
-        painter.galley(at, suffix, palette.muted);
-    }
+    egui::Shape::Vec(shapes)
+}
 
-    if field.pinned {
+/// How the edit of a text field ended this frame. A pinned field shows why it is fixed instead.
+fn edit_outcome(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    around: egui::Response,
+    pinned: bool,
+    row: Rect,
+    id: egui::Id,
+) -> Edit {
+    if pinned {
         ui.interact(row, id.with("pinned"), Sense::hover())
             .on_hover_text(PINNED_HINT);
         return Edit::None;
     }
-    if !focused {
+    if !response.has_focus() {
         around.on_hover_cursor(egui::CursorIcon::Text);
     }
     if response.lost_focus() {

@@ -67,6 +67,19 @@ impl Config {
     }
 }
 
+/// The longest track this machine accepts, in minutes. Warns when the saved limit is longer.
+fn longest_track(settings: &SettingsFile) -> u32 {
+    let longest = crate::disk::longest_track_minutes();
+    let saved = settings.get().max_track_minutes;
+    if saved > f64::from(longest) {
+        tracing::warn!(
+            "a {saved:.0}-minute track does not fit this machine's memory; \
+             accepting up to {longest} minutes"
+        );
+    }
+    longest
+}
+
 /// Build every service the router depends on.
 ///
 /// `endpoint` is the bound listener's address, the real port under `--bind :0`.
@@ -93,14 +106,7 @@ pub fn prepare(
         .set_limits(config.session_idle, config.max_sessions);
     stems.set_gate(queue.consolidation_gate());
     spawn_session_reaper(Arc::clone(&queue));
-    let longest = crate::disk::longest_track_minutes();
-    let saved = settings.get().max_track_minutes;
-    if saved > f64::from(longest) {
-        tracing::warn!(
-            "a {saved:.0}-minute track does not fit this machine's memory; \
-             accepting up to {longest} minutes"
-        );
-    }
+    let longest = longest_track(&settings);
     log_model(&info, precisions, settings.get().max_track_secs(longest));
 
     // Build this before the app state so every exit path can reach it. A headless server has no

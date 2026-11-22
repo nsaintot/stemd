@@ -115,35 +115,7 @@ impl HybridSeparator {
         };
         sink.update(within(0, 0, 0, 1));
 
-        // The normalisation follows the audio a half receives: under `cascade` the second half gets
-        // the instrumental, whose mono statistics differ from the mixture's.
-        let run = |half: &Half, source: &Audio, base: u32, span: u32| -> Result<Vec<Vec<f32>>> {
-            let norm = Normalisation::of(source);
-            let input = to_array(source, half.normalised.then_some(&norm))?;
-            let out = over_track(
-                half.model.as_ref(),
-                &input,
-                self.config.overlap,
-                &mut |done, total| {
-                    // Refusing here stops `over_track` at this chunk. Do not set a
-                    // flag and read it afterwards: the vocals half is most of the
-                    // run, so the cancel would wait for the whole model.
-                    if sink.cancelled() {
-                        return Err(Cancelled.into());
-                    }
-                    sink.update(within(base, span, done, total));
-                    Ok(())
-                },
-            )?;
-            to_planes(
-                &out.index((0, half.source)),
-                self.channels,
-                half.normalised.then_some(&norm),
-                frames,
-            )
-        };
-
-        let vocals = run(&self.vocals, mix, 0, vocals_units)?;
+        let vocals = self.run_half(&self.vocals, mix, (0, vocals_units), frames, sink)?;
 
         // The drums half sees either the mixture or the audio the vocals half left. The binding is
         // declared outside the `if`, so the common path passes `mix` by reference and copies no
@@ -171,17 +143,59 @@ impl HybridSeparator {
             Some(_) => (UNITS - vocals_units) / 2,
             None => UNITS - vocals_units,
         };
-        let drums = run(&self.drums, for_drums, vocals_units, drums_units)?;
+        let drums = self.run_half(
+            &self.drums,
+            for_drums,
+            (vocals_units, drums_units),
+            frames,
+            sink,
+        )?;
         let bass = bass_half
             .map(|half| {
                 let base = vocals_units + drums_units;
-                run(half, mix, base, UNITS - base)
+                self.run_half(half, mix, (base, UNITS - base), frames, sink)
             })
             .transpose()?;
         sink.update(within(UNITS, 0, 0, 1));
 
         sink.update(Progress::new(Stage::Reconstructing));
         Ok(remainder_stems(mix, drums, vocals, bass))
+    }
+
+    /// Run `half` over `source`, reporting into the `(base, span)` part of the bar.
+    fn run_half(
+        &self,
+        half: &Half,
+        source: &Audio,
+        (base, span): (u32, u32),
+        frames: usize,
+        sink: &dyn ProgressSink,
+    ) -> Result<Vec<Vec<f32>>> {
+        // The normalisation follows the audio a half receives: under `cascade` the second half gets
+        // the instrumental, whose mono statistics differ from the mixture's.
+        let norm = Normalisation::of(source);
+        let input = to_array(source, half.normalised.then_some(&norm))?;
+        let out = over_track(
+            half.model.as_ref(),
+            &input,
+            self.config.overlap,
+            &mut |done, total| {
+                // Refusing here stops `over_track` at this chunk. Do not set a
+                // flag and read it afterwards: the vocals half is most of the
+                // run, so the cancel would wait for the whole model.
+                if sink.cancelled() {
+                    return Err(Cancelled.into());
+                }
+                sink.update(within(base, span, done, total));
+                Ok(())
+            },
+        )?;
+        to_planes(
+            &out.index((0, half.source)),
+            self.channels,
+            half.normalised.then_some(&norm),
+            frames,
+        )
     }
 }
 

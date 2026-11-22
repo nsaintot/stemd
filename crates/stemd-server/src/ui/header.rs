@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, Rect, Sense, Stroke, pos2, vec2};
 use stemd_core::{OutputRate, PART_NAMES, StemFormat};
 
 use crate::models::Preset;
-use crate::settings::{DropParts, SettingsFile};
+use crate::settings::{DropParts, Pinned, Settings, SettingsFile};
 use crate::state::AppState;
 use crate::switch::{SwitchState, Switcher};
 
@@ -89,94 +89,133 @@ fn models(
     clock: f32,
 ) -> f32 {
     let switcher = Arc::clone(&state.switcher);
-    let busy = switcher.state().busy();
-    let shown = shown_preset(&switcher);
-    let pending = pending_preset(&switcher);
+    let control = Models {
+        busy: switcher.state().busy(),
+        shown: shown_preset(&switcher),
+        pending: pending_preset(&switcher),
+        clock,
+    };
     let width = 2.0 * (1.0 + INSET) + SEGMENTS.iter().sum::<f32>();
     let rect = Rect::from_min_size(row.min, vec2(width, HEIGHT));
-    let painter = ui.painter();
-    brushes.glass(painter, rect, HEIGHT / 2.0, Glass::Panel);
+    brushes.glass(ui.painter(), rect, HEIGHT / 2.0, Glass::Panel);
 
     let lefts: [f32; 3] = std::array::from_fn(|i| SEGMENTS[..i].iter().sum::<f32>());
-    let top = rect.top() + 1.0 + INSET;
-    let segment = |left: f32, width: f32| {
-        Rect::from_min_size(
-            pos2(rect.left() + 1.0 + INSET + left, top),
-            vec2(width, SEGMENT_HEIGHT),
-        )
-    };
-
-    if let Some(preset) = shown {
-        let i = index_of(preset);
-        let id = ui.id().with("model-thumb");
-        let x = Tween::follow(
-            ui.ctx(),
-            id.with("x"),
-            lefts[i],
-            THUMB_TIME[i],
-            theme::ease_spring,
-        );
-        let w = Tween::follow(
-            ui.ctx(),
-            id.with("w"),
-            SEGMENTS[i],
-            THUMB_TIME[i],
-            theme::ease_spring,
-        );
-        let thumb = segment(x, w);
-        if preset == Preset::Quality {
-            brushes.sheen(painter, thumb, SEGMENT_HEIGHT / 2.0, 0.4 * clock);
-        } else {
-            brushes.pill(painter, thumb, SEGMENT_HEIGHT / 2.0, 1.0);
-        }
+    if let Some(preset) = control.shown {
+        thumb(ui, brushes, rect, &lefts, preset, clock);
     }
-
     for (i, preset) in Preset::ALL.into_iter().enumerate() {
-        let seg = segment(lefts[i], SEGMENTS[i]);
-        let response = ui
-            .interact(seg, ui.id().with(("model", i)), Sense::click())
-            .on_hover_text(hint_for(&switcher, preset));
-        let selected = shown == Some(preset);
-        let hover = ui.ctx().animate_bool_with_time(
-            response.id.with("hover"),
-            response.hovered() && !busy,
-            0.15,
-        );
-        let colour = if selected {
-            palette.ink
-        } else {
-            theme::mix(palette.soft, Color32::WHITE, hover)
-        };
-        let weight = if selected {
-            Weight::Semibold
-        } else {
-            Weight::Medium
-        };
-        let remote = !selected && !switcher.is_local(preset);
-        let galley = ui.painter().layout_no_wrap(
-            preset.label().to_owned(),
-            theme::font(TEXT, weight),
-            colour,
-        );
-        let icon = if remote { 10.0 + 5.0 } else { 0.0 };
-        let left = seg.center().x - (galley.size().x + icon) / 2.0;
-        let text_pos = pos2(left, seg.center().y - galley.size().y / 2.0);
-        let text_width = galley.size().x;
-        ui.painter().galley(text_pos, galley, colour);
-        let icon_box = icons::square(pos2(left + text_width + 5.0 + 5.0, seg.center().y), 10.0);
-        if pending == Some(preset) {
-            icons::spinner(ui.painter(), icon_box, colour, 1.3, clock.rem_euclid(1.0));
-        } else if remote {
-            icons::download(ui.painter(), icon_box, colour, 1.3);
-        }
-        if !busy && response.clicked() && !selected {
-            switcher.request(preset);
-        }
-        if !busy && !selected {
-            response.on_hover_cursor(egui::CursorIcon::PointingHand);
-        }
+        let seg = segment_rect(rect, lefts[i], SEGMENTS[i]);
+        model_segment(ui, seg, i, preset, &switcher, &control, palette);
     }
     width
+}
+
+/// What the model control shows this frame.
+struct Models {
+    busy: bool,
+    shown: Option<Preset>,
+    pending: Option<Preset>,
+    clock: f32,
+}
+
+/// The segment `width` wide at `left` along the control in `rect`.
+fn segment_rect(rect: Rect, left: f32, width: f32) -> Rect {
+    Rect::from_min_size(
+        pos2(rect.left() + 1.0 + INSET + left, rect.top() + 1.0 + INSET),
+        vec2(width, SEGMENT_HEIGHT),
+    )
+}
+
+/// The thumb under the shown preset, sliding to it when it changes.
+fn thumb(
+    ui: &egui::Ui,
+    brushes: &Brushes,
+    rect: Rect,
+    lefts: &[f32; 3],
+    preset: Preset,
+    clock: f32,
+) {
+    let i = index_of(preset);
+    let id = ui.id().with("model-thumb");
+    let x = Tween::follow(
+        ui.ctx(),
+        id.with("x"),
+        lefts[i],
+        THUMB_TIME[i],
+        theme::ease_spring,
+    );
+    let w = Tween::follow(
+        ui.ctx(),
+        id.with("w"),
+        SEGMENTS[i],
+        THUMB_TIME[i],
+        theme::ease_spring,
+    );
+    let thumb = segment_rect(rect, x, w);
+    if preset == Preset::Quality {
+        brushes.sheen(ui.painter(), thumb, SEGMENT_HEIGHT / 2.0, 0.4 * clock);
+    } else {
+        brushes.pill(ui.painter(), thumb, SEGMENT_HEIGHT / 2.0, 1.0);
+    }
+}
+
+/// One preset's segment: its label, a spinner or download icon, and a click that switches to it.
+fn model_segment(
+    ui: &egui::Ui,
+    seg: Rect,
+    i: usize,
+    preset: Preset,
+    switcher: &Arc<Switcher>,
+    control: &Models,
+    palette: &Palette,
+) {
+    let busy = control.busy;
+    let response = ui
+        .interact(seg, ui.id().with(("model", i)), Sense::click())
+        .on_hover_text(hint_for(switcher, preset));
+    let selected = control.shown == Some(preset);
+    let hover = ui.ctx().animate_bool_with_time(
+        response.id.with("hover"),
+        response.hovered() && !busy,
+        0.15,
+    );
+    let colour = if selected {
+        palette.ink
+    } else {
+        theme::mix(palette.soft, Color32::WHITE, hover)
+    };
+    let weight = if selected {
+        Weight::Semibold
+    } else {
+        Weight::Medium
+    };
+    let remote = !selected && !switcher.is_local(preset);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(preset.label().to_owned(), theme::font(TEXT, weight), colour);
+    let icon = if remote { 10.0 + 5.0 } else { 0.0 };
+    let left = seg.center().x - (galley.size().x + icon) / 2.0;
+    let text_pos = pos2(left, seg.center().y - galley.size().y / 2.0);
+    let text_width = galley.size().x;
+    ui.painter().galley(text_pos, galley, colour);
+    let icon_box = icons::square(pos2(left + text_width + 5.0 + 5.0, seg.center().y), 10.0);
+    if control.pending == Some(preset) {
+        icons::spinner(
+            ui.painter(),
+            icon_box,
+            colour,
+            1.3,
+            control.clock.rem_euclid(1.0),
+        );
+    } else if remote {
+        icons::download(ui.painter(), icon_box, colour, 1.3);
+    }
+    if !busy && response.clicked() && !selected {
+        switcher.request(preset);
+    }
+    if !busy && !selected {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
 }
 
 /// Which capsule menu.
@@ -187,6 +226,35 @@ enum Menu {
     Rate,
 }
 
+impl Menu {
+    /// Where the menu opens under its button.
+    fn align(self) -> egui::RectAlign {
+        if self == Self::Rate {
+            egui::RectAlign::BOTTOM_END
+        } else {
+            egui::RectAlign::BOTTOM_START
+        }
+    }
+
+    /// The parts menu stays open while parts are ticked.
+    fn close(self) -> egui::PopupCloseBehavior {
+        if self == Self::Parts {
+            egui::PopupCloseBehavior::CloseOnClickOutside
+        } else {
+            egui::PopupCloseBehavior::CloseOnClick
+        }
+    }
+}
+
+/// One capsule button and what it shows.
+struct Item {
+    menu: Menu,
+    label: String,
+    /// The padding left and right of the label.
+    pads: (f32, f32),
+    disabled: bool,
+}
+
 /// Parts, format and rate, in one glass capsule on the right. Returns its width.
 fn capsule(
     ui: &mut egui::Ui,
@@ -195,49 +263,19 @@ fn capsule(
     palette: &Palette,
     brushes: &Brushes,
 ) -> f32 {
-    let settings = Arc::clone(&state.settings);
-    let current = settings.get();
-    let pinned = settings.pinned();
-    let count = current.drop_parts.names().count();
-    let items = [
-        (
-            Menu::Parts,
-            if count == 1 {
-                "1 part".to_owned()
-            } else {
-                format!("{count} parts")
-            },
-            (13.0, 10.0),
-            false,
-        ),
-        (
-            Menu::Format,
-            match current.format {
-                // The menu label says "float", which does not fit in the capsule.
-                StemFormat::Pcm32 => "PCM 32-bit".to_owned(),
-                format => format.label().to_owned(),
-            },
-            (12.0, 10.0),
-            pinned.format,
-        ),
-        (
-            Menu::Rate,
-            rate_label(current.rate),
-            (12.0, 11.0),
-            pinned.rate,
-        ),
-    ];
+    let current = state.settings.get();
+    let items = capsule_items(&current, &state.settings.pinned());
 
     let font = theme::font(TEXT, Weight::Regular);
     let widths: Vec<f32> = items
         .iter()
-        .map(|(_, label, (left, right), _)| {
+        .map(|item| {
             let text = ui
                 .painter()
-                .layout_no_wrap(label.clone(), font.clone(), palette.text)
+                .layout_no_wrap(item.label.clone(), font.clone(), palette.text)
                 .size()
                 .x;
-            left + text + 6.0 + CHEVRON + right
+            item.pads.0 + text + 6.0 + CHEVRON + item.pads.1
         })
         .collect();
     // Two hairline dividers and a point of padding at each end.
@@ -246,9 +284,7 @@ fn capsule(
     brushes.glass(ui.painter(), rect, HEIGHT / 2.0, Glass::Panel);
 
     let mut x = rect.left() + 1.0;
-    for (n, ((menu, label, (pad_left, _), disabled), item_width)) in
-        items.into_iter().zip(widths).enumerate()
-    {
+    for (n, (item, item_width)) in items.iter().zip(widths).enumerate() {
         if n > 0 {
             ui.painter().line_segment(
                 [
@@ -264,54 +300,106 @@ fn capsule(
             vec2(item_width, CAP_HEIGHT),
         );
         x += item_width;
-        let id = ui.id().with(("capsule", n));
-        let response = ui.interact(
-            button,
-            id,
-            if disabled {
-                Sense::hover()
-            } else {
-                Sense::click()
-            },
-        );
-        let open = widgets::menu(
-            &response,
-            if menu == Menu::Rate {
-                egui::RectAlign::BOTTOM_END
-            } else {
-                egui::RectAlign::BOTTOM_START
-            },
-            if menu == Menu::Parts {
-                egui::PopupCloseBehavior::CloseOnClickOutside
-            } else {
-                egui::PopupCloseBehavior::CloseOnClick
-            },
-            palette,
-            |ui| match menu {
-                Menu::Parts => parts_menu(ui, &settings, current.drop_parts, state, palette),
-                Menu::Format => format_menu(ui, &settings, current.format, palette),
-                Menu::Rate => rate_menu(ui, &settings, current.format, current.rate, palette),
-            },
-        );
-        cap_button(
-            ui, button, &response, &label, pad_left, open, disabled, palette, brushes,
-        );
-        if disabled {
-            response.on_hover_text(PINNED_HINT);
-        } else if !open {
-            response
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(match menu {
-                    Menu::Parts => format!(
-                        "What a dropped track writes: {}.",
-                        current.drop_parts.names().collect::<Vec<_>>().join(", ")
-                    ),
-                    Menu::Format => format_hint(current.format).to_owned(),
-                    Menu::Rate => rate_hint(current.rate).to_owned(),
-                });
-        }
+        capsule_item(ui, button, item, &current, state, palette, brushes);
     }
     width
+}
+
+/// The parts, format and rate buttons, with their labels for `current`.
+fn capsule_items(current: &Settings, pinned: &Pinned) -> [Item; 3] {
+    let count = current.drop_parts.names().count();
+    [
+        Item {
+            menu: Menu::Parts,
+            label: if count == 1 {
+                "1 part".to_owned()
+            } else {
+                format!("{count} parts")
+            },
+            pads: (13.0, 10.0),
+            disabled: false,
+        },
+        Item {
+            menu: Menu::Format,
+            label: match current.format {
+                // The menu label says "float", which does not fit in the capsule.
+                StemFormat::Pcm32 => "PCM 32-bit".to_owned(),
+                format => format.label().to_owned(),
+            },
+            pads: (12.0, 10.0),
+            disabled: pinned.format,
+        },
+        Item {
+            menu: Menu::Rate,
+            label: rate_label(current.rate),
+            pads: (12.0, 11.0),
+            disabled: pinned.rate,
+        },
+    ]
+}
+
+/// One capsule button in `button`, with its menu and its tooltip.
+fn capsule_item(
+    ui: &egui::Ui,
+    button: Rect,
+    item: &Item,
+    current: &Settings,
+    state: &AppState,
+    palette: &Palette,
+    brushes: &Brushes,
+) {
+    let settings = &state.settings;
+    let id = ui.id().with(("capsule", item.menu as usize));
+    let response = ui.interact(
+        button,
+        id,
+        if item.disabled {
+            Sense::hover()
+        } else {
+            Sense::click()
+        },
+    );
+    let open = widgets::menu(
+        &response,
+        item.menu.align(),
+        item.menu.close(),
+        palette,
+        |ui| match item.menu {
+            Menu::Parts => parts_menu(ui, settings, current.drop_parts, state, palette),
+            Menu::Format => format_menu(ui, settings, current.format, palette),
+            Menu::Rate => rate_menu(ui, settings, current.format, current.rate, palette),
+        },
+    );
+    cap_button(
+        ui,
+        button,
+        &response,
+        &item.label,
+        item.pads.0,
+        open,
+        item.disabled,
+        palette,
+        brushes,
+    );
+    if item.disabled {
+        response.on_hover_text(PINNED_HINT);
+    } else if !open {
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(menu_hint(item.menu, current));
+    }
+}
+
+/// The tooltip on a capsule button whose menu is closed.
+fn menu_hint(menu: Menu, current: &Settings) -> String {
+    match menu {
+        Menu::Parts => format!(
+            "What a dropped track writes: {}.",
+            current.drop_parts.names().collect::<Vec<_>>().join(", ")
+        ),
+        Menu::Format => format_hint(current.format).to_owned(),
+        Menu::Rate => rate_hint(current.rate).to_owned(),
+    }
 }
 
 /// One capsule button: label and chevron, a faint hover, the light pill while
