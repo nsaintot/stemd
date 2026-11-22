@@ -110,6 +110,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
     );
 
     spawn_reaper(Arc::clone(&stems), Arc::clone(&store), Arc::clone(&queue));
+    let filters = open_filters()?;
 
     Ok(Server {
         state: Arc::new(AppState {
@@ -122,6 +123,7 @@ pub fn prepare(args: &Args, logs: LogBuffer, addr: SocketAddr, launch: &Launch) 
             settings,
             max_track_secs: args.max_track_secs(),
             serving,
+            filters,
         }),
         max_upload,
         cache_summary,
@@ -481,6 +483,20 @@ fn open_stem_cache(args: &Args) -> Result<(Arc<Cache>, String)> {
         max_bytes as f64 / 1e9
     );
     Ok((cache, summary))
+}
+
+/// Open the uploaded filters, which are kept across restarts.
+fn open_filters() -> Result<Arc<crate::filters::Filters>> {
+    let dir = models::support_dir()?.join("filters");
+    let filters = crate::filters::Filters::open(dir.clone(), crate::filters::MAX_FILTERS)
+        .with_context(|| format!("preparing the filter store in {}", dir.display()))?;
+    tracing::info!(
+        "filters in {}: {} of {}",
+        dir.display(),
+        filters.len(),
+        crate::filters::MAX_FILTERS
+    );
+    Ok(filters)
 }
 
 /// Open the piece store, which keeps pieces across restarts.

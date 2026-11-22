@@ -384,7 +384,7 @@ mod tests {
                         format: StemFormat::Pcm16,
                         rate: OutputRate::default(),
                         derived: false,
-                        dsp: DspMode::default(),
+                        dsp: DspMode::default().into(),
                         parts: stemd_core::Parts::DEFAULT,
                     },
                     model_id: "test".into(),

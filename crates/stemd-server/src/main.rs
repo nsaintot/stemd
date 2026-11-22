@@ -19,6 +19,7 @@ mod cuda;
 mod discovery;
 mod disk;
 mod drops;
+mod filters;
 mod ident;
 mod jobs;
 mod launch;

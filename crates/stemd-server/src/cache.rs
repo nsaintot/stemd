@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, StemFormat, Stems, resample};
+use stemd_core::{Audio, OutputRate, Parts, PcmFormat, StemFormat, Stems};
+
+use crate::filters::Dsp;
 
 /// Invalidates every stored entry when bumped by hand. Covers a change to which
 /// stems ship, or to how one is encoded or scaled on the way out. The model is in
@@ -32,7 +34,7 @@ use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, StemFormat, Stems
 const EPOCH: u32 = 2;
 
 /// What a job asks for on the way out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub format: StemFormat,
     pub rate: OutputRate,
@@ -40,19 +42,19 @@ pub struct Output {
     /// it from the mix. See [`to_output_rate`].
     pub derived: bool,
     /// Filter the conversion to `rate` runs through.
-    pub dsp: DspMode,
+    pub dsp: Dsp,
     /// Parts to ship. The derived part is the one they leave out.
     pub parts: Parts,
 }
 
 impl Output {
     /// How many parts this asks for, for a log line.
-    pub fn parts(self) -> usize {
+    pub fn parts(&self) -> usize {
         self.parts.len() + usize::from(self.ships_derived())
     }
 
     /// Whether the derived part ships: asked for, and something is left out.
-    pub fn ships_derived(self) -> bool {
+    pub fn ships_derived(&self) -> bool {
         self.derived && self.parts.derived().is_some()
     }
 }
@@ -80,8 +82,8 @@ pub struct Ingredients<'a> {
     /// holds.
     pub parts: Parts,
     /// Filter the conversion to `out_rate` ran through. In the key because two
-    /// modes at one rate are two different files.
-    pub dsp: DspMode,
+    /// filters at one rate are two different files.
+    pub dsp: &'a Dsp,
     /// Digest of the model artefact where one is pinned, else its name.
     pub model: &'a str,
 }
@@ -444,7 +446,7 @@ impl Cache {
     ) -> Result<Arc<Entry>> {
         // Converted before encoding, so an entry holds exactly the bytes a
         // client is handed and a hit costs no further work.
-        let shipped = to_output_rate(mix, stems, output)?;
+        let shipped = to_output_rate(mix, stems, &output)?;
 
         let dir = self.root.join(key);
         let staging = self.staging_dir(key)?;
@@ -651,7 +653,7 @@ fn clear_contents(dir: &Path) -> std::io::Result<()> {
 pub(crate) fn to_output_rate(
     mix: &Audio,
     stems: &Stems,
-    output: Output,
+    output: &Output,
 ) -> Result<Vec<(&'static str, Audio)>> {
     let mut parts: Vec<(&'static str, &Audio)> = Vec::new();
     for name in output.parts.names() {
@@ -695,9 +697,11 @@ pub(crate) fn to_output_rate(
     })
 }
 
-fn one_rate(name: &'static str, audio: &Audio, output: Output) -> Result<(&'static str, Audio)> {
+fn one_rate(name: &'static str, audio: &Audio, output: &Output) -> Result<(&'static str, Audio)> {
     let began = std::time::Instant::now();
-    let converted = resample::to_rate_with(audio, output.rate.hz(), output.dsp)
+    let converted = output
+        .dsp
+        .convert(audio, output.rate.hz())
         .with_context(|| format!("converting {name} to {} Hz", output.rate))?;
     //  Timed because which of conversion and encode dominates depends on the format
     //  asked for.
@@ -909,7 +913,7 @@ mod tests {
                     format: StemFormat::Pcm16,
                     rate: OutputRate::default(),
                     derived: false,
-                    dsp: DspMode::default(),
+                    dsp: stemd_core::DspMode::default().into(),
                     parts: Parts::DEFAULT,
                 },
                 1.0,
@@ -1100,7 +1104,7 @@ mod tests {
             format: StemFormat::Pcm16,
             rate,
             derived,
-            dsp: DspMode::default(),
+            dsp: stemd_core::DspMode::default().into(),
             parts: Parts::DEFAULT,
         }
     }
@@ -1111,11 +1115,11 @@ mod tests {
     fn what_ships_is_the_request_not_the_rate() {
         let (mix, stems) = crate::testkit::stems(4410);
         for rate in OutputRate::ALL {
-            let parts = to_output_rate(&mix, &stems, output(rate, false)).unwrap();
+            let parts = to_output_rate(&mix, &stems, &output(rate, false)).unwrap();
             let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
             assert_eq!(names, stemd_core::SHIPPED, "{rate} changed what ships");
 
-            let parts = to_output_rate(&mix, &stems, output(rate, true)).unwrap();
+            let parts = to_output_rate(&mix, &stems, &output(rate, true)).unwrap();
             let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
             assert_eq!(
                 names.len(),
@@ -1154,7 +1158,7 @@ mod tests {
             parts: Parts::parse("vocals,other,bass").unwrap(),
             ..output(OutputRate::Hz44100, true)
         };
-        let parts = to_output_rate(&mix, &stems, output).unwrap();
+        let parts = to_output_rate(&mix, &stems, &output).unwrap();
         let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, ["vocals", "bass", "other", "drums"]);
 
@@ -1170,7 +1174,7 @@ mod tests {
         };
         let (_, plain) = crate::testkit::stems(4410);
         assert!(
-            to_output_rate(&mix, &plain, missing).is_err(),
+            to_output_rate(&mix, &plain, &missing).is_err(),
             "no drums estimate to ship"
         );
     }
@@ -1188,7 +1192,7 @@ mod tests {
             out_rate: OutputRate::Hz44100,
             include_derived: false,
             parts: Parts::DEFAULT,
-            dsp: DspMode::General,
+            dsp: &Dsp::default(),
             model: "digest",
         };
         assert_ne!(
@@ -1251,7 +1255,7 @@ mod tests {
             out_rate: OutputRate::Hz44100,
             include_derived: false,
             parts: Parts::DEFAULT,
-            dsp: DspMode::General,
+            dsp: &Dsp::default(),
             model: "digest",
         };
         let reference = key(&base);
@@ -1308,7 +1312,7 @@ mod tests {
         assert_ne!(
             reference,
             key(&Ingredients {
-                dsp: DspMode::Mode1,
+                dsp: &Dsp::Mode(stemd_core::DspMode::Mode1),
                 ..base
             })
         );

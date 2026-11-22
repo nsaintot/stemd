@@ -28,7 +28,7 @@ pub use mlx::{MlxConfig, MlxSeparator};
 pub use pass::{Pass, Segmenting, whole_track};
 pub use pcm::{Audio, PcmFormat};
 pub use progress::{Cancelled, Progress, ProgressSink, Silent, Stage};
-pub use resample::{DspMode, OutputRate};
+pub use resample::{DspMode, OutputRate, polyphase::Polyphase};
 pub use roformer::RoformerSeparator;
 /// Re-exported so the server can plan segments without linking `stemd-mlx`.
 pub use stemd_mlx::apply::{Grid, Placement};

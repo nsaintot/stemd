@@ -61,7 +61,7 @@ pub fn publish(cache: &Cache, key: &str, frames: usize, separation_secs: f64) ->
                 format: StemFormat::Pcm16,
                 rate: OutputRate::default(),
                 derived: false,
-                dsp: DspMode::default(),
+                dsp: DspMode::default().into(),
                 parts: stemd_core::Parts::DEFAULT,
             },
             separation_secs,

@@ -8,6 +8,8 @@
 //! GET    /v1/jobs/{id}/stems/{name}     raw interleaved PCM stream
 //! DELETE /v1/jobs/{id}                  stop the job, drop the handle
 //! GET    /v1/logs                       recent log lines
+//! PUT    /v1/filters/{id}               store a conversion filter, see [`crate::filters`]
+//! GET    /v1/filters/{id}               a stored filter's summary
 //! ```
 //!
 //! Upload is raw PCM, no decode/encode
@@ -24,13 +26,14 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
 use stemd_core::{Audio, DspMode, OutputRate, Parts, PcmFormat, Stage, resample};
 use tokio_util::io::ReaderStream;
 
 use crate::cache::{Cache, Ingredients, Output};
+use crate::filters::{Dsp, Filters};
 use crate::jobs::JobStore;
 use crate::logbuf::LogBuffer;
 use crate::models::Preset;
@@ -55,6 +58,8 @@ pub struct AppState {
     /// Whether the API answers, and its mDNS advertisement. Shared so every
     /// exit path can withdraw the advertisement: macOS skips Drop on Cmd-Q.
     pub serving: crate::serving::Serving,
+    /// Conversion filters clients uploaded.
+    pub filters: Arc<Filters>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -65,6 +70,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}", delete(delete_job))
         .route("/v1/jobs/{id}/stems/{name}", get(get_stem))
         .route("/v1/logs", get(get_logs))
+        .route("/v1/filters/{id}", put(put_filter))
+        .route("/v1/filters/{id}", get(get_filter))
         .merge(crate::session_api::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -138,11 +145,15 @@ struct Health {
     output_sample_rates: Vec<u32>,
     /// Values `dsp_mode` accepts. `0` is the default and converts any rate pair;
     /// the rest are fixed filters covering one pair each, listed under
-    /// `dsp_mode_pairs`. Ask for one only if you know why you need it.
+    /// `dsp_mode_pairs`. The numbered modes are deprecated in favor of
+    /// `dsp_filter`.
     dsp_modes: Vec<u8>,
     /// The `[from, to]` a numbered mode is limited to, keyed by the mode. Mode 0
     /// is absent because it has no such limit.
     dsp_mode_pairs: BTreeMap<u8, [u32; 2]>,
+    /// Filters `PUT /v1/filters/{id}` keeps before evicting the least recently
+    /// used.
+    max_dsp_filters: usize,
     /// What a job that names neither gets. Set in the window, so read them here
     /// rather than assuming: they persist across launches and can change while
     /// this server is running.
@@ -156,7 +167,16 @@ struct Health {
     parts: Vec<String>,
     /// What a job that names no `parts` gets.
     default_parts: Vec<&'static str>,
+    /// Behaviors a client can test for, see [`FEATURES`].
+    features: &'static [&'static str],
 }
+
+/// Behaviors added after protocol 1, listed in `/v1/health` and the TXT record.
+///
+/// | Feature | Since | Meaning |
+/// |---------|-------|---------|
+/// | `dsp-filters` | 0.2.1 | `PUT /v1/filters/{id}` and the `dsp_filter` parameter |
+pub const FEATURES: &[&str] = &["dsp-filters"];
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
     // Asked of the queue rather than kept alongside it: the worker owns the
@@ -188,11 +208,13 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
             .iter()
             .filter_map(|m| m.only_pair().map(|(from, to)| (m.id(), [from, to])))
             .collect(),
+        max_dsp_filters: crate::filters::MAX_FILTERS,
         default_output_format: defaults.format.to_string(),
         default_output_sample_rate: defaults.rate.hz(),
         derived_stem: stemd_core::DERIVED,
         parts: info.parts,
         default_parts: Parts::DEFAULT.names().collect(),
+        features: FEATURES,
     })
 }
 
@@ -227,6 +249,10 @@ pub(crate) struct CreateParams {
     /// default, converts any pair. See `dsp_modes` in `/v1/health`.
     #[serde(default)]
     pub(crate) dsp_mode: Option<String>,
+    /// Id of an uploaded filter the conversion runs through instead. See
+    /// `PUT /v1/filters/{id}`.
+    #[serde(default)]
+    pub(crate) dsp_filter: Option<String>,
 }
 
 pub(crate) const fn default_rate() -> u32 {
@@ -254,18 +280,66 @@ fn track_seconds(bytes: usize, params: &CreateParams, format: PcmFormat) -> f64 
 /// it a different one is the failure it was trying to avoid. The uploaded rate
 /// does not enter into it, since the conversion starts from the model's rate
 /// whatever arrived.
-fn check_dsp_mode(dsp: DspMode, model_rate: u32, out_rate: OutputRate) -> Result<(), String> {
+fn check_dsp(dsp: &Dsp, model_rate: u32, out_rate: OutputRate) -> Result<(), String> {
+    let name = match dsp {
+        Dsp::Mode(mode) => format!("dsp_mode {mode}"),
+        Dsp::Fir(fir) => format!("dsp_filter {}", fir.id),
+    };
     match dsp.only_pair() {
         Some((from, to)) if from != model_rate || to != out_rate.hz() => Err(format!(
-            "dsp_mode {dsp} converts {from} to {to} Hz; this job converts {model_rate} to {} Hz",
+            "{name} converts {from} to {to} Hz; this job converts {model_rate} to {} Hz",
             out_rate.hz()
         )),
         _ => Ok(()),
     }
 }
 
+/// Log once per run that a client still uses a numbered mode.
+fn warn_numbered_mode_once(mode: DspMode) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "a client asked for dsp_mode {mode}, which is deprecated; \
+             it should upload its filter and send dsp_filter instead"
+        );
+    }
+}
+
+/// The filter a request names with `dsp_mode` or `dsp_filter`.
+fn parse_dsp(params: &CreateParams, filters: &Filters) -> Result<Dsp, ApiError> {
+    let mode: DspMode = match params.dsp_mode.as_deref() {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
+        None => DspMode::default(),
+    };
+    let Some(id) = params.dsp_filter.as_deref() else {
+        if mode != DspMode::General {
+            warn_numbered_mode_once(mode);
+        }
+        return Ok(mode.into());
+    };
+    if mode != DspMode::General {
+        return Err(ApiError::bad_request(
+            "dsp_mode and dsp_filter both name a filter; send one",
+        ));
+    }
+    if !crate::filters::is_id(id) {
+        return Err(ApiError::bad_request(format!(
+            "{id:?} is not a filter id: expected 64 lowercase hex digits"
+        )));
+    }
+    filters.get(id).map(Dsp::Fir).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no filter {id}; upload it with PUT /v1/filters/{id}"),
+        )
+        .with_code("unknown_filter")
+    })
+}
+
 /// A submission whose query string has been parsed and checked against the body.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Submission {
     in_format: PcmFormat,
     output: Output,
@@ -305,12 +379,7 @@ pub(crate) fn parse_output(
             .map_err(|e| ApiError::bad_request(format!("{e}")))?,
         None => defaults.rate,
     };
-    let dsp: DspMode = match params.dsp_mode.as_deref() {
-        Some(s) => s
-            .parse()
-            .map_err(|e| ApiError::bad_request(format!("{e}")))?,
-        None => DspMode::default(),
-    };
+    let dsp = parse_dsp(params, &state.filters)?;
 
     let info = state.queue.info();
     let model_rate = info.sample_rate;
@@ -324,7 +393,7 @@ pub(crate) fn parse_output(
             info.model, info.parts
         )));
     }
-    check_dsp_mode(dsp, model_rate, out_rate).map_err(ApiError::bad_request)?;
+    check_dsp(&dsp, model_rate, out_rate).map_err(ApiError::bad_request)?;
 
     // Said out loud, because the way this goes wrong is inaudible from here
     // and unmistakable at the other end. A client rebuilding the derived
@@ -333,7 +402,7 @@ pub(crate) fn parse_output(
     // delay that the general resampler does not, which at 1.5 kHz is a third
     // of a cycle, so the vocals come back rather than cancelling. Not an
     // error, because plenty of clients ask for a rate and subtract nothing.
-    if dsp == DspMode::General
+    if dsp.is_general()
         && let Some(other) = DspMode::for_pair(model_rate, out_rate.hz())
     {
         tracing::info!(
@@ -410,7 +479,7 @@ impl Submission {
         })
     }
 
-    fn ingredients<'a>(&self, pcm: &'a [u8], model: &'a str) -> Ingredients<'a> {
+    fn ingredients<'a>(&'a self, pcm: &'a [u8], model: &'a str) -> Ingredients<'a> {
         Ingredients {
             pcm,
             sample_rate: self.sample_rate,
@@ -420,7 +489,7 @@ impl Submission {
             out_rate: self.output.rate,
             include_derived: self.output.derived,
             parts: self.output.parts,
-            dsp: self.output.dsp,
+            dsp: &self.output.dsp,
             model,
         }
     }
@@ -510,7 +579,7 @@ async fn create_job(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let submission = Submission::parse(&params, &body, &state)?;
-    let (key, body) = hash_upload(body, submission, state.switcher.identity()).await?;
+    let (key, body) = hash_upload(body, submission.clone(), state.switcher.identity()).await?;
 
     // Claim the key before the decode, not after: `claim` registers the job
     // under the same lock that looks for one, so simultaneous requests for the
@@ -549,7 +618,7 @@ async fn create_job(
         ));
     }
 
-    let mix = decode_upload(body, submission, &job).await?;
+    let mix = decode_upload(body, submission.clone(), &job).await?;
     enqueue(&state, &job, mix, submission)?;
     Ok((StatusCode::ACCEPTED, Json(job.view())).into_response())
 }
@@ -567,7 +636,7 @@ fn enqueue(
         .submit(QueuedWork {
             job: Arc::clone(job),
             mix,
-            output: submission.output,
+            output: submission.output.clone(),
             model_id: state.switcher.published_identity(),
             from_api: true,
         })
@@ -685,10 +754,70 @@ async fn get_logs(
     Json(state.logs.recent(params.limit))
 }
 
+/// Store a filter file under its SHA-256. `201` when new, `200` when already stored.
+async fn put_filter(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    if body.len() > crate::filters::MAX_FILE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{} bytes is over the limit of {}",
+                body.len(),
+                crate::filters::MAX_FILE_BYTES
+            ),
+        ));
+    }
+    let filters = Arc::clone(&state.filters);
+    let stored = tokio::task::spawn_blocking(move || filters.put(&id, &body))
+        .await
+        .map_err(|e| ApiError::internal(format!("storing the filter: {e}")))?;
+    match stored {
+        Ok((fir, created)) => {
+            if created {
+                tracing::info!(
+                    "filter {} stored: {} to {} Hz, {} taps",
+                    &fir.id[..12],
+                    fir.poly.in_rate(),
+                    fir.poly.out_rate(),
+                    fir.poly.taps()
+                );
+            }
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            Ok((status, Json(fir.summary())).into_response())
+        }
+        Err(crate::filters::PutError::Io(err)) => Err(ApiError::internal(format!("{err:#}"))),
+        Err(err) => Err(ApiError::bad_request(err.to_string())),
+    }
+}
+
+/// A stored filter's summary, or `404` with code `unknown_filter`.
+async fn get_filter(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    state
+        .filters
+        .peek(&id)
+        .map(|fir| Json(fir.summary()).into_response())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, format!("no filter {id}"))
+                .with_code("unknown_filter")
+        })
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// A stable name for an error a client acts on, sent as `code`.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -696,7 +825,13 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
         }
+    }
+
+    pub(crate) const fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
@@ -714,11 +849,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({"error": self.message})),
-        )
-            .into_response()
+        let body = match self.code {
+            Some(code) => serde_json::json!({"error": self.message, "code": code}),
+            None => serde_json::json!({"error": self.message}),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -736,6 +871,7 @@ mod tests {
             include_derived: None,
             parts: None,
             dsp_mode: None,
+            dsp_filter: None,
         }
     }
 
@@ -757,21 +893,55 @@ mod tests {
     #[test]
     fn a_numbered_dsp_mode_is_refused_outside_its_own_rate_pair() {
         for rate in OutputRate::ALL {
-            assert!(check_dsp_mode(DspMode::General, 44_100, rate).is_ok());
+            assert!(check_dsp(&DspMode::General.into(), 44_100, rate).is_ok());
         }
 
-        assert!(check_dsp_mode(DspMode::Mode1, 44_100, OutputRate::Hz96000).is_ok());
+        assert!(check_dsp(&DspMode::Mode1.into(), 44_100, OutputRate::Hz96000).is_ok());
 
-        let err = check_dsp_mode(DspMode::Mode1, 44_100, OutputRate::Hz48000)
+        let err = check_dsp(&DspMode::Mode1.into(), 44_100, OutputRate::Hz48000)
             .expect_err("48 kHz is not mode 1's pair");
         assert!(err.contains("44100 to 96000"), "{err}");
         assert!(err.contains("44100 to 48000"), "{err}");
 
         // A model at another rate takes mode 1 out of reach entirely, and the
         // message has to say so rather than blaming the output rate.
-        let err = check_dsp_mode(DspMode::Mode1, 48_000, OutputRate::Hz96000)
+        let err = check_dsp(&DspMode::Mode1.into(), 48_000, OutputRate::Hz96000)
             .expect_err("mode 1 starts at 44.1 kHz");
         assert!(err.contains("48000 to 96000"), "{err}");
+    }
+
+    #[test]
+    fn a_job_names_an_uploaded_filter_by_its_id() {
+        let dir = std::env::temp_dir().join(format!("stemd-api-filters-{}", std::process::id()));
+        let filters = Filters::open(dir, 4).unwrap();
+        let body = crate::filters::encode(44_100, 96_000, &[1.0; 320]);
+        let id = crate::filters::id_of(&body);
+
+        let mut p = params(2, 44_100);
+        p.dsp_filter = Some(id.clone());
+        let err = parse_dsp(&p, &filters).unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, Some("unknown_filter"));
+
+        filters.put(&id, &body).unwrap();
+        let dsp = parse_dsp(&p, &filters).unwrap();
+        assert_eq!(dsp.to_string(), format!("fir:{id}"));
+        assert!(check_dsp(&dsp, 44_100, OutputRate::Hz96000).is_ok());
+        let err = check_dsp(&dsp, 44_100, OutputRate::Hz48000).unwrap_err();
+        assert!(err.contains(&format!("dsp_filter {id}")), "{err}");
+
+        p.dsp_mode = Some("1".into());
+        assert_eq!(
+            parse_dsp(&p, &filters).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        p.dsp_mode = None;
+        p.dsp_filter = Some("not-a-hash".into());
+        assert_eq!(
+            parse_dsp(&p, &filters).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

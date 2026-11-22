@@ -610,7 +610,7 @@ mod tests {
             out_rate: stemd_core::OutputRate::default(),
             include_derived: false,
             parts: stemd_core::Parts::DEFAULT,
-            dsp: stemd_core::DspMode::default(),
+            dsp: &crate::filters::Dsp::default(),
             model: "digest",
         };
         assert_eq!(crate::cache::key(&base).len(), 64);

@@ -36,19 +36,14 @@ pub struct Advertiser {
 }
 
 impl Advertiser {
-    /// Announce this server on the local network.
-    ///
-    /// TXT records carry what a client needs before a round trip: protocol version,
-    /// model, and where the API lives. Not the stem names, because `harmonics,vocals`
-    /// is what `v=1` means. `model` names the artefact, not how the preset uses it, so
-    /// two servers can advertise the same `model` and produce different audio;
-    /// `/v1/health` has `model_id`.
+    /// Announce this server over mDNS with TXT keys `v`, `version`, `model`, `path`, `features`.
     pub fn start(instance: &str, port: u16, model: &str) -> Result<Self> {
         let mut props = HashMap::new();
         props.insert("v", "1".to_owned());
         props.insert("version", env!("CARGO_PKG_VERSION").to_owned());
         props.insert("model", model.to_owned());
         props.insert("path", "/v1".to_owned());
+        props.insert("features", crate::api::FEATURES.join(","));
 
         // Logged so a discovery failure on a multi-homed host is a one-line
         // diagnosis rather than a packet capture. Kept out of the ordinary

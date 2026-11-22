@@ -59,6 +59,8 @@ struct OpenParams {
     parts: Option<String>,
     #[serde(default)]
     dsp_mode: Option<String>,
+    #[serde(default)]
+    dsp_filter: Option<String>,
     /// Mean of the mono mixdown over the whole track.
     #[serde(default)]
     mean: Option<f32>,
@@ -81,6 +83,7 @@ impl OpenParams {
             include_derived: self.include_derived,
             parts: self.parts.clone(),
             dsp_mode: self.dsp_mode.clone(),
+            dsp_filter: self.dsp_filter.clone(),
         }
     }
 }
@@ -202,7 +205,7 @@ async fn open(
         .queue
         .sessions()
         .open(Request {
-            output,
+            output: output.clone(),
             in_format,
             track: TrackSpec {
                 frames: params.frames,

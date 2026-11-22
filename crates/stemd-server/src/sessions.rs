@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use stemd_core::{Audio, Grid, Normalisation, Parts, PcmFormat, Stems, resample};
+use stemd_core::{Audio, Grid, Normalisation, Parts, PcmFormat, Stems};
 
 use crate::cache::Output;
 use crate::pieces::{Pieces, type_dir};
@@ -509,7 +509,7 @@ impl Track {
         if model == out {
             return Ok(Excerpt { audio, from });
         }
-        let converted = resample::to_rate_with(&audio, output.rate.hz(), output.dsp)?;
+        let converted = output.dsp.convert(&audio, output.rate.hz())?;
         let offset = output_index(start, model, out);
         let a = output_index(from, model, out) - offset;
         let b = (output_index(to, model, out) - offset).min(converted.frames());
@@ -1166,7 +1166,7 @@ mod tests {
             format,
             rate: OutputRate::default(),
             derived: false,
-            dsp: DspMode::default(),
+            dsp: DspMode::default().into(),
             parts: Parts::DEFAULT,
         }
     }
@@ -1319,6 +1319,30 @@ mod tests {
             }
         }
         assert_eq!(output_index(441_000, 44_100, 48_000), 480_000);
+    }
+
+    #[test]
+    fn a_polyphase_read_to_the_end_reaches_the_last_output_sample() {
+        let frames = 100_000;
+        assert_ne!(frames % 147, 0);
+        let mut req = request();
+        req.output.rate = OutputRate::Hz96000;
+        req.output.dsp = DspMode::Mode1.into();
+        let sessions = Sessions::default();
+        let session = sessions.open(req).expect("open");
+        let track = session.track();
+        track.upload(0, &audio(frames, 0.01)).expect("upload");
+        track
+            .store(0, frames, &crate::testkit::stems(frames).1)
+            .expect("store");
+        for from in [0, frames - 10_000] {
+            let got = session.read("vocals", from, frames).expect("read");
+            assert_eq!(
+                got.audio.frames(),
+                output_index(frames, 44_100, 96_000) - output_index(from, 44_100, 96_000),
+                "from {from}"
+            );
+        }
     }
 
     #[test]

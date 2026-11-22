@@ -370,7 +370,7 @@ fn run(state: &Arc<AppState>, item: &Arc<Dropped>, turn: &mut Turn) -> Result<()
         rate: settings.rate,
         derived: true,
         // A drop writes files, it does not feed a client's subtraction.
-        dsp: DspMode::General,
+        dsp: DspMode::General.into(),
         parts: settings.drop_parts.request(),
     };
 
@@ -465,7 +465,7 @@ fn separate(
         out_rate: output.rate,
         include_derived: output.derived,
         parts: output.parts,
-        dsp: output.dsp,
+        dsp: &output.dsp,
         model: &state.switcher.identity(),
     });
     std::mem::drop(pcm);
