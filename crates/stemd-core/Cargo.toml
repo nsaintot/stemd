@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-description = "Stem separation pipeline: PCM in, stems out, demucs v4 on MLX."
+description = "Stem separation pipeline: PCM in, stems out, demucs v4 and BS-RoFormer on MLX."
 
 [dependencies]
 anyhow.workspace = true

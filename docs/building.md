@@ -11,8 +11,9 @@ cargo build --release
 ```
 
 The submodule is `vendor/mlx-rs-stemd`, a fork of MLX's Rust bindings that
-builds on platforms other than Apple silicon. Nothing resolves without it; for a
-clone made without `--recurse-submodules`, run `git submodule update --init`.
+builds on platforms other than Apple silicon. Without it, cargo cannot resolve MLX.
+For a clone made without `--recurse-submodules`, run
+`git submodule update --init`.
 The newest published `mlx-rs` and `mlx-sys` (0.25.3 and 0.2.0) declare no CUDA
 feature, so the build uses the fork.
 
@@ -27,7 +28,7 @@ four minutes.
 
 The Metal shader compiler is the requirement most often missing. MLX compiles
 its kernels during the build, and the compiler is not part of the command line
-tools: it is a separate component installed under an Xcode, so a machine
+tools: it is a separate Xcode component, so a machine
 can have Xcode and a current SDK and still lack it. `xcrun --find metal` shows
 whether it is installed, and
 
@@ -43,8 +44,8 @@ compiles its Metal shaders at build time and never at run time, so a bundle
 built for a newer macOS launches on an older Mac and then fails the first time
 it uses the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
 `MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` set this
-floor and must agree. The script passes `MACOS_MIN` as a linker flag under
-`--target`. Do not export it as `MACOSX_DEPLOYMENT_TARGET`: that also reaches
+floor and must agree. The script passes `MACOS_MIN` to the linker in `RUSTFLAGS` and builds with
+`--target`, so only the executable gets the flag. Do not export it as `MACOSX_DEPLOYMENT_TARGET`: that also reaches
 proc-macro dylibs, which this toolchain then links in a form that dyld refuses.
 
 The kernels are in a separate `mlx.metallib`, looked up next to the executable
@@ -82,7 +83,7 @@ To build on your own machine instead, install `libavahi-compat-libdnssd-dev`,
 `liblapacke-dev`, the CUDA toolkit and cuDNN 9.5 or later, set `CUDNN_PATH` to
 cuDNN, and set `MLX_BUILD_CUDA=1`. The cudnn-frontend that MLX builds against
 calls `cudnnBackendPopulateCudaGraph`, which first appeared in cuDNN 9.5. An
-older cuDNN compiles, then finds no execution plan for any graph at run time.
+older cuDNN builds, but finds no execution plan at run time.
 
 ## Packaging
 
@@ -205,7 +206,7 @@ their licences require. The executables find them through `DT_RPATH`
 path. MLX locates its CCCL headers from argv[0] without resolving symlinks, so
 never start the server binary through a symlink or by name.
 
-The minimum glibc version is the image's, 2.35.
+The minimum glibc is 2.35, from the build image.
 
 ### Prebuilt MLX
 
@@ -265,11 +266,11 @@ then signs, notarizes and staples it. The disk image window is drawn by
 placeholder squares on it. The icon positions at the top of the script are the
 centres of those squares in points; update them if the artwork moves the
 squares. Finder itself lays out the image on a writable copy, which writes the
-`.DS_Store`, and the script then compresses it. Stapling is easy to skip, and it
-decides whether a Mac that is offline at first launch has to contact Apple.
+`.DS_Store`, and the script then compresses it. Do not skip stapling. Without it,
+a Mac offline at first launch cannot check the notarization.
 
-The notarization credentials live in a keychain profile, which is created once
-and which nothing in this repository reads:
+The notarization credentials live in a keychain profile, created once. Nothing
+in this repository reads it:
 
 ```bash
 xcrun notarytool store-credentials stemd-notary \
@@ -308,7 +309,7 @@ default model instead of failing the launch.
 | `--output-sample-rate` | saved, else `44100` | also `24000`, `48000`, `96000` (not with `mp3`) |
 | `--settings` | user data directory | |
 | `--overlap` | `0.25` | the fraction by which segments overlap |
-| `--full-precision` | off | runs the model at float32, 1.3x slower |
+| `--full-precision` | off | runs every model at float32. By default Metal runs every model at float16 (1.3x faster), CUDA runs demucs at float16 and the RoFormer at float32, and the CPU runs float32 |
 | `--cache-dir` | user cache directory | kept across restarts; the alias is `--pieces-dir` |
 | `--cache-max-gb` | saved, else `8` | 8 GB holds about 200 six-minute tracks as 44.1 kHz flac; the alias is `--pieces-max-gb` |
 | `--partial-max-hours` | `24` | how long a track with a stem still in pieces is kept unused; `0` keeps it until the cache is full |
@@ -317,9 +318,12 @@ default model instead of failing the launch.
 | `--unfetched-ttl` | `300` | seconds a job result is held for its client |
 | `--max-track-minutes` | saved, else `10` | the only size limit; the body cap is derived from it. Memory caps it, and `0` takes that cap |
 | `--queue-depth` | `16` | jobs past this many get `429` |
+| `--session-idle-secs` | `30` | a session with nothing to run and no request for this long is ended |
+| `--max-sessions` | `4` | sessions open at once; each holds its track in memory |
 | `--models` | `models` | searched before the download cache |
 | `--instance` | `stemd` | the mDNS name |
 | `--no-mdns`, `--offline`, `--headless` | off | |
+| `--install-cuda` | off | Windows only: downloads the CUDA runtime beside the executable and exits |
 
 MP3 sample rates stop at 48 kHz: MPEG-1 Layer III has three rates, and 96 kHz is
 not one of them. The server refuses `mp3` at 96 kHz instead of encoding it at 48
@@ -332,7 +336,7 @@ window's level dropdown can show.
 ## Layout
 
 ```
-crates/stemd-mlx/      demucs v4 on MLX: stft, layers, transformer, segmenting
+crates/stemd-mlx/      demucs v4 and BS-RoFormer on MLX, Metal or CUDA: stft, layers, transformer, segmenting
 crates/stemd-core/     pcm, stem topology, progress, the backend around the model
 crates/stemd-audio/    file decoding, with no model dependency so the CLI stays small
 crates/stemd-server/   axum API, cache, queue, mDNS, drops, window
@@ -363,13 +367,17 @@ reads.
 
 ## Models
 
-All three models are served from [this project's own
-release](https://github.com/nsaintot/stemd/releases/tag/models-v2) and pinned by
-SHA-256. The demucs models are byte-for-byte copies of
+The models are served from this project's own releases and pinned by SHA-256:
+the demucs models from
+[models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) and
+`stemd_roformer` from
+[models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3). The
+demucs models are byte-for-byte copies of
 [mlx-community's](https://huggingface.co/mlx-community/demucs-mlx) conversions,
-mirrored so the app depends on one release that this project controls. Nobody
-publishes an MLX BS-RoFormer, so `tools/export/convert_roformer.py` converts
-that one here.
+mirrored so the app depends only on this project's releases. Nobody publishes an
+MLX BS-RoFormer, so `tools/export/convert_stemd_roformer.py` and then
+`tools/export/convert_roformer.py` convert that one here. See
+[models.md](models.md) for the files and digests.
 
 No manifest comes with the weights. The architecture is compiled in, and every
 layer checks the shape of each tensor it reads, which identifies a wrong

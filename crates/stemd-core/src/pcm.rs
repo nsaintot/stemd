@@ -108,9 +108,8 @@ impl Audio {
 
     /// The same as [`Self::new`], for data from outside: a decoder, a file or a client.
     ///
-    /// Unequal channels are refused, never trimmed to the shortest. A decode that disagrees with
-    /// itself about the track length has already failed, and dropping the difference would give the
-    /// model a track with a piece missing.
+    /// Refuses channels of unequal length. Do not trim them to the shortest: that drops part of the
+    /// track.
     pub fn checked(data: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, PcmError> {
         let frames = data.first().map_or(0, Vec::len);
         if let Some((channel, found)) = data
@@ -221,9 +220,8 @@ impl Audio {
 
     /// Encode to an interleaved wire payload, scaling by `gain` first.
     ///
-    /// One gain is shared across all stems, with no per-stem clamp: the mix does not bound each
-    /// stem, and clamping each would break the exact sum. Scaling is linear, so the sum survives,
-    /// and the client receives `gain` to undo it.
+    /// Callers pass one gain for all stems so the stems still sum to the mix; the client receives
+    /// `gain` to undo it.
     pub(crate) fn to_interleaved_scaled(&self, format: PcmFormat, gain: f32) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(self.frames() * self.channels() * format.bytes_per_sample());
@@ -263,8 +261,7 @@ mod tests {
 
     /// Channel 0 with samples and channel 1 empty is refused. `frames()` reads channel 0, so every
     /// downstream reader would index channel 1 at 0 and panic with "the len is 0 but the index is
-    /// 0". The error happens here, where the file can be named; the panic would happen three crates
-    /// later.
+    /// 0".
     #[test]
     fn checked_refuses_ragged_channels() {
         let err = Audio::checked(vec![vec![0.1; 4096], Vec::new()], 44100)
@@ -286,8 +283,7 @@ mod tests {
         assert!(Audio::checked(vec![vec![0.1; 100], vec![0.1; 99]], 44100).is_err());
     }
 
-    /// This tests `to_interleaved`, which the encoders use, so `checked` covers the case they rely
-    /// on.
+    /// A buffer accepted by `checked` interleaves every frame.
     #[test]
     fn a_rectangular_buffer_interleaves_every_frame() {
         let audio = Audio::checked(vec![vec![0.0, 0.5], vec![0.25, -0.25]], 44100).unwrap();

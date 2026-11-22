@@ -69,11 +69,8 @@ impl Config {
 
 /// Build every service the router depends on.
 ///
-/// The stem cache is opened before the model because the worker that loads the
-/// model needs it. See [`crate::queue::BuildSeparator`].
-///
-/// `endpoint` holds where the listener is already bound, which is the real port
-/// under `--bind :0`. Progress is reported through `launch`.
+/// `endpoint` is the bound listener's address, the real port under `--bind :0`.
+/// Progress is reported through `launch`.
 pub fn prepare(
     config: &Config,
     logs: LogBuffer,
@@ -274,11 +271,9 @@ fn load_artefact(
     ))
 }
 
-/// Directories searched for a model artefact, in order.
+/// Directories searched for a model artefact, in order; the download cache comes last.
 ///
-/// An `.app` is launched with the working directory set to `/`, so a relative
-/// `--models` cannot resolve against the cwd. The download cache comes last, so a
-/// local copy wins during development.
+/// A relative `--models` is also tried beside the executable, since an `.app` starts in `/`.
 fn search_dirs(arg: &Path, cache: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![arg.to_path_buf()];
     if let Ok(exe) = std::env::current_exe()
@@ -326,9 +321,7 @@ fn resolve_models(
     // Only a known preset can be fetched; anything else has no pinned URL.
     let Some(preset) = preset else {
         anyhow::bail!(
-            "no {marker} in any of {} — it is not one of the built-in presets, \
-             so it cannot be downloaded; put the weights in one of those \
-             directories yourself",
+            "no {marker} in any of {}: not a built-in preset, so not downloadable",
             joined(dirs)
         );
     };
@@ -396,8 +389,8 @@ fn fetch_preset(cache: &Path, preset: Preset, launch: &Launch) -> Result<PathBuf
 
     if !models::is_complete(cache, preset.source()) {
         anyhow::bail!(
-            "fetched {} but {} is still incomplete — the release does not \
-             match what stemd expects",
+            "fetched {} but {} is still incomplete: the release does not match \
+             this build",
             preset.artefact(),
             cache.display()
         );

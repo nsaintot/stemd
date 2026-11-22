@@ -1,12 +1,12 @@
 //! Sessions separate tracks in pieces, in the order their clients ask for.
 //!
 //! A [`Track`] holds one track's audio and the parts separated so far. A [`Session`] is one
-//! client's (one deck's) view of a track: its output format, its window around the playhead and its
-//! idle timer.
+//! client's (one player's) view of a track: its output format, its window around the playhead and
+//! its idle timer.
 //!
 //! A session starts on a track of its own. When its whole upload has arrived, the server hashes it
 //! into a [`track_id`]. If another session's track already has that id, the session moves onto that
-//! track, so two decks playing one song share the work and the memory from then on.
+//! track, so two players playing one song share the work and the memory from then on.
 //!
 //! | Track field | Meaning                                                  |
 //! |-------------|----------------------------------------------------------|

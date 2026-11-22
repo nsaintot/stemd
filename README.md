@@ -60,8 +60,8 @@ Stemd is two things in one program:
   stems back. The contract is in [docs/api.md](docs/api.md).
 - It announces itself over mDNS as `_stemd._tcp`, so a client needs no address.
 - `--headless` runs it without a window, on a desktop or a server.
-- Sessions separate a track piece by piece around a playhead. A player can start
-  on the part under the needle before the whole track is done.
+- Sessions separate a track piece by piece around a playhead. A player can play
+  the part under its playhead before the track is done.
 - Drops and clients share one job queue and one cache. A track separated once is
   a cache hit the next time, from a drop or a client.
 - `model_id` in `/v2/health` names the exact weights and settings behind the
@@ -85,7 +85,7 @@ Stemd is two things in one program:
 
 
 Every link opens the latest release. The first run downloads the model
-weights, 168 MB to 942 MB depending on the preset.
+weights, 168 MB to 672 MB depending on the preset.
 
 **macOS.** Open the disk image and drag Stemd to Applications. The app is
 signed and notarized, and the ticket is stapled, so the first launch needs no
@@ -139,11 +139,11 @@ The method and notes are in
 ## Where things go
 
 
-|        |                                                                |
-| ------ | -------------------------------------------------------------- |
-| stems  | `<track>-stems/`, beside the track                             |
-| models | the user data directory, downloaded once                       |
-| cache  | every separation, 8 GB and 30 days by default, set in Settings |
+|        |                                                                 |
+| ------ | --------------------------------------------------------------- |
+| stems  | `<track>-stems/`, beside the track                              |
+| models | the user data directory, downloaded once                        |
+| cache  | every separation. 8 GB and 30 days by default, set in Settings. |
 
 
 Separating a track again returns the cached result. Stems are kept by track,

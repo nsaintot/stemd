@@ -1,9 +1,9 @@
 //! Switches the model at runtime.
 //!
-//! A switch can mean a 320 MB download, so it never runs on the UI thread: a request spawns a
-//! thread, which publishes progress through [`SwitchState`] and hands the queue a closure that
-//! builds the model. The queue's worker runs it between jobs, so a switch during a separation takes
-//! effect once the current track is done.
+//! A switch can mean a download of up to 672 MB, so it never runs on the UI thread: a request
+//! spawns a thread, which publishes progress through [`SwitchState`] and hands the queue a closure
+//! that builds the model. The queue's worker runs it between jobs, so a switch during a separation
+//! takes effect once the current track is done.
 //! The switch thread downloads but never builds: MLX weights must be allocated on the thread that
 //! evaluates them, so the separation worker does the last step. See
 //! [`crate::queue::BuildSeparator`].
@@ -262,11 +262,9 @@ fn model_identity(preset: Preset) -> String {
     format!("m={};r={}", preset.digest(), preset.recipe())
 }
 
-/// The cache identity: `m=` (the model), `p=` (precisions) and `o=` (overlap), `;`-separated.
-///
-/// Every input that changes the samples belongs here, since a cache hit is served without
-/// separating again. Append new fields at the end: only `m=` holds free-form text, so parsing from
-/// the right stays unambiguous.
+/// The cache identity: every input that changes the samples, as `m=` (model), `p=` (precisions)
+/// and `o=` (overlap), `;`-separated. Append new fields at the end: only `m=` holds free-form
+/// text, so parsing from the right stays unambiguous.
 fn identity_of(
     model: Option<Preset>,
     artefact: &str,

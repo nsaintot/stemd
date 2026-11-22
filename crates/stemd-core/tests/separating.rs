@@ -454,10 +454,7 @@ fn chaining_the_halves_against_running_them_side_by_side() {
 /// BS PolarFormer against the viperx BS-RoFormer as the Quality tier's vocals
 /// half, on a real track.
 ///
-/// MUSDB scores the two the same, and torch times PolarFormer faster, but neither settles which
-/// model Quality should use: MUSDB is pop and rock, and torch is not the runtime that ships.
-/// Transient-heavy material decides the choice, because that is where a slightly wrong vocals model
-/// puts ticks on the vocals fader.
+/// Run it on transient-heavy material, where a weaker vocals model puts ticks on the vocals fader.
 ///
 /// ```text
 /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both roformers and htdemucs_ft> \

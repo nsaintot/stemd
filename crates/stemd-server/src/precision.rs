@@ -48,10 +48,7 @@ impl Precisions {
         }
     }
 
-    /// What a preset's models will run at, in the order the preset uses them.
-    ///
-    /// There is one entry per model, so the key below can tell "both halves at half precision" from
-    /// "one at each" without knowing about presets.
+    /// What a preset's models will run at, one entry per model in preset order.
     fn for_preset(self, preset: Option<Preset>) -> Vec<Precision> {
         Preset::families(preset)
             .iter()
@@ -59,11 +56,10 @@ impl Precisions {
             .collect()
     }
 
-    /// The precisions of a preset as one field of a cache key.
+    /// The precisions of a preset as one cache-key field: one value when all models agree, as on
+    /// Metal and on a CPU, joined with `+` otherwise.
     ///
-    /// When every model agrees, as on Metal and on a CPU, the field is a single value, which keeps
-    /// existing keys valid. The joined form appears only on a backend where models need different
-    /// precisions, and there the audio does differ.
+    /// The single-value form keeps existing cache keys valid.
     pub fn key(self, preset: Option<Preset>) -> String {
         let all = self.for_preset(preset);
         match all.split_first() {

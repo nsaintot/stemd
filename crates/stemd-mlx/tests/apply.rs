@@ -71,9 +71,7 @@ fn centre(input: &mlx_rs::Array, segment: i32) -> (mlx_rs::Array, i32) {
 
 /// Every sample is covered by at least one segment, and the joins are crossfades.
 ///
-/// The weights do not sum to a constant: with a stride of three quarters of a segment and a
-/// triangular window the sum ripples 2:1 by design, and dividing by it flattens the result. What
-/// must hold is that the sum is never zero and that adjacent segments overlap.
+/// The window weights ripple 2:1 and are divided out, so their sum must never be zero.
 #[test]
 fn every_sample_is_covered_and_the_joins_overlap() {
     let _gpu = one_at_a_time();

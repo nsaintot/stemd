@@ -2,15 +2,15 @@
 
 Every model and tuning decision in this repo was settled with this, and the
 numbers in the README come from it. Re-run it before changing the model, the
-overlap, or which part is derived -- the interesting results were all the ones
-that contradicted the reasoning.
+overlap, or which part is derived. Several of its results contradicted the
+reasoning that predicted them.
 
     uv run --extra eval tools/eval/benchmark.py
     uv run --extra eval tools/eval/benchmark.py --clips 50 --overlap 0.5
 
 It scores the three parts the player actually drives (drums / harmonics /
 vocals), not the model's four raw sources, and it scores them *after* deriving
-one by subtraction -- which is what the player hears. Global SDR, the
+one by subtraction, which is what the player hears. Global SDR, the
 MDX/multisong convention.
 
 Two limits worth knowing before trusting a number:

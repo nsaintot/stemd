@@ -42,9 +42,8 @@ pub struct Config {
     pub bands: Vec<i32>,
     /// The hidden width of each band's mask MLP, as a multiple of `dim`.
     pub mask_expansion: i32,
-    /// The samples in one chunk. Unlike htdemucs, this is not a hard limit: position is rotary, so
-    /// any length runs, but the model was trained at this length and the overlap-add is sized
-    /// around it.
+    /// The samples in one chunk: the length the model was trained at, which the overlap-add is
+    /// sized around. Rotary position lets other lengths run.
     pub chunk: i32,
     pub sample_rate: i32,
     /// The precision the transformer stack runs at.
@@ -60,9 +59,8 @@ pub struct Config {
 
 /// The positional scheme the artefact was trained with.
 ///
-/// The weights were trained with one of these, and the other produces plausible noise, so it is not
-/// a tunable setting. The artefact says which: a PoPE checkpoint carries `pope_embed.*` tensors and
-/// no `rotary_embed.freqs`.
+/// The weights fit only the scheme they were trained with; the other gives noise. The artefact says
+/// which: a PoPE checkpoint carries `pope_embed.*` tensors and no `rotary_embed.freqs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Positional {
     /// Rotary, interleaved, applied to q and k, as in the viperx checkpoints.
@@ -314,8 +312,7 @@ const ROPE_BASE: f32 = 10_000.0;
 /// kernel that wants one head size for all three.
 ///
 /// The bias is on the keys only, learned per head and per frequency, and clamped to `[-2pi, 0]` on
-/// output. The reference clamps, and a checkpoint guarantees nothing, so the clamp is applied here
-/// too.
+/// output, as in the reference.
 struct Pope {
     /// `[dim_head]`, stored and never derived: the reference registers them as a buffer, so a
     /// checkpoint could have been trained with values other than the `theta ** -(arange(d) / d)`
@@ -373,10 +370,7 @@ impl Pope {
     }
 }
 
-/// `log(1 + exp(x))`, in the form that does not overflow.
-///
-/// The direct form turns the whole tensor to `inf` for `x` past about 11 in half precision, and
-/// these pre-activation attention inputs are unbounded.
+/// `log(1 + exp(x))`, in a form that does not overflow in half precision.
 fn softplus(x: &Array) -> Result<Array> {
     let zero = crate::layers::scalar_like(0.0, x)?;
     let positive = ops::maximum(x, &zero)?;
@@ -662,8 +656,7 @@ impl BsRoformer {
     /// The spectrogram flattened the way the band split wants it.
     ///
     /// `[B, C, F, N] -> [B, N, F * C * 2]`, ordered by frequency, then audio channel,
-    /// then real and imaginary. Getting that order wrong gives exactly the right shape and feeds
-    /// every band a mix of its neighbours' bins.
+    /// then real and imaginary.
     pub fn interleave(&self, real: &Array, imag: &Array) -> Result<Array> {
         let shape = real.shape().to_vec();
         let (batch, channels, bins, frames) = (shape[0], shape[1], shape[2], shape[3]);

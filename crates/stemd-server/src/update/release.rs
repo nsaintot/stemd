@@ -1,5 +1,5 @@
-//! Windows and Linux: check GitHub's newest release at launch, once a day
-//! and on a click on the version.
+//! Windows and Linux: check GitHub's newest release at launch and once a day.
+//! On Windows, a click on the version also checks. Linux has no version button.
 //!
 //! On Linux, and for a Windows copy Setup did not install (the zip), a newer
 //! release opens its page in the browser. On an installed Windows copy, it

@@ -266,10 +266,8 @@ impl PartGains {
         }
     }
 
-    /// True when this is exactly unity, so mixing can return the mix untouched.
-    ///
-    /// The comparison is exact on purpose: the guarantee is bit-for-bit identity, so a UI must snap
-    /// its faders to exactly `1.0`.
+    /// True when every gain is exactly `1.0`, so mixing can return the mix untouched. A UI must
+    /// snap its faders to exactly `1.0` to get the untouched mix.
     pub(crate) fn is_unity(self) -> bool {
         self == Self::UNITY
     }
@@ -311,10 +309,7 @@ impl Stems {
         remainder(mix, self.shipped.iter().map(|(_, stem)| stem))
     }
 
-    /// Apply the three faders.
-    ///
-    /// Unity returns a copy of the mix directly, which makes the bit-exactness guarantee explicit,
-    /// so a later change to the arithmetic cannot break it.
+    /// Apply the three faders. Unity returns a copy of the mix.
     pub fn mix(&self, mix: &Audio, gains: PartGains) -> Audio {
         if gains.is_unity() {
             return mix.clone();

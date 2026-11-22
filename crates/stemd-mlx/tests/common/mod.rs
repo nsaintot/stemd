@@ -1,7 +1,7 @@
 //! Shared plumbing for the null tests.
 //!
-//! Each test binary compiles this separately, so a helper that only one binary uses reads as dead
-//! code in the others, so the module allows `dead_code`.
+//! Each test binary compiles this separately, and a helper used by only one binary is dead code
+//! in the others, hence `allow(dead_code)`.
 #![allow(dead_code)]
 
 use std::path::PathBuf;

@@ -192,10 +192,7 @@ pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Queue {
-    /// Spawn the worker thread and have it build the first separator.
-    ///
-    /// Blocks until the build finishes, so a model that does not load is a synchronous error at the
-    /// call site. [`BuildSeparator`] explains why the worker allocates the weights.
+    /// Spawn the worker thread and block until it has built the first separator.
     pub fn start(
         build: BuildSeparator,
         max_depth: usize,
@@ -469,10 +466,10 @@ impl Queue {
         running_first(running, waiting)
     }
 
-    /// Have the worker build a new separator and run on it from now on.
+    /// Build a new separator on the worker and swap it in after the running track; blocks until the
+    /// swap.
     ///
-    /// Blocks until the swap has happened, after the running track and the build, so the caller
-    /// learns what loaded. The old separator keeps running until the new one is built.
+    /// The old separator keeps running until the new one is built.
     pub fn install(&self, build: BuildSeparator) -> Result<BackendInfo> {
         let (reply, done) = mpsc::sync_channel(1);
         let superseded = {
@@ -504,10 +501,7 @@ impl Queue {
         }
     }
 
-    /// Progress for a waiting job, with its live queue position filled in.
-    ///
-    /// The position is computed on read: every waiter's position shifts each time the worker takes
-    /// a job, and the queue is short enough that a scan per poll costs less than pushing updates.
+    /// Progress for a waiting job, with its queue position computed on read.
     pub fn queued_progress_for(&self, id: &str) -> Option<Progress> {
         let pending = self.inner.pending.lock();
         let position = pending.iter().position(|p| p.work.job.id == id)?;

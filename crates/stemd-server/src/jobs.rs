@@ -49,9 +49,6 @@ pub struct JobResult {
 
 impl JobResult {
     /// Describe a cache entry as the result of `job_id`.
-    ///
-    /// The URLs are built here because they differ per job: two decks sharing one entry each poll
-    /// their own id.
     fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
         Self {
             output: crate::output::OutputView::of(&entry.output, None),
@@ -87,14 +84,14 @@ pub struct JobView {
 
 pub struct Job {
     pub id: String,
-    /// The track and output this job produces, see [`job_key`]; a second deck joins on it.
+    /// The track and output this job produces, see [`job_key`]; a second client joins on it.
     pub key: String,
     pub progress: Mutex<Progress>,
     pub result: Mutex<Option<JobResult>>,
     pub error: Mutex<Option<String>>,
     /// Where this job's stems live in the cache, once it has any.
     pub entry: Mutex<Option<Arc<Entry>>>,
-    /// One per deck waiting on this job. See [`Job::release`].
+    /// One per client waiting on this job. See [`Job::release`].
     waiters: Mutex<usize>,
     pub created: Instant,
     /// The mix being separated, at the model's rate.
@@ -128,10 +125,7 @@ impl Job {
         *self.waiters.lock() += 1;
     }
 
-    /// Drop one waiter and return the number left.
-    ///
-    /// A shared job is cancelled only when its last waiter releases it. The count saturates at
-    /// zero, so a repeated delete cannot bring a job back.
+    /// Drop one waiter and return the number left, stopping at zero.
     pub fn release(&self) -> usize {
         let mut waiters = self.waiters.lock();
         *waiters = waiters.saturating_sub(1);
@@ -143,20 +137,15 @@ impl Job {
     }
 
     /// Attach a finished entry and mark the job done.
-    ///
-    /// The result is published before the stage flips, so a client that sees
-    /// `Done` and immediately asks for a stem never races an empty handle.
     pub fn complete(&self, entry: Arc<Entry>, cached: bool) {
         let result = JobResult::from_entry(&entry, &self.id, cached);
+        // Stored before the stage flips, so a client that sees `Done` finds the entry.
         *self.entry.lock() = Some(entry);
         *self.result.lock() = Some(result);
         self.set_progress(Progress::new(Stage::Done));
     }
 
-    /// Mark the job stopped at the client's request.
-    ///
-    /// This is terminal like [`Job::fail`], but carries no error. A job that outlives its removal
-    /// from the table then no longer looks like it is separating, so `claim` cannot join it.
+    /// Mark the job stopped at the client's request: terminal, with no error.
     pub fn cancelled(&self) {
         self.set_progress(Progress::new(Stage::Cancelled));
     }
@@ -280,8 +269,7 @@ impl Jobs {
     /// Claim `key`, or join the job that already holds it.
     ///
     /// `Ok` is a new job that the caller owns and must drive to a terminal stage; `Err` is an
-    /// existing job that the caller now waits on. Registration happens under the same lock as the
-    /// lookup, so concurrent submissions of one track share a single separation.
+    /// existing job that the caller now waits on.
     pub fn claim(&self, key: &str, mix: MixShape) -> Result<Arc<Job>, Arc<Job>> {
         let mut jobs = self.jobs.lock();
         if let Some(job) = jobs.in_flight(key) {
@@ -372,13 +360,8 @@ pub fn short(key: &str) -> &str {
     &key[..key.len().min(SHORT_KEY)]
 }
 
-/// A job id: the leading characters of the job key, then the attempt number.
-///
-/// It has the same `name-discriminator` shape as `model_id`, and its first part is what [`short`]
-/// prints in the logs, so a log line and a URL match by eye.
-///
-/// The attempt number keeps ids unique: without it, two clients asking for the same track at
-/// different times would share an id, and a `DELETE` from one would cancel the other's separation.
+/// A job id: the first [`SHORT_KEY`] characters of the job key, then the attempt number, such as
+/// `<key>-3`.
 fn job_id(key: &str, attempt: u64) -> String {
     format!("{}-{attempt}", short(key))
 }
@@ -611,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_deck_joins_a_separation_already_running() {
+    fn a_second_client_joins_a_separation_already_running() {
         let jobs = Jobs::new(Duration::from_secs(3600));
         let first = jobs.create("same-track".into());
         first.set_progress(Progress::new(Stage::Separating));
@@ -803,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn one_deck_giving_up_does_not_cancel_the_other() {
+    fn one_client_giving_up_does_not_cancel_the_other() {
         let jobs = Jobs::new(Duration::from_secs(3600));
         let job = jobs.create("shared".into());
         job.set_progress(Progress::new(Stage::Separating));
@@ -812,7 +795,7 @@ mod tests {
             "second client joins"
         );
 
-        assert_eq!(job.release(), 1, "the other deck is still waiting");
+        assert_eq!(job.release(), 1, "the other client is still waiting");
         assert_eq!(job.release(), 0, "now nobody is");
     }
 

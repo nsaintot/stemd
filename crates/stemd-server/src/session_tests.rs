@@ -205,11 +205,11 @@ fn with_the_clients_statistics_a_segment_runs_once_its_own_input_is_in() {
     let mix = track(frames, 3);
     let queue = start(Toy::new(SEGMENT, 0.25), fresh_cache());
     let session = open(&queue, frames, Some(Normalisation::of(&mix)));
-    let needle = 200_000;
+    let playhead = 200_000;
     session
         .set_window(&WindowRequest {
             regions: vec![Region {
-                at: needle,
+                at: playhead,
                 ahead: 10_000,
                 behind: 0,
                 priority: 0,
@@ -221,8 +221,8 @@ fn with_the_clients_statistics_a_segment_runs_once_its_own_input_is_in() {
     queue.wake();
     assert!(ready_within(
         &session,
-        needle,
-        needle + 5_000,
+        playhead,
+        playhead + 5_000,
         Duration::from_secs(20)
     ));
     assert!(session.read("vocals", 0, 1_000).is_err());
@@ -449,7 +449,7 @@ fn a_model_switch_closes_every_session() {
 }
 
 #[test]
-fn a_second_deck_on_the_same_audio_joins_the_first_once_its_upload_completes() {
+fn a_second_client_on_the_same_audio_joins_the_first_once_its_upload_completes() {
     let _gpu = GPU.lock();
     let frames = 60_000;
     let mix = track(frames, 8);

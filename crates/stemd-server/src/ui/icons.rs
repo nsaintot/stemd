@@ -27,7 +27,7 @@ fn paths(
     }
 }
 
-/// `M2.5 6.4 5 8.8l4.5-5.4` in a 12-unit box.
+/// A check mark, in a 12-unit box.
 pub fn check(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     paths(
         painter,

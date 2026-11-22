@@ -55,13 +55,7 @@ const READ_CHUNK: usize = 1 << 20;
 /// Windows  %LOCALAPPDATA%\stemd\data
 /// ```
 ///
-/// It holds what a user would not want cleaned up: the model artefacts and the settings file.
-/// Separated stems live under the cache root instead, since losing them costs only a separation.
-///
-/// On Windows this uses `dirs::data_local_dir`, the local profile: a roaming profile is copied to
-/// and from the domain controller at every logon, and weights that any machine can download again
-/// do not belong there. The extra `data` component keeps it apart from the cache, which also lives
-/// in local app data (see [`crate::cache::default_dir`]).
+/// Holds the model artefacts and the settings file.
 pub fn support_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
         .context("no data directory for this platform")?
@@ -78,10 +72,7 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The directory that holds a preset's artefact, if any.
-///
-/// It follows the startup search order, so the window and the command line agree on whether a
-/// switch needs the network.
+/// The directory that holds a preset's artefact, if any, in startup search order.
 pub fn locate(dirs: &[PathBuf], preset: Preset) -> Option<PathBuf> {
     dirs.iter()
         .find(|d| is_complete(d, preset.source()))

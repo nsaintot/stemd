@@ -228,15 +228,6 @@ fn contents(
     label(ui, palette, width, "Cache");
     let cache_card = card(ui, width, USAGE + 2.0 * ROW);
     cache(ui, sheet, state, palette, brushes, cache_card);
-    ui.add_space(6.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        "Changes are saved as you make them.",
-        theme::font(11.5, Weight::Regular),
-        FAINT,
-    );
     close
 }
 
@@ -512,9 +503,7 @@ fn cache(
         palette,
         brushes,
     )
-    .on_hover_text(
-        "Deletes every separated track no session is playing. Each one can be separated again.",
-    )
+    .on_hover_text("Deletes stored separations and pieces.")
     .clicked()
     {
         state.empty_cache();
@@ -539,7 +528,7 @@ fn cache(
         palette,
         row_rect(ui, card, USAGE, 0),
         "Size limit",
-        "When full, tracks are deleted, oldest last used first.",
+        "When full, the oldest unused tracks go first.",
         &size_label(current.cache_max_gb),
         pinned.cache_max_gb,
         &SIZES.map(|gb| (size_label(gb), gb == current.cache_max_gb)),
@@ -576,7 +565,7 @@ fn apply(state: &AppState, note: &Arc<Mutex<Option<(String, Instant)>>>) {
             let noun = if tracks == 1 { "track" } else { "tracks" };
             *note.lock() = Some((
                 format!(
-                    "Freed {}: deleted {tracks} {noun}, oldest last used first.",
+                    "Freed {}: deleted {tracks} {noun}, oldest unused first.",
                     bytes_label(freed)
                 ),
                 Instant::now(),

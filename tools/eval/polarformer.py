@@ -6,9 +6,9 @@ checkpoint's 10.87. That difference is not the interesting part: it is 0.13 dB,
 and docs/evaluation.md puts this benchmark's noise floor at ~0.2 dB, so this
 script cannot resolve it and does not pretend to.
 
-The interesting part is the cost. The two are the same architecture --
-identical 62-band table, depth 12, 8 heads of 64, ff_mult 4 -- differing in
-`dim`, 256 against 512, and in the chunk and hop they run at. The transformer
+The interesting part is the cost. The two are the same architecture: identical
+62-band table, depth 12, 8 heads of 64, ff_mult 4. They differ in `dim`, 256
+against 512, and in the chunk and hop they run at. The transformer
 stack is 97% of a forward pass, so half the width is most of the way to a
 quality tier that is not four minutes long.
 
@@ -20,7 +20,7 @@ tools/eval/roformer_hybrid.py, so the numbers land in the same table:
   * `harmonics` as the remainder, which is what the Quality tier ships, since a
     better vocals model moves that stem too;
   * seconds per second of audio, which is a torch/MPS number and does not
-    predict MLX -- the honest cost signal is the arithmetic printed beside it.
+    predict MLX. The arithmetic printed beside it is the better cost signal.
 
 Needs ZFTurbo's Music-Source-Separation-Training on the path for the model
 class, and `PoPE-pytorch` installed.
@@ -107,7 +107,7 @@ def transformer_cost(dim, depth, bands, frames, heads, dim_head, ff_mult=4):
       against 800, so its attention costs twice as much per chunk.
 
     Counting only the first term said 4.64x less. Counting both says 2.96x. A
-    stopwatch says 1.82x -- see tools/eval/roformer_speed.py, and prefer it.
+    stopwatch says 1.82x; see tools/eval/roformer_speed.py, and prefer it.
     """
     tokens = bands * frames
     inner = heads * dim_head
@@ -154,13 +154,12 @@ def main():
         # Vocals is the only thing this model determines, so it is the only
         # thing scored against the tier.
         #
-        # `harmonics` is reported too but is NOT the tier's harmonics and must
-        # not be read beside it: the remainder here is taken against the *true*
-        # drums rather than a demucs estimate, because this script does not run
-        # demucs. That makes it an upper bound -- what the tier's harmonics
-        # would score if the drums half were perfect -- which is useful for
-        # seeing how much of that stem this model is responsible for, and
-        # useless as a comparison. It lands several dB high for that reason.
+        # `harmonics` is reported too, but it is not the tier's harmonics and
+        # must not be read beside it. The remainder here is taken against the
+        # true drums, since this script does not run demucs. That makes it an
+        # upper bound: what the tier's harmonics would score if the drums half
+        # were perfect. It shows how much of that stem this model is
+        # responsible for, and lands several dB high for that reason.
         est = {"vocals": vocals, "harmonics": mix - vocals - truth["drums"]}
         for p, e in est.items():
             v = global_sdr(truth[p], e)
@@ -174,7 +173,7 @@ def main():
     print(f"  {'vocals':<12}{np.mean(scores['vocals']):>9.2f}   <- comparable")
     print(
         f"  {'harmonics':<12}{np.mean(scores['harmonics']):>9.2f}   <- upper bound, "
-        f"true drums, NOT the tier's figure"
+        f"true drums, not the tier's figure"
     )
     print(f"\n  {wall:.1f}s for {audio_secs:.0f}s of audio ({audio_secs / wall:.1f}x realtime, torch/MPS)")
 
@@ -193,7 +192,7 @@ def main():
     print(f"  {'PolarFormer':<12}{tp / (chunk / 44100) / 1e12:>9.3f}T"
           f"{ta / (chunk / 44100) / 1e12:>11.3f}T{theirs / 1e12:>9.3f}T")
     print(f"  {'viperx':<12}{op / 8.0 / 1e12:>9.3f}T{oa / 8.0 / 1e12:>11.3f}T{ours / 1e12:>9.3f}T")
-    print(f"\n  {ours / theirs:.2f}x less arithmetic -- but attention is {ta / oa:.1f}x *more*,")
+    print(f"\n  {ours / theirs:.2f}x less arithmetic, but attention is {ta / oa:.1f}x *more*,")
     print("  because heads*dim_head is 512 in both and only the chunk differs.")
 
 

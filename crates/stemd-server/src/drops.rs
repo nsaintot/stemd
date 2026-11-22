@@ -1,7 +1,7 @@
 //! Files dropped on the window.
 //!
 //! A drop becomes the same job that `POST /v2/jobs` makes, with the same track id, job table,
-//! worker and cache. Dropping a track that a deck already asked for joins that separation, and
+//! worker and cache. Dropping a track that a client already asked for joins that separation, and
 //! dropping the same file twice is a cache hit. The two ends differ: the audio comes from a file,
 //! and the stems are written to a folder.
 //!
@@ -344,10 +344,8 @@ impl Drops {
         recent.truncate(REMEMBERED);
     }
 
-    /// Take a file and start working on it. Returns the entry the window draws.
-    ///
-    /// Decoding and separation run on their own thread: decoding a five-minute track takes long
-    /// enough to drop frames, and the window must keep painting the job's progress.
+    /// Take a file and decode and separate it on its own thread. Returns the entry the window
+    /// draws.
     pub fn accept(self: &Arc<Self>, state: &Arc<AppState>, path: PathBuf) -> Arc<Dropped> {
         // A second drop of a track still in progress would write the same folder.
         if let Some(running) = self
@@ -412,10 +410,7 @@ impl Drops {
         self.recent.lock().clone()
     }
 
-    /// Take a drop out of the list, leaving its stems on disk.
-    ///
-    /// The drop is matched by identity, since two files with the same title in different folders
-    /// are two drops.
+    /// Take a drop out of the list by identity, leaving its stems on disk.
     pub fn forget(&self, item: &Arc<Dropped>) {
         self.recent.lock().retain(|other| !Arc::ptr_eq(other, item));
     }
@@ -428,10 +423,7 @@ impl Drops {
         self.forget(item);
     }
 
-    /// Forget a drop and delete the stems it wrote.
-    ///
-    /// The folder is deleted at once. Moving it to the Trash would need Finder automation and a
-    /// permission prompt inside an `.app`.
+    /// Forget a drop and delete its stems folder at once.
     pub fn discard(&self, item: &Arc<Dropped>) {
         if let State::Done(finished) = item.state() {
             remove_stems(&finished.dir);
@@ -440,10 +432,7 @@ impl Drops {
     }
 }
 
-/// Delete a folder this wrote, and nothing else.
-///
-/// The name check costs one string comparison and guards a recursive delete of a path taken from a
-/// struct field.
+/// Delete `dir` recursively if its name ends in [`STEMS_SUFFIX`]; refuse any other path.
 fn remove_stems(dir: &Path) {
     if !dir
         .file_name()
@@ -460,8 +449,8 @@ fn remove_stems(dir: &Path) {
     }
 }
 
-/// Decode, separate, and write the stems out. A track finished before with the
-/// same settings and model, whose files are unchanged, is shown as it was.
+/// Decode, separate, and write the stems out, or reuse the earlier result when the same track,
+/// settings and model left stems on disk that are still unchanged.
 fn run(
     state: &Arc<AppState>,
     history: &History,
@@ -524,10 +513,7 @@ fn run(
     Ok(())
 }
 
-/// Decode the file, and bring it to the rate the model works at.
-///
-/// The command-line client refuses any rate other than the model's, but a drop cannot ask the user,
-/// so it converts with the same resampler that runs on the way out.
+/// Decode the file and resample it to the model's rate with the output resampler.
 fn read(state: &AppState, path: &Path) -> Result<Audio> {
     let decoded = stemd_audio::decode(path)?;
     // This is the only mix whose shape comes from a decoded file; the upload path builds its
@@ -577,7 +563,7 @@ fn separate(
     output: Output,
     turn: &mut Turn,
 ) -> Result<(Arc<Entry>, Origin)> {
-    // The same track id an upload of these samples gets, so a drop and a deck
+    // The same track id an upload of these samples gets, so a drop and a client
     // asking for the same track land on the same stems.
     let cache_id = state.switcher.cache_id();
     let id = crate::ident::track_id(&mix);
@@ -597,7 +583,7 @@ fn separate(
     }
 
     // Claim before enqueuing, as the HTTP path does: it is the same table, so a drop can join a
-    // separation that a deck already started.
+    // separation that a client already started.
     let job = match state.jobs.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Ok(job) => {
             // The stems go into the cache first. Free space in the folder next to the track is
@@ -758,11 +744,7 @@ fn output_dir(source: &Path) -> PathBuf {
     parent.join(format!("{}{STEMS_SUFFIX}", title_of(source)))
 }
 
-/// Record the scale a part was written at, when it is not unity.
-///
-/// A stem that peaks past full scale cannot be stored in a 16-bit container without clipping, so it
-/// is written quieter. The parts then no longer sum to the mix, and this file records the scale so
-/// a reader can undo it.
+/// Write the gain of each part scaled down to fit a 16-bit container, so a reader can undo it.
 fn write_gains(dir: &Path, scaled: &[(String, f32)]) -> Result<()> {
     let gains: serde_json::Map<String, serde_json::Value> = scaled
         .iter()

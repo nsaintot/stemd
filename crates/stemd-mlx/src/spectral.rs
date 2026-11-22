@@ -75,8 +75,7 @@ impl Stft {
 
     /// `[..., T] -> [..., F, N]`, with `F = n_fft/2 + 1`.
     ///
-    /// Framing is a strided view, with no loop over frames: a four-minute track is ten thousand
-    /// frames, and ten thousand slices would cost more than the transform they feed.
+    /// Frames are a strided view, with no loop over frames.
     pub fn forward(&self, x: &Array, centred: bool) -> Result<Array> {
         let x = if centred {
             reflect_pad(x, self.n_fft / 2, self.n_fft / 2)?

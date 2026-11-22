@@ -98,11 +98,10 @@ fn the_converted_artefact_is_what_the_checkpoint_said() {
     assert!(w.at("final_norm").has("gamma"));
 }
 
-/// The spectrogram, before anything is built on it.
+/// The spectrogram matches the reference.
 ///
-/// BS-RoFormer takes an ordinary centred STFT: 2048-point, 441 hop, periodic Hann, the transform
-/// `crate::spectral::Stft` already does for demucs at different constants. So this checks that
-/// reusing it is valid; it is cheap, and everything downstream reads these numbers.
+/// BS-RoFormer takes an ordinary centred STFT (2048 points, hop 441, periodic Hann), so it reuses
+/// `crate::spectral::Stft` with these constants.
 #[test]
 #[ignore]
 fn the_spectrogram_matches_the_reference() {
@@ -346,12 +345,11 @@ fn the_whole_model_matches_the_reference() {
     assert!(null < -60.0, "the model nulls at only {null:.1} dB");
 }
 
-/// A track shorter than one chunk still goes through the window protocol.
+/// A track shorter than one chunk goes through the window protocol, and the crossfade weights
+/// cancel on the model's output.
 ///
-/// Segmenting a one-second track does not equal running the model on that second, for the same
-/// reason as with htdemucs: the chunk is centred in a full window, so the model sees eight seconds
-/// of mostly silence, which is different audio. What must hold is that the crossfade weighting and
-/// the division by the accumulated weight cancel on top of the model's output.
+/// The chunk is centred in an eight-second window of mostly silence, so the result differs from
+/// running the model on the one second alone.
 #[test]
 #[ignore]
 fn a_short_track_survives_the_crossfade() {

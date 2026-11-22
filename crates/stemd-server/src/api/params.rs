@@ -68,11 +68,8 @@ pub(super) fn track_seconds(bytes: usize, params: &CreateParams, format: PcmForm
     (bytes / stride) as f64 / f64::from(params.sample_rate)
 }
 
-/// Check that `dsp` covers the conversion this job runs.
-///
-/// A mode for one rate pair is refused on any other pair, because a client asks for a mode to match
-/// that exact filter. The conversion starts from the model's rate whatever the upload rate, so the
-/// upload rate is not checked.
+/// Check that `dsp` covers the conversion from the model's rate to `out_rate`. A numbered mode or
+/// a FIR filter covers only its own rate pair.
 pub(super) fn check_dsp(dsp: &Dsp, model_rate: u32, out_rate: OutputRate) -> Result<(), String> {
     let name = match dsp {
         Dsp::Mode(mode) => format!("dsp_mode {mode}"),

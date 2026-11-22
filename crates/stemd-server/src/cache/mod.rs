@@ -1,17 +1,20 @@
 //! The cache of separated stems on disk, each piece encoded and ready to send as it is.
 //!
 //! ```text
-//! <root>/<model_id>/<type>/<track>/<stem>/<k>.<ext>
-//! <root>/<model_id>/<type>/<track>/<stem>.<ext>       the whole stem, see [`crate::whole`]
-//! <root>/<model_id>/<type>/<track>/track.json         the length and piece grid, see [`TrackInfo`]
+//! <root>/<cache_id>/<type>/<track>/<stem>/<k>.<ext>
+//! <root>/<cache_id>/<type>/<track>/<stem>.<ext>       the whole stem, see [`crate::whole`]
+//! <root>/<cache_id>/<type>/<track>/track.json         the length and piece grid, see [`TrackInfo`]
 //! ```
 //!
 //! | Level   | Example                                        |
 //! |---------|------------------------------------------------|
-//! | `model_id` | `htdemucs-22c7f2c9`, as in `/v2/health`     |
+//! | `cache_id` | `htdemucs-22c7f2c9-1f2e3d4c`, see [`crate::switch::Switcher::cache_id`] |
 //! | `type`  | `flac-96000-dsp1-harmonics.vocals-g1`; `-dsp1` or `-fir<id>` names the filter |
 //! | `track` | the 24-hex track id, see [`crate::ident::track_id`] |
 //! | `k`     | piece index, four digits                       |
+//!
+//! A `cache_id` is the `model_id` of `/v2/health` plus a digest of the model, precision and
+//! overlap.
 //!
 //! Sessions, jobs and drops share this one cache. A piece is written only after the track's whole
 //! upload has been hashed, so the track id in the path is always the server's own. The root

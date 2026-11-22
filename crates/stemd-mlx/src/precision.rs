@@ -62,8 +62,7 @@ impl Precision {
 
     /// The mlx dtype this means.
     ///
-    /// `pub(crate)` on purpose: this is the one place the two vocabularies meet, and a caller
-    /// outside the crate that used it would bring back the coupling this type removes.
+    /// Crate-private so mlx types stay out of the public API.
     pub(crate) const fn dtype(self) -> mlx_rs::Dtype {
         match self {
             Self::F16 => mlx_rs::Dtype::Float16,

@@ -1,7 +1,7 @@
 //! The separation pipeline: it takes PCM audio and returns stems.
 //!
-//! The one backend is [`mlx`], demucs v4 built layer by layer on Apple's MLX. The [`Separate`]
-//! trait lets a second model be added without changes to the server.
+//! The models run on MLX: [`mlx`] holds demucs v4, [`roformer`] the BS-RoFormer, and [`hybrid`]
+//! chains two models. Each implements [`Separate`], which the server calls.
 //!
 //! [`mixture`] holds what the model does not own: the track-level normalisation,
 //! and folding four sources into the two stems that ship.

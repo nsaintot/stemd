@@ -1,21 +1,21 @@
 """Time BS PolarFormer against the viperx BS-RoFormer, in one runtime.
 
-The two score the same — 11.04 against 11.12, inside the noise floor — so the
+The two score the same (11.04 against 11.12, inside the noise floor), so the
 only question left is what they cost. `tools/eval/polarformer.py` answers that
 in multiply-accumulates, which is exact and ignores everything real: kernel
 launches, memory traffic, and how well a narrower matmul keeps the GPU busy.
 
 This puts a stopwatch on it instead. Weights are random, because speed does not
-depend on their values — which means this needs no checkpoint for either model
-and can time the viperx configuration without a 600 MB download.
+depend on their values. So this needs no checkpoint for either model and can
+time the viperx configuration without a 600 MB download.
 
 Both are timed on the same device, with warmup, over the same duration of audio
 rather than the same chunk count: they use 8.0 s and 13.35 s chunks, so
 per-chunk timings are not comparable and per-second-of-audio ones are.
 
 torch/MPS is not the runtime stemd ships, so the number that transfers is the
-*ratio*. It captures what the arithmetic cannot — the fixed per-launch costs
-that do not shrink with width — and both models meet them equally.
+*ratio*. It captures what the arithmetic cannot: the fixed per-launch costs
+that do not shrink with width, which both models pay equally.
 
 ```text
 uv run --extra eval tools/eval/roformer_speed.py --msst <checkout> \\

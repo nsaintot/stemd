@@ -20,9 +20,6 @@ pub fn install() {
 }
 
 /// Log one panic.
-///
-/// The job is not known here: `queue` logs it separately, so a caught panic leaves two lines, this
-/// one with the location and the queue's with the job.
 fn report(info: &PanicHookInfo<'_>) {
     let thread = std::thread::current();
     // The worker and drop threads are named, and the thread name says most of what went wrong.
@@ -41,10 +38,8 @@ fn report(info: &PanicHookInfo<'_>) {
     }
 }
 
-/// `file:line:column`, or a phrase saying there was none.
-///
-/// A panic raised through [`std::panic::resume_unwind`] has no location; storing a job's stems uses
-/// it to re-raise an encoder panic across a thread join.
+/// `file:line:column`, or a phrase when the panic has no location, such as after
+/// [`std::panic::resume_unwind`].
 fn at(location: Option<&Location<'_>>) -> String {
     location.map_or_else(
         || "an unknown location".to_owned(),
@@ -52,10 +47,7 @@ fn at(location: Option<&Location<'_>>) -> String {
     )
 }
 
-/// The panic's message, when it can be recovered.
-///
-/// A payload is `Any`; this reads the two shapes that `panic!` produces. A custom payload's
-/// message, if it has one, is not reachable here.
+/// The panic's message from a `&str` or `String` payload.
 pub fn message(payload: &(dyn Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&'static str>() {
         return (*text).to_owned();
