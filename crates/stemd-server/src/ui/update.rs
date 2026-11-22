@@ -269,29 +269,13 @@ fn item(
     let y = rect.center().y;
     let sheen = status.sheen();
     let hovered = click.is_some() && ui.rect_contains_pointer(rect.expand(3.0));
-    // Move for SHEEN_SECS, then only under the pointer, so an update left for
-    // days does not keep the window repainting.
-    let clock = if age < SHEEN_SECS {
-        Some(age)
-    } else if hovered {
-        Some(time)
-    } else {
-        None
-    };
+    let clock = sheen_clock(age, hovered, time);
     let moving = sheen && clock.is_some();
     if moving || *status == Status::Checking {
         ui.ctx().request_repaint_after(FRAME);
     }
 
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, slot_font(), Color32::PLACEHOLDER);
-    let galley = if sheen {
-        let phase = clock.map_or(0.0, |t| (t / 3.0).fract()) as f32;
-        sheened(&galley, phase, alpha)
-    } else {
-        galley
-    };
+    let galley = item_galley(ui, text, sheen, clock, alpha);
     let mut x = rect.left();
     if let Some(icon) = icon.filter(|icon| icon.leads()) {
         draw_icon(
@@ -317,34 +301,76 @@ fn item(
         );
     }
     if let Some(icon) = icon.filter(|icon| !icon.leads()) {
-        let nudge = match clock.filter(|_| sheen) {
-            // Up 1 px to down 2 px and back, every 1.4 s.
-            Some(t) => -1.0 + 3.0 * (0.5 - 0.5 * (t as f32 / 1.4 * TAU).cos()),
-            None => -1.0,
-        };
+        let nudge = arrow_nudge(clock.filter(|_| sheen));
         let origin = pos2(x + SLOT_GAP, y - icon.size() / 2.0 + nudge);
         draw_icon(ui.painter(), origin, icon, palette, alpha);
     }
 
     if let Some(id) = click {
-        let opens = status.opens();
-        let mut response = ui.interact(
-            rect.expand(3.0),
-            id,
-            if opens {
-                Sense::click()
-            } else {
-                Sense::hover()
-            },
-        );
-        if let Some(hint) = hint(status) {
-            response = response.on_hover_text(hint);
-        }
+        item_response(ui, status, rect, id);
+    }
+}
+
+/// The time the sheen moves by, or `None` while it holds still.
+fn sheen_clock(age: f64, hovered: bool, time: f64) -> Option<f64> {
+    // Move for SHEEN_SECS, then only under the pointer, so an update left for
+    // days does not keep the window repainting.
+    if age < SHEEN_SECS {
+        Some(age)
+    } else if hovered {
+        Some(time)
+    } else {
+        None
+    }
+}
+
+/// The status's text laid out, with the moving gradient when it has a sheen.
+fn item_galley(
+    ui: &egui::Ui,
+    text: String,
+    sheen: bool,
+    clock: Option<f64>,
+    alpha: f32,
+) -> Arc<Galley> {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, slot_font(), Color32::PLACEHOLDER);
+    if sheen {
+        let phase = clock.map_or(0.0, |t| (t / 3.0).fract()) as f32;
+        sheened(&galley, phase, alpha)
+    } else {
+        galley
+    }
+}
+
+/// The arrow's vertical offset, which moves while `clock` runs.
+fn arrow_nudge(clock: Option<f64>) -> f32 {
+    match clock {
+        // Up 1 px to down 2 px and back, every 1.4 s.
+        Some(t) => -1.0 + 3.0 * (0.5 - 0.5 * (t as f32 / 1.4 * TAU).cos()),
+        None => -1.0,
+    }
+}
+
+/// The status's tooltip, and a click that acts on an update.
+fn item_response(ui: &egui::Ui, status: &Status, rect: Rect, id: egui::Id) {
+    let opens = status.opens();
+    let mut response = ui.interact(
+        rect.expand(3.0),
+        id,
         if opens {
-            response = response.on_hover_cursor(CursorIcon::PointingHand);
-            if response.clicked() {
-                update::open();
-            }
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if let Some(hint) = hint(status) {
+        response = response.on_hover_text(hint);
+    }
+    if opens {
+        response = response.on_hover_cursor(CursorIcon::PointingHand);
+        if response.clicked() {
+            update::open();
         }
     }
 }

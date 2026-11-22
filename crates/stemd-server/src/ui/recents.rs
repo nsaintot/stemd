@@ -159,41 +159,24 @@ fn row(
     let meta_left = meta(painter, rect, cross_rect, &state, palette, touched, swapped);
 
     let title_left = icon.right() + 10.0;
-    let mut job = egui::text::LayoutJob::single_section(
+    title_line(
+        painter,
+        palette,
         item.title.clone(),
-        egui::TextFormat::simple(theme::font(13.0, Weight::Medium), palette.text),
-    );
-    job.wrap =
-        egui::text::TextWrapping::truncate_at_width((meta_left - 10.0 - title_left).max(20.0));
-    let title = painter.layout_job(job);
-    painter.galley(
-        pos2(title_left, rect.center().y - title.size().y / 2.0),
-        title,
-        palette.text,
+        pos2(title_left, rect.center().y),
+        meta_left - 10.0 - title_left,
     );
 
     if touched {
         let lit = ui
             .ctx()
             .animate_bool_with_time(id.with("cross"), cross.hovered(), 0.12);
-        if lit > 0.0 {
-            painter.rect_filled(cross_rect, 8.0, white(0.08 * lit));
-        }
-        icons::cross(
-            painter,
-            icons::square(cross_rect.center(), 9.0),
-            theme::mix(palette.muted, palette.danger, lit),
-            1.5,
-        );
+        cross_mark(painter, palette, cross_rect, lit);
     }
 
     if cross
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(match &state {
-            State::Done(_) => "Remove from the list and delete the stems",
-            _ if running => "Cancel and remove from the list",
-            _ => "Remove from the list",
-        })
+        .on_hover_text(cross_hint(&state, running))
         .clicked()
     {
         if running {
@@ -209,16 +192,60 @@ fn row(
             .clicked()
         && let State::Done(finished) = &state
     {
-        // The folder was deleted outside the app. Remove the row, since opening nothing would look
-        // broken.
-        if finished.dir.is_dir() {
-            reveal(&finished.dir);
-        } else {
-            tracing::info!("{} is gone; dropping the row", finished.dir.display());
-            drops.forget(item);
-        }
+        open_or_forget(drops, item, &finished.dir);
     }
     false
+}
+
+/// The title from `at`, centred on its y and cut to `width`.
+fn title_line(
+    painter: &egui::Painter,
+    palette: &Palette,
+    title: String,
+    at: egui::Pos2,
+    width: f32,
+) {
+    let mut job = egui::text::LayoutJob::single_section(
+        title,
+        egui::TextFormat::simple(theme::font(13.0, Weight::Medium), palette.text),
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(20.0));
+    let title = painter.layout_job(job);
+    painter.galley(pos2(at.x, at.y - title.size().y / 2.0), title, palette.text);
+}
+
+/// The remove button's cross in `rect`, lit by `lit` under the pointer.
+fn cross_mark(painter: &egui::Painter, palette: &Palette, rect: Rect, lit: f32) {
+    if lit > 0.0 {
+        painter.rect_filled(rect, 8.0, white(0.08 * lit));
+    }
+    icons::cross(
+        painter,
+        icons::square(rect.center(), 9.0),
+        theme::mix(palette.muted, palette.danger, lit),
+        1.5,
+    );
+}
+
+/// What the remove button does to a track in `state`.
+fn cross_hint(state: &State, running: bool) -> &'static str {
+    match state {
+        State::Done(_) => "Remove from the list and delete the stems",
+        _ if running => "Cancel and remove from the list",
+        _ => "Remove from the list",
+    }
+}
+
+/// Show the stems in `dir`, or drop the row when `dir` is gone.
+fn open_or_forget(drops: &Drops, item: &Arc<Dropped>, dir: &std::path::Path) {
+    // The folder was deleted outside the app. Remove the row, since opening nothing would look
+    // broken.
+    if dir.is_dir() {
+        reveal(dir);
+    } else {
+        tracing::info!("{} is gone; dropping the row", dir.display());
+        drops.forget(item);
+    }
 }
 
 /// The row's hover fill and the hairline above every row but the first.

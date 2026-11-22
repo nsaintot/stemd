@@ -258,41 +258,106 @@ fn row(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, item: &Row, firs
         );
     }
 
-    let (title, length, detail, fill, tooltip) = match item {
-        Row::Job(job) => (
-            format!("Job {}", job.number),
-            job.protocol_1.then(|| "protocol 1".to_owned()),
-            job_detail(&job.progress, job.left),
-            (!queued(job)).then(|| {
-                let id = egui::Id::new(("client-fill", "job", job.number));
-                (job.progress.fraction, id)
-            }),
-            None,
-        ),
-        Row::Session(session) => (
-            format!("Session {}", session.number),
-            Some(length(session.frames, session.sample_rate)),
-            session_detail(session),
-            Some((
-                session.covered as f32 / session.frames.max(1) as f32,
-                egui::Id::new(("client-fill", "session", session.number)),
-            )),
-            Some(session_tooltip(session)),
-        ),
-        Row::Ended(ended) => (
-            format!("Session {}", ended.number),
-            None,
-            ended_detail(ended).0,
-            None,
-            None,
-        ),
-    };
-    if let Some(tooltip) = tooltip {
+    let content = content_of(item);
+    if let Some(tooltip) = content.tooltip {
         response.on_hover_text(tooltip);
     }
 
     let icon = icons::square(pos2(rect.left() + 14.0 + 6.0, rect.center().y), 12.0);
     let failed = matches!(item, Row::Ended(e) if ended_detail(e).1);
+    row_icon(painter, palette, item, icon, failed, now);
+
+    let colour = if failed {
+        palette.danger
+    } else {
+        palette.muted
+    };
+    let meta_left = row_meta(painter, rect, content.detail, colour);
+
+    let title_left = icon.right() + 10.0;
+    let ended = matches!(item, Row::Ended(_));
+    let title_colour = if ended { palette.muted } else { palette.text };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &content.title,
+        0.0,
+        egui::TextFormat::simple(theme::font(13.0, Weight::Medium), title_colour),
+    );
+    if let Some(length) = content.length {
+        job.append(
+            &length,
+            6.0,
+            egui::TextFormat::simple(theme::font(12.0, Weight::Regular), palette.muted),
+        );
+    }
+    job.wrap =
+        egui::text::TextWrapping::truncate_at_width((meta_left - 10.0 - title_left).max(20.0));
+    let galley = painter.layout_job(job);
+    painter.galley(
+        pos2(title_left, rect.center().y - galley.size().y / 2.0),
+        galley,
+        title_colour,
+    );
+
+    if let Some((fraction, id)) = content.fill {
+        row_fill(ui, brushes, rect, title_left, fraction, id);
+    }
+}
+
+/// What a row shows.
+struct Content {
+    title: String,
+    /// The track's length, after the title.
+    length: Option<String>,
+    /// The line at the right of the row.
+    detail: String,
+    /// The share of the track ready, and the id its bar eases under.
+    fill: Option<(f32, egui::Id)>,
+    tooltip: Option<String>,
+}
+
+/// The title, length, detail, fill and tooltip of `item`.
+fn content_of(item: &Row) -> Content {
+    match item {
+        Row::Job(job) => Content {
+            title: format!("Job {}", job.number),
+            length: job.protocol_1.then(|| "protocol 1".to_owned()),
+            detail: job_detail(&job.progress, job.left),
+            fill: (!queued(job)).then(|| {
+                let id = egui::Id::new(("client-fill", "job", job.number));
+                (job.progress.fraction, id)
+            }),
+            tooltip: None,
+        },
+        Row::Session(session) => Content {
+            title: format!("Session {}", session.number),
+            length: Some(length(session.frames, session.sample_rate)),
+            detail: session_detail(session),
+            fill: Some((
+                session.covered as f32 / session.frames.max(1) as f32,
+                egui::Id::new(("client-fill", "session", session.number)),
+            )),
+            tooltip: Some(session_tooltip(session)),
+        },
+        Row::Ended(ended) => Content {
+            title: format!("Session {}", ended.number),
+            length: None,
+            detail: ended_detail(ended).0,
+            fill: None,
+            tooltip: None,
+        },
+    }
+}
+
+/// The icon in `icon` for the state of `item`.
+fn row_icon(
+    painter: &egui::Painter,
+    palette: &Palette,
+    item: &Row,
+    icon: Rect,
+    failed: bool,
+    now: f32,
+) {
     match item {
         Row::Job(job) if queued(job) => icons::clock(painter, icon, palette.muted, 1.4),
         Row::Job(_) => icons::spinner(painter, icon, palette.text, 1.6, now.rem_euclid(1.0)),
@@ -309,16 +374,13 @@ fn row(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, item: &Row, firs
         Row::Ended(_) if failed => icons::cross(painter, icon.shrink(1.0), palette.danger, 1.5),
         Row::Ended(_) => icons::cross(painter, icon.shrink(1.0), palette.muted, 1.5),
     }
+}
 
-    let meta_font = theme::font(12.0, Weight::Regular);
-    let colour = if failed {
-        palette.danger
-    } else {
-        palette.muted
-    };
+/// The detail at the right of `rect`. Returns its left edge.
+fn row_meta(painter: &egui::Painter, rect: Rect, detail: String, colour: egui::Color32) -> f32 {
     let mut job = egui::text::LayoutJob::single_section(
         detail,
-        egui::TextFormat::simple(meta_font.clone(), colour),
+        egui::TextFormat::simple(theme::font(12.0, Weight::Regular), colour),
     );
     job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() * 0.6);
     let meta = painter.layout_job(job);
@@ -328,47 +390,22 @@ fn row(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, item: &Row, firs
         meta,
         colour,
     );
+    meta_left
+}
 
-    let title_left = icon.right() + 10.0;
-    let ended = matches!(item, Row::Ended(_));
-    let title_colour = if ended { palette.muted } else { palette.text };
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        &title,
-        0.0,
-        egui::TextFormat::simple(theme::font(13.0, Weight::Medium), title_colour),
+/// The share of the track ready, along the foot of the row from `left`.
+fn row_fill(ui: &egui::Ui, brushes: &Brushes, rect: Rect, left: f32, fraction: f32, id: egui::Id) {
+    let fraction = super::dropzone::eased_fill(ui.ctx(), id, fraction, super::dropzone::TRACK_EASE);
+    let track = Rect::from_min_max(
+        pos2(left, rect.bottom() - 6.0),
+        pos2(rect.right() - 14.0, rect.bottom() - 4.0),
     );
-    if let Some(length) = length {
-        job.append(
-            &length,
-            6.0,
-            egui::TextFormat::simple(meta_font, palette.muted),
-        );
-    }
-    job.wrap =
-        egui::text::TextWrapping::truncate_at_width((meta_left - 10.0 - title_left).max(20.0));
-    let galley = painter.layout_job(job);
-    painter.galley(
-        pos2(title_left, rect.center().y - galley.size().y / 2.0),
-        galley,
-        title_colour,
+    ui.painter().rect_filled(track, 1.0, white(0.06));
+    let fill = Rect::from_min_max(
+        track.min,
+        pos2(track.left() + track.width() * fraction, track.bottom()),
     );
-
-    // The share of the track ready, along the foot of the row.
-    if let Some((fraction, id)) = fill {
-        let fraction =
-            super::dropzone::eased_fill(ui.ctx(), id, fraction, super::dropzone::TRACK_EASE);
-        let track = Rect::from_min_max(
-            pos2(title_left, rect.bottom() - 6.0),
-            pos2(rect.right() - 14.0, rect.bottom() - 4.0),
-        );
-        painter.rect_filled(track, 1.0, white(0.06));
-        let fill = Rect::from_min_max(
-            track.min,
-            pos2(track.left() + track.width() * fraction, track.bottom()),
-        );
-        brushes.spectrum(painter, track, fill, 1.0, white(0.8));
-    }
+    brushes.spectrum(ui.painter(), track, fill, 1.0, white(0.8));
 }
 
 #[cfg(test)]

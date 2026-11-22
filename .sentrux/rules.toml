@@ -1,6 +1,9 @@
-# Structural limits CI enforces with `sentrux check .`.
-
+# Structural limits CI enforces with `sentrux check .`. Raise min_quality and
+# lower the size limits as the code improves; do not loosen them.
 [constraints]
 max_cycles = 0
-max_cc = 50
-max_fn_lines = 150
+no_god_files = true
+min_quality = 0.70
+max_cc = 20
+max_fn_lines = 80
+max_file_lines = 1400

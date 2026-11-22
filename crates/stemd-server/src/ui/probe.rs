@@ -521,15 +521,10 @@ fn a_short_separated_list_is_as_tall_as_its_rows() {
     }
 }
 
-/// The Clients list at the narrowest window: the visible rows are drawn, no text runs past the
-/// panel or over other text, and the height matches what [`super::activity::height`] promised.
-#[test]
-fn the_clients_list_fits_the_narrowest_window() {
+/// Two jobs, two sessions and an ended session, for the Clients list.
+fn two_jobs_two_sessions_one_ended() -> super::activity::Snapshot {
     use std::time::Instant;
 
-    let ctx = themed();
-    let palette = super::theme::Palette::of(&ctx);
-    let brushes = super::theme::Brushes::new(&ctx);
     let session = |number, runnable| crate::sessions::Activity {
         number,
         frames: 441_000 * 22,
@@ -542,7 +537,7 @@ fn the_clients_list_fits_the_narrowest_window() {
         normal: 30,
         runnable,
     };
-    let snapshot = super::activity::Snapshot {
+    super::activity::Snapshot {
         jobs: vec![
             super::activity::JobRow {
                 number: 1,
@@ -563,7 +558,38 @@ fn the_clients_list_fits_the_narrowest_window() {
             reason: "idle".to_owned(),
             at: Instant::now(),
         }],
-    };
+    }
+}
+
+/// The text shapes in `shapes` and where each is laid out, each once.
+fn texts_of(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+    let drawn: Vec<(String, egui::Rect)> = shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t) => Some((
+                t.galley.text().to_owned(),
+                t.galley.rect.translate(t.pos.to_vec2()),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut texts: Vec<(String, egui::Rect)> = Vec::new();
+    for text in drawn {
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    texts
+}
+
+/// The Clients list at the narrowest window: the visible rows are drawn, no text runs past the
+/// panel or over other text, and the height matches what [`super::activity::height`] promised.
+#[test]
+fn the_clients_list_fits_the_narrowest_window() {
+    let ctx = themed();
+    let palette = super::theme::Palette::of(&ctx);
+    let brushes = super::theme::Brushes::new(&ctx);
+    let snapshot = two_jobs_two_sessions_one_ended();
     let width = super::MIN_WINDOW_SIZE[0] - 2.0 * f32::from(super::PAD);
     let mut height = 0.0;
     let mut build = |ui: &mut egui::Ui| {
@@ -595,22 +621,7 @@ fn the_clients_list_fits_the_narrowest_window() {
             );
         }
     }
-    let drawn: Vec<(String, egui::Rect)> = shapes
-        .iter()
-        .filter_map(|c| match &c.shape {
-            egui::epaint::Shape::Text(t) => Some((
-                t.galley.text().to_owned(),
-                t.galley.rect.translate(t.pos.to_vec2()),
-            )),
-            _ => None,
-        })
-        .collect();
-    let mut texts: Vec<(String, egui::Rect)> = Vec::new();
-    for text in drawn {
-        if !texts.contains(&text) {
-            texts.push(text);
-        }
-    }
+    let texts = texts_of(&shapes);
     // Two rows and part of the third are visible; the others scroll.
     for want in ["Clients", "Job 1", "Job 2", "Session 1"] {
         assert!(

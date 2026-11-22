@@ -174,47 +174,15 @@ impl Zone<'_> {
         } else {
             self.palette.text
         };
-        let progress = match switch {
-            Some(Switch::Downloading { done, total, .. }) => Some((
-                (total > 0).then(|| done as f32 / total as f32),
-                String::new(),
-            )),
-            Some(Switch::Verifying(_)) => Some((None, String::new())),
-            _ => self.current.filter(|_| working).map(progress_of),
-        };
-        let ease = if switch.is_some() {
-            DOWNLOAD_EASE
-        } else {
-            TRACK_EASE
-        };
+        let progress = self.progress(switch, working);
         let sub = self.caption(switch, progress.as_ref());
-        let title_font = theme::font(20.0, Weight::Semibold);
-        let sub_font = theme::font(12.5, Weight::Regular);
-        let (title_h, sub_h) =
-            ctx.fonts_mut(|f| (f.row_height(&title_font), f.row_height(&sub_font)));
         let stacked = progress.is_some() && switch.is_none() && self.batch.total() > 1;
-        let button = match switch {
-            Some(Switch::Failed { .. }) => Some(("Keep current model", Action::KeepModel)),
-            Some(_) => None,
-            None if working => Some(("Queue another track", Action::ChooseFile)),
-            None => Some(("Choose a file", Action::ChooseFile)),
-        };
-
-        // Measure each row's height and the gap under it once, so the block can be centred.
-        let mut column = Column::default();
-        let stage_at = column.add(globe::STAGE.y, 8.0);
-        let title_at = column.add(title_h, 6.0);
-        let sub_at = column.add(sub_h, 18.0);
-        let bar_at = progress
-            .is_some()
-            .then(|| column.add(BAR_ROW_HEIGHT, if stacked { 6.0 } else { 14.0 }));
-        let segments_at = stacked.then(|| column.add(4.0, 14.0));
-        let button_at = button.is_some().then(|| column.add(BUTTON_HEIGHT, 0.0));
-        let top = rect.center().y - column.height() / 2.0;
-        let mid = rect.center().x;
+        let button = button_for(switch, working);
+        let block = Block::measure(&ctx, rect, progress.is_some(), stacked, button.is_some());
+        let (top, mid) = (block.top, rect.center().x);
 
         let stage = Rect::from_min_size(
-            pos2(mid - globe::STAGE.x / 2.0, top + stage_at),
+            pos2(mid - globe::STAGE.x / 2.0, top + block.stage_at),
             globe::STAGE,
         );
         self.paint_globe(
@@ -230,52 +198,85 @@ impl Zone<'_> {
         centred_line(
             painter,
             title,
-            title_font,
+            title_font(),
             title_colour,
             mid,
-            top + title_at,
+            top + block.title_at,
             TITLE_WIDTH.min(rect.width() - 40.0),
         );
         centred_line(
             painter,
             sub,
-            sub_font,
+            sub_font(),
             self.palette.muted,
             mid,
-            top + sub_at,
+            top + block.sub_at,
             rect.width() - 40.0,
         );
 
-        if let (Some((fraction, _)), Some(bar_at)) = (progress, bar_at) {
-            // The bar is centred, and the percentage sits past its right end.
-            let row = Rect::from_min_size(
-                pos2(mid - BAR_WIDTH / 2.0, top + bar_at),
-                vec2(BAR_WIDTH + PERCENT_GAP + PERCENT_WIDTH, BAR_ROW_HEIGHT),
-            );
-            progress_row(
-                ui,
-                row,
-                fraction,
-                ease,
-                self.palette,
-                self.brushes,
-                self.motion.clock,
-            );
-            if let Some(segments_at) = segments_at {
-                self.segments(
-                    ui,
-                    Rect::from_min_size(pos2(row.left(), top + segments_at), vec2(BAR_WIDTH, 4.0)),
-                    fraction,
-                );
-            }
+        if let (Some((fraction, _)), Some(bar_at)) = (progress, block.bar_at) {
+            let segments_at = block.segments_at.map(|at| top + at);
+            let ease = if switch.is_some() {
+                DOWNLOAD_EASE
+            } else {
+                TRACK_EASE
+            };
+            self.progress_bar(ui, pos2(mid, top + bar_at), fraction, ease, segments_at);
         }
 
-        let ((label, action), button_at) = button.zip(button_at)?;
-        let width = widgets::pill_width(ui, label, BUTTON_HEIGHT);
-        let rect = Rect::from_min_size(
-            pos2(mid - width / 2.0, top + button_at),
-            vec2(width, BUTTON_HEIGHT),
+        let ((label, action), button_at) = button.zip(block.button_at)?;
+        self.button(ui, id, label, pos2(mid, top + button_at))
+            .then_some(action)
+    }
+
+    /// The download's or the running track's share done, and its caption, while either runs.
+    fn progress(&self, switch: Option<Switch<'_>>, working: bool) -> Option<(Option<f32>, String)> {
+        match switch {
+            Some(Switch::Downloading { done, total, .. }) => Some((
+                (total > 0).then(|| done as f32 / total as f32),
+                String::new(),
+            )),
+            Some(Switch::Verifying(_)) => Some((None, String::new())),
+            _ => self.current.filter(|_| working).map(progress_of),
+        }
+    }
+
+    /// The progress row centred on `at`, and the batch's segments under it at `segments_at`.
+    fn progress_bar(
+        &self,
+        ui: &egui::Ui,
+        at: egui::Pos2,
+        fraction: Option<f32>,
+        ease: f32,
+        segments_at: Option<f32>,
+    ) {
+        // The bar is centred, and the percentage sits past its right end.
+        let row = Rect::from_min_size(
+            pos2(at.x - BAR_WIDTH / 2.0, at.y),
+            vec2(BAR_WIDTH + PERCENT_GAP + PERCENT_WIDTH, BAR_ROW_HEIGHT),
         );
+        progress_row(
+            ui,
+            row,
+            fraction,
+            ease,
+            self.palette,
+            self.brushes,
+            self.motion.clock,
+        );
+        if let Some(segments_at) = segments_at {
+            self.segments(
+                ui,
+                Rect::from_min_size(pos2(row.left(), segments_at), vec2(BAR_WIDTH, 4.0)),
+                fraction,
+            );
+        }
+    }
+
+    /// The pill button centred on `at.x` from `at.y`. Returns whether it was clicked.
+    fn button(&self, ui: &egui::Ui, id: egui::Id, label: &str, at: egui::Pos2) -> bool {
+        let width = widgets::pill_width(ui, label, BUTTON_HEIGHT);
+        let rect = Rect::from_min_size(pos2(at.x - width / 2.0, at.y), vec2(width, BUTTON_HEIGHT));
         widgets::pill(
             ui,
             rect,
@@ -287,7 +288,6 @@ impl Zone<'_> {
             self.brushes,
         )
         .clicked()
-        .then_some(action)
     }
 
     /// The zone's title line.
@@ -490,7 +490,60 @@ fn ease_spread(t: f32) -> f32 {
     theme::cubic_bezier(0.2, 0.9, 0.2, 1.0, t)
 }
 
-/// The fraction done, if it can be counted, and the stage in words.
+fn title_font() -> egui::FontId {
+    theme::font(20.0, Weight::Semibold)
+}
+
+fn sub_font() -> egui::FontId {
+    theme::font(12.5, Weight::Regular)
+}
+
+/// The zone's rows, as offsets from `top`, centred as one block in the zone.
+struct Block {
+    top: f32,
+    stage_at: f32,
+    title_at: f32,
+    sub_at: f32,
+    bar_at: Option<f32>,
+    /// The batch's segments, shown when the batch has more than one track.
+    segments_at: Option<f32>,
+    button_at: Option<f32>,
+}
+
+impl Block {
+    /// Measure each row's height and the gap under it once, so the block can be centred in `rect`.
+    fn measure(ctx: &egui::Context, rect: Rect, bar: bool, stacked: bool, button: bool) -> Self {
+        let (title_h, sub_h) =
+            ctx.fonts_mut(|f| (f.row_height(&title_font()), f.row_height(&sub_font())));
+        let mut column = Column::default();
+        let stage_at = column.add(globe::STAGE.y, 8.0);
+        let title_at = column.add(title_h, 6.0);
+        let sub_at = column.add(sub_h, 18.0);
+        let bar_at = bar.then(|| column.add(BAR_ROW_HEIGHT, if stacked { 6.0 } else { 14.0 }));
+        let segments_at = stacked.then(|| column.add(4.0, 14.0));
+        let button_at = button.then(|| column.add(BUTTON_HEIGHT, 0.0));
+        Self {
+            top: rect.center().y - column.height() / 2.0,
+            stage_at,
+            title_at,
+            sub_at,
+            bar_at,
+            segments_at,
+            button_at,
+        }
+    }
+}
+
+/// The zone's button for `switch`: none while a model downloads or is checked.
+fn button_for(switch: Option<Switch<'_>>, working: bool) -> Option<(&'static str, Action)> {
+    match switch {
+        Some(Switch::Failed { .. }) => Some(("Keep current model", Action::KeepModel)),
+        Some(_) => None,
+        None if working => Some(("Queue another track", Action::ChooseFile)),
+        None => Some(("Choose a file", Action::ChooseFile)),
+    }
+}
+
 fn progress_of(item: &Dropped) -> (Option<f32>, String) {
     match item.state() {
         State::Reading => (None, "reading the file".to_owned()),

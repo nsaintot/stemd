@@ -480,55 +480,7 @@ mod backend {
         props: &HashMap<&str, String>,
         addrs: &[(String, IpAddr)],
     ) -> Result<Registration> {
-        // Sorted, as in `encode_txt`, so the record is byte-stable across runs.
-        let mut keys: Vec<&&str> = props.keys().collect();
-        keys.sort_unstable();
-        let key_bufs: Vec<Vec<u16>> = keys.iter().map(|k| wide(k)).collect();
-        let value_bufs: Vec<Vec<u16>> = keys.iter().map(|k| wide(&props[**k])).collect();
-        let key_ptrs: Vec<*const u16> = key_bufs.iter().map(|b| b.as_ptr()).collect();
-        let value_ptrs: Vec<*const u16> = value_bufs.iter().map(|b| b.as_ptr()).collect();
-
-        let name = wide(&super::full_name(instance));
-
-        // Bonjour defaults the host to the machine's own name. Here it must be given, as a `.local`
-        // name, because the A record below is published under that name.
-        let host = wide(&format!("{}.local", hostname()));
-
-        // The address itself. `IP4_ADDRESS` is an `in_addr`, in network byte order, which is what
-        // `from_ne_bytes` of the octets leaves in memory.
-        //
-        // This publishes one A record, on whichever interface `if_addrs` lists first; on a host
-        // with a Hyper-V switch, a WSL adapter or a Docker bridge, that address may be unreachable
-        // from the real network.
-        let chosen = super::first_ipv4(addrs);
-        if let Some(v4) = chosen {
-            tracing::info!(
-                "publishing {v4} as the address of {}, chosen from {} interface(s)",
-                super::full_name(instance),
-                addrs.len()
-            );
-        }
-        let ip4 = chosen.map(|v4| u32::from_ne_bytes(v4.octets()));
-
-        // SAFETY: every pointer below outlives the call, which copies what it
-        // needs into the instance it returns.
-        let service = unsafe {
-            DnsServiceConstructInstance(
-                name.as_ptr(),
-                host.as_ptr(),
-                ip4.as_ref().map_or(std::ptr::null(), |a| a as *const u32),
-                std::ptr::null(),
-                port,
-                0, // priority
-                0, // weight
-                u32::try_from(key_ptrs.len()).expect("four properties"),
-                key_ptrs.as_ptr(),
-                value_ptrs.as_ptr(),
-            )
-        };
-        if service.is_null() {
-            bail!("DnsServiceConstructInstance returned null");
-        }
+        let service = construct_instance(instance, port, props, addrs)?;
 
         let completion = Arc::new(Completion::default());
         let mut request = Box::new(RegisterRequest {
@@ -554,7 +506,79 @@ mod backend {
             }
             bail!("DnsServiceRegister failed with {status}");
         }
+        confirm(instance, &completion, request, service)
+    }
 
+    /// The service instance to register: `instance` on `port`, with `props` as its TXT record.
+    fn construct_instance(
+        instance: &str,
+        port: u16,
+        props: &HashMap<&str, String>,
+        addrs: &[(String, IpAddr)],
+    ) -> Result<*mut c_void> {
+        // Sorted, as in `encode_txt`, so the record is byte-stable across runs.
+        let mut keys: Vec<&&str> = props.keys().collect();
+        keys.sort_unstable();
+        let key_bufs: Vec<Vec<u16>> = keys.iter().map(|k| wide(k)).collect();
+        let value_bufs: Vec<Vec<u16>> = keys.iter().map(|k| wide(&props[**k])).collect();
+        let key_ptrs: Vec<*const u16> = key_bufs.iter().map(|b| b.as_ptr()).collect();
+        let value_ptrs: Vec<*const u16> = value_bufs.iter().map(|b| b.as_ptr()).collect();
+
+        let name = wide(&super::full_name(instance));
+
+        // Bonjour defaults the host to the machine's own name. Here it must be given, as a `.local`
+        // name, because the A record below is published under that name.
+        let host = wide(&format!("{}.local", hostname()));
+        let ip4 = address(instance, addrs);
+
+        // SAFETY: every pointer below outlives the call, which copies what it
+        // needs into the instance it returns.
+        let service = unsafe {
+            DnsServiceConstructInstance(
+                name.as_ptr(),
+                host.as_ptr(),
+                ip4.as_ref().map_or(std::ptr::null(), |a| a as *const u32),
+                std::ptr::null(),
+                port,
+                0, // priority
+                0, // weight
+                u32::try_from(key_ptrs.len()).expect("four properties"),
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+            )
+        };
+        if service.is_null() {
+            bail!("DnsServiceConstructInstance returned null");
+        }
+        Ok(service)
+    }
+
+    /// The IPv4 address to publish for `instance`, as an `IP4_ADDRESS`.
+    fn address(instance: &str, addrs: &[(String, IpAddr)]) -> Option<u32> {
+        // The address itself. `IP4_ADDRESS` is an `in_addr`, in network byte order, which is what
+        // `from_ne_bytes` of the octets leaves in memory.
+        //
+        // This publishes one A record, on whichever interface `if_addrs` lists first; on a host
+        // with a Hyper-V switch, a WSL adapter or a Docker bridge, that address may be unreachable
+        // from the real network.
+        let chosen = super::first_ipv4(addrs);
+        if let Some(v4) = chosen {
+            tracing::info!(
+                "publishing {v4} as the address of {}, chosen from {} interface(s)",
+                super::full_name(instance),
+                addrs.len()
+            );
+        }
+        chosen.map(|v4| u32::from_ne_bytes(v4.octets()))
+    }
+
+    /// Wait for the system to confirm the registration of `service` sent in `request`.
+    fn confirm(
+        instance: &str,
+        completion: &Completion,
+        request: Box<RegisterRequest>,
+        service: *mut c_void,
+    ) -> Result<Registration> {
         match completion.wait(COMPLETION_TIMEOUT) {
             Some(outcome) if outcome.status == 0 => {
                 let registered = outcome.instance as *mut c_void;

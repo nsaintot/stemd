@@ -90,13 +90,124 @@ def roformer_vocals(model, chunk, mix, device):
     return out[:, :length]
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--config", required=True)
     ap.add_argument("--clips", type=int, default=25)
     ap.add_argument("--overlap", type=float, default=0.25)
-    args = ap.parse_args()
+    return ap.parse_args()
+
+
+def add_scores(scores, truth, est):
+    """Append the finite SDR of each part of `est` against `truth` to `scores`."""
+    for p in PARTS:
+        v = global_sdr(truth[p], est[p])
+        if np.isfinite(v):
+            scores[p].append(v)
+
+
+def run_demucs(demucs, mix, device, overlap, wall):
+    """Every source from each demucs model, and the seconds htdemucs took."""
+    raw = {}
+    took_demucs = 0.0
+    for name, m in demucs.items():
+        t0 = time.time()
+        with torch.no_grad():
+            out = apply_model(
+                m, torch.from_numpy(mix)[None], device=device,
+                shifts=0, split=True, overlap=overlap, progress=False,
+            )[0]
+        elapsed = time.time() - t0
+        wall[name] += elapsed
+        if name == "htdemucs":
+            took_demucs = elapsed
+        raw[name] = {s: out[m.sources.index(s)].cpu().numpy() for s in SOURCES}
+    return raw, took_demucs
+
+
+def hybrids(raw, mix, vocals_r):
+    """The three hybrid arrangements of the RoFormer's vocals and demucs's drums."""
+    drums_h = raw["htdemucs"]["drums"]
+    harmonics_h = raw["htdemucs"]["bass"] + raw["htdemucs"]["other"]
+
+    # Ship harmonics as the remainder: the player's derived drums comes back
+    # as htdemucs's raw drums, and harmonics carries the residual.
+    clean = {
+        "vocals": vocals_r,
+        "harmonics": mix - vocals_r - drums_h,
+        "drums": drums_h,
+    }
+    # Ship harmonics raw: the residual stays on the derived drums, where the
+    # project wants it, along with the two models' vocal disagreement.
+    derived_drums = mix - harmonics_h - vocals_r
+    naive = {
+        "vocals": vocals_r,
+        "harmonics": harmonics_h,
+        "drums": derived_drums,
+    }
+    # The same as hybrid-clean but taking drums from htdemucs_ft's drums
+    # specialist. In production that is one forward, not four: only the
+    # model whose weight column is non-zero has to run.
+    drums_ft = raw["htdemucs_ft"]["drums"]
+    specialist = {
+        "vocals": vocals_r,
+        "harmonics": mix - vocals_r - drums_ft,
+        "drums": drums_ft,
+    }
+    return (
+        ("hybrid-clean", clean),
+        ("hybrid-derived", naive),
+        ("hybrid-ft-drums", specialist),
+    )
+
+
+def score_clip(track, demucs, roformer, chunk, device, args, scores, wall):
+    """Score every config on one clip. Returns the clip's length in seconds."""
+    mix = track.audio.T.astype(np.float32)
+    truth = {
+        p: sum(track.targets[s].audio.T.astype(np.float32) for s in members)
+        for p, members in PARTS.items()
+    }
+
+    raw, took_demucs = run_demucs(demucs, mix, device, args.overlap, wall)
+
+    t0 = time.time()
+    vocals_r = roformer_vocals(roformer, chunk, mix, device)
+    roformer_secs = time.time() - t0
+    demucs_secs = took_demucs
+
+    for name in ("htdemucs", "htdemucs_ft"):
+        est = {p: sum(raw[name][s] for s in members) for p, members in PARTS.items()}
+        est["drums"] = mix - est["harmonics"] - est["vocals"]
+        add_scores(scores[name], truth, est)
+
+    for cfg, est in hybrids(raw, mix, vocals_r):
+        add_scores(scores[cfg], truth, est)
+        wall[cfg] += roformer_secs + demucs_secs
+    return mix.shape[1] / track.rate
+
+
+def print_table(configs, scores, wall, audio_secs):
+    header = f"  {'config':<14}" + "".join(f"{p:>11}" for p in PARTS) + f"{'mean':>9}{'speed':>12}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for cfg in configs:
+        per = [float(np.mean(scores[cfg][p])) for p in PARTS]
+        rt = audio_secs / wall[cfg] if wall[cfg] else float("inf")
+        print(
+            f"  {cfg:<14}" + "".join(f"{v:>11.2f}" for v in per)
+            + f"{np.mean(per):>9.2f}{rt:>11.2f}x"
+        )
+    print(
+        "\n  speed is on padded clips and pessimistic for every row; the point "
+        "here is\n  the dB, not the x. Differences under ~0.2 dB are inside the "
+        "noise of this\n  many clips."
+    )
+
+
+def main():
+    args = parse_args()
 
     device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
     db = musdb.DB(download=True)
@@ -116,97 +227,11 @@ def main():
     )
 
     for n, track in enumerate(tracks):
-        mix = track.audio.T.astype(np.float32)
-        audio_secs += mix.shape[1] / track.rate
-        truth = {
-            p: sum(track.targets[s].audio.T.astype(np.float32) for s in members)
-            for p, members in PARTS.items()
-        }
-
-        raw = {}
-        took_demucs = 0.0
-        for name, m in demucs.items():
-            t0 = time.time()
-            with torch.no_grad():
-                out = apply_model(
-                    m, torch.from_numpy(mix)[None], device=device,
-                    shifts=0, split=True, overlap=args.overlap, progress=False,
-                )[0]
-            elapsed = time.time() - t0
-            wall[name] += elapsed
-            if name == "htdemucs":
-                took_demucs = elapsed
-            raw[name] = {s: out[m.sources.index(s)].cpu().numpy() for s in SOURCES}
-
-        t0 = time.time()
-        vocals_r = roformer_vocals(roformer, chunk, mix, device)
-        roformer_secs = time.time() - t0
-        demucs_secs = took_demucs
-
-        for name in ("htdemucs", "htdemucs_ft"):
-            est = {p: sum(raw[name][s] for s in members) for p, members in PARTS.items()}
-            est["drums"] = mix - est["harmonics"] - est["vocals"]
-            for p in PARTS:
-                v = global_sdr(truth[p], est[p])
-                if np.isfinite(v):
-                    scores[name][p].append(v)
-
-        drums_h = raw["htdemucs"]["drums"]
-        harmonics_h = raw["htdemucs"]["bass"] + raw["htdemucs"]["other"]
-
-        # Ship harmonics as the remainder: the player's derived drums comes back
-        # as htdemucs's raw drums, and harmonics carries the residual.
-        clean = {
-            "vocals": vocals_r,
-            "harmonics": mix - vocals_r - drums_h,
-            "drums": drums_h,
-        }
-        # Ship harmonics raw: the residual stays on the derived drums, where the
-        # project wants it, along with the two models' vocal disagreement.
-        derived_drums = mix - harmonics_h - vocals_r
-        naive = {
-            "vocals": vocals_r,
-            "harmonics": harmonics_h,
-            "drums": derived_drums,
-        }
-        # The same as hybrid-clean but taking drums from htdemucs_ft's drums
-        # specialist. In production that is one forward, not four: only the
-        # model whose weight column is non-zero has to run.
-        drums_ft = raw["htdemucs_ft"]["drums"]
-        specialist = {
-            "vocals": vocals_r,
-            "harmonics": mix - vocals_r - drums_ft,
-            "drums": drums_ft,
-        }
-        for cfg, est in (
-            ("hybrid-clean", clean),
-            ("hybrid-derived", naive),
-            ("hybrid-ft-drums", specialist),
-        ):
-            for p in PARTS:
-                v = global_sdr(truth[p], est[p])
-                if np.isfinite(v):
-                    scores[cfg][p].append(v)
-            wall[cfg] += roformer_secs + demucs_secs
-
+        audio_secs += score_clip(track, demucs, roformer, chunk, device, args, scores, wall)
         print(f"  clip {n + 1}/{len(tracks)}", end="\r", flush=True)
 
     print(" " * 30, end="\r")
-    header = f"  {'config':<14}" + "".join(f"{p:>11}" for p in PARTS) + f"{'mean':>9}{'speed':>12}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for cfg in configs:
-        per = [float(np.mean(scores[cfg][p])) for p in PARTS]
-        rt = audio_secs / wall[cfg] if wall[cfg] else float("inf")
-        print(
-            f"  {cfg:<14}" + "".join(f"{v:>11.2f}" for v in per)
-            + f"{np.mean(per):>9.2f}{rt:>11.2f}x"
-        )
-    print(
-        "\n  speed is on padded clips and pessimistic for every row; the point "
-        "here is\n  the dB, not the x. Differences under ~0.2 dB are inside the "
-        "noise of this\n  many clips."
-    )
+    print_table(configs, scores, wall, audio_secs)
 
 
 if __name__ == "__main__":

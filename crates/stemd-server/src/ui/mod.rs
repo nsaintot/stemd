@@ -416,34 +416,14 @@ impl Window {
         let running = self.state.queue.running();
         self.drive_globe(&ctx, dt, now, shown, &switch_state, running.as_deref());
 
-        egui::Panel::top("header")
-            .frame(egui::Frame::NONE.inner_margin(margin(TOP, 0)))
-            .show_separator_line(false)
-            .resizable(false)
-            .show(ui, |ui| {
-                if let Some(t) = reveal {
-                    ui.multiply_opacity(t);
-                }
-                let needed = header::row(ui, &self.state, &palette, brushes, self.motion.clock);
-                self.fit_width(&ctx, needed + 2.0 * f32::from(PAD));
-            });
-
+        self.header_panel(ui, &ctx, &palette, brushes, reveal);
         self.status_panel(ui, &palette, reveal);
 
         // The drop zone keeps a fixed height and the sections take the rest,
         // so the ratio between them holds whatever the list holds.
         let drop_left = self.drop_left(now);
         let clients = activity::height(&self.clients.1);
-        let height = ctx
-            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
-            .unwrap_or_else(|| ctx.content_rect().height());
-        let (target, grow) = self.fit.step(height, self.sections_wanted());
-        if let Some(target) = target {
-            set_height(&ctx, target);
-        }
-        if self.fit.waiting() {
-            ctx.request_repaint();
-        }
+        let (height, grow) = self.fit_height(&ctx);
         // Laid out at the height asked for, so the zone does not shrink while
         // the window grows.
         let zone = zone_height(ctx.content_rect().height() + grow, clients);
@@ -482,12 +462,54 @@ impl Window {
         // The first frame fits the window to its contents, whatever size it
         // was saved at; later frames follow changes in what the sections want.
         if !self.fit.started() {
-            // A short saved window also squeezed the zone; give that back too.
-            let wanted = self.sections_wanted();
-            let lacking = wanted - self.sections_room + (ZONE_HEIGHT - zone);
-            if let Some(target) = self.fit.start(height, wanted, lacking) {
-                set_height(&ctx, target);
-            }
+            self.first_fit(&ctx, height, zone);
+        }
+    }
+
+    /// The header panel: the model control and the capsule. It widens the window to fit them.
+    fn header_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        palette: &Palette,
+        brushes: &Brushes,
+        reveal: Option<f32>,
+    ) {
+        egui::Panel::top("header")
+            .frame(egui::Frame::NONE.inner_margin(margin(TOP, 0)))
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                if let Some(t) = reveal {
+                    ui.multiply_opacity(t);
+                }
+                let needed = header::row(ui, &self.state, palette, brushes, self.motion.clock);
+                self.fit_width(ctx, needed + 2.0 * f32::from(PAD));
+            });
+    }
+
+    /// Step the window's height toward what the sections want. Returns the height and the growth.
+    fn fit_height(&mut self, ctx: &egui::Context) -> (f32, f32) {
+        let height = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
+            .unwrap_or_else(|| ctx.content_rect().height());
+        let (target, grow) = self.fit.step(height, self.sections_wanted());
+        if let Some(target) = target {
+            set_height(ctx, target);
+        }
+        if self.fit.waiting() {
+            ctx.request_repaint();
+        }
+        (height, grow)
+    }
+
+    /// Fit the window to its contents on the first frame, from `height` with the zone `zone` tall.
+    fn first_fit(&mut self, ctx: &egui::Context, height: f32, zone: f32) {
+        // A short saved window also squeezed the zone; give that back too.
+        let wanted = self.sections_wanted();
+        let lacking = wanted - self.sections_room + (ZONE_HEIGHT - zone);
+        if let Some(target) = self.fit.start(height, wanted, lacking) {
+            set_height(ctx, target);
         }
     }
 

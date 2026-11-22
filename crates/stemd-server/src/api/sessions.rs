@@ -185,18 +185,7 @@ async fn open(
             None => return Err(ApiError::bad_request("frames must be at least 1")),
         },
     };
-    let secs = frames as f64 / f64::from(model_rate);
-    let max_secs = state.max_track_secs();
-    if secs > max_secs {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "track is {:.1} minutes; this server accepts up to {:.0}",
-                secs / 60.0,
-                max_secs / 60.0
-            ),
-        ));
-    }
+    let secs = track_secs(&state, frames, model_rate)?;
     let grid = session_grid(&state, &info, frames)?;
     let spec = TrackSpec {
         frames,
@@ -206,11 +195,7 @@ async fn open(
         normalises: state.queue.normalises(),
         parts: output.parts,
     };
-    let claim = match stored {
-        Some((info, claim)) if info == TrackInfo::from(&spec) => Some(claim),
-        Some((_, claim)) => return Err(unknown_track(&claim.id)),
-        None => None,
-    };
+    let claim = matching_claim(stored, &spec)?;
     let claimed = claim.as_ref().map(|c| c.id.clone());
 
     let session = state
@@ -245,6 +230,35 @@ async fn open(
     }
     state.queue.wake();
     Ok((StatusCode::CREATED, view_of(&state, &session)).into_response())
+}
+
+/// The track's length in seconds at `model_rate`; an error past the longest track accepted.
+fn track_secs(state: &AppState, frames: usize, model_rate: u32) -> Result<f64, ApiError> {
+    let secs = frames as f64 / f64::from(model_rate);
+    let max_secs = state.max_track_secs();
+    if secs > max_secs {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "track is {:.1} minutes; this server accepts up to {:.0}",
+                secs / 60.0,
+                max_secs / 60.0
+            ),
+        ));
+    }
+    Ok(secs)
+}
+
+/// The claim on a stored track, kept only when the track has the shape `spec` asks for.
+fn matching_claim(
+    stored: Option<(TrackInfo, Claim)>,
+    spec: &TrackSpec,
+) -> Result<Option<Claim>, ApiError> {
+    match stored {
+        Some((info, claim)) if info == TrackInfo::from(spec) => Ok(Some(claim)),
+        Some((_, claim)) => Err(unknown_track(&claim.id)),
+        None => Ok(None),
+    }
 }
 
 /// A 400 unless the output cuts into pieces and the upload has the model's rate and channels.

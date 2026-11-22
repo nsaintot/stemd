@@ -298,27 +298,12 @@ mod tests {
     //
     //     STEMD_AB_MLX=<dir with every artefact> \
     //     cargo test --release -p stemd-server -- --ignored across_a_preset_switch --nocapture
-    #[test]
-    #[ignore]
-    fn separating_works_across_a_preset_switch() {
-        use crate::jobs::Jobs;
-        use crate::output::Output;
-        use crate::queue::{Queue, QueuedWork};
-        use stemd_core::{Audio, DspMode, OutputRate, StemFormat};
-
-        let Ok(dir) = std::env::var("STEMD_AB_MLX") else {
-            eprintln!("SKIPPED: set STEMD_AB_MLX to a directory holding the artefacts.");
-            return;
-        };
-        let dir = PathBuf::from(dir);
-        let cache = crate::testkit::cache(u64::MAX, std::time::Duration::from_secs(600));
-        let jobs = Jobs::new(std::time::Duration::from_secs(600));
-
-        // Eight seconds of tone and noise: long enough to cross a segment boundary, short enough
-        // that Quality finishes quickly. A bass note, a chord, a vibrato lead and a noise burst
-        // twice a second give each branch something to find. The two channels differ: a mix with
-        // identical channels has no side content, and the BS-RoFormer standardises a band of it to
-        // NaN.
+    /// Eight seconds of tone and noise in two channels that differ.
+    fn tone_and_noise() -> stemd_core::Audio {
+        // Long enough to cross a segment boundary, short enough that Quality finishes quickly. A
+        // bass note, a chord, a vibrato lead and a noise burst twice a second give each branch
+        // something to find. The two channels differ: a mix with identical channels has no side
+        // content, and the BS-RoFormer standardises a band of it to NaN.
         let hz = 44100;
         let tau = 2.0 * std::f32::consts::PI;
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -340,45 +325,90 @@ mod tests {
             left.push(0.7 * (bass + chord + hit + lead));
             right.push(0.7 * (bass + 0.9 * chord + 0.8 * hit + 1.1 * lead));
         }
-        let mix = Audio::new(vec![left, right], hz as u32);
+        stemd_core::Audio::new(vec![left, right], hz as u32)
+    }
 
-        let separate = |queue: &Queue, key: &str| {
-            let job = jobs.create(key.to_owned());
-            queue
-                .submit(QueuedWork {
-                    job: Arc::clone(&job),
-                    mix: mix.clone(),
-                    output: Output {
-                        format: StemFormat::Pcm16,
-                        rate: OutputRate::default(),
-                        derived: false,
-                        dsp: DspMode::default().into(),
-                        parts: stemd_core::Parts::DEFAULT,
-                    },
-                    cache_id: "test".into(),
-                    from_api: true,
-                })
-                .expect("queue has room");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
-            while !job.progress.lock().stage.is_terminal() {
-                assert!(std::time::Instant::now() < deadline, "{key} never finished");
-                std::thread::sleep(std::time::Duration::from_millis(50));
+    /// Separate `mix` on `queue` as job `key` and check that its stems are `SHIPPED`.
+    fn separate(
+        jobs: &crate::jobs::Jobs,
+        queue: &crate::queue::Queue,
+        mix: &stemd_core::Audio,
+        key: &str,
+    ) {
+        use crate::output::Output;
+        use crate::queue::QueuedWork;
+        use stemd_core::{DspMode, OutputRate, StemFormat};
+
+        let job = jobs.create(key.to_owned());
+        queue
+            .submit(QueuedWork {
+                job: Arc::clone(&job),
+                mix: mix.clone(),
+                output: Output {
+                    format: StemFormat::Pcm16,
+                    rate: OutputRate::default(),
+                    derived: false,
+                    dsp: DspMode::default().into(),
+                    parts: stemd_core::Parts::DEFAULT,
+                },
+                cache_id: "test".into(),
+                from_api: true,
+            })
+            .expect("queue has room");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !job.progress.lock().stage.is_terminal() {
+            assert!(std::time::Instant::now() < deadline, "{key} never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            job.error.lock().is_none(),
+            "{key} failed: {:?}",
+            job.error.lock()
+        );
+        let entry = job.entry.lock().clone().expect("a completed job has stems");
+        let names: Vec<String> = entry.stems.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, stemd_core::SHIPPED, "{key} shipped {names:?}");
+        println!(
+            "  {key}: {} stems, residual {:.1} dB, {:.1}x realtime",
+            names.len(),
+            entry.model_residual_db.unwrap_or(f64::NAN),
+            entry.realtime_factor()
+        );
+    }
+
+    /// Wait until `switcher` has loaded `to` and settled.
+    fn wait_for_switch(switcher: &Switcher, to: Preset) {
+        // Wait on `current`: `request` returns before its thread sets a state, so `busy` would read
+        // `Idle` as finished.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while switcher.current() != Some(to) {
+            if let SwitchState::Failed { message, .. } = switcher.state() {
+                panic!("switching to {to:?} failed: {message}");
             }
-            assert!(
-                job.error.lock().is_none(),
-                "{key} failed: {:?}",
-                job.error.lock()
-            );
-            let entry = job.entry.lock().clone().expect("a completed job has stems");
-            let names: Vec<String> = entry.stems.iter().map(|s| s.name.clone()).collect();
-            assert_eq!(names, stemd_core::SHIPPED, "{key} shipped {names:?}");
-            println!(
-                "  {key}: {} stems, residual {:.1} dB, {:.1}x realtime",
-                names.len(),
-                entry.model_residual_db.unwrap_or(f64::NAN),
-                entry.realtime_factor()
-            );
+            assert!(std::time::Instant::now() < deadline, "the switch hung");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            switcher.state(),
+            SwitchState::Idle,
+            "the switch did not complete"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn separating_works_across_a_preset_switch() {
+        use crate::jobs::Jobs;
+        use crate::queue::Queue;
+
+        let Ok(dir) = std::env::var("STEMD_AB_MLX") else {
+            eprintln!("SKIPPED: set STEMD_AB_MLX to a directory holding the artefacts.");
+            return;
         };
+        let dir = PathBuf::from(dir);
+        let cache = crate::testkit::cache(u64::MAX, std::time::Duration::from_secs(600));
+        let jobs = Jobs::new(std::time::Duration::from_secs(600));
+        let mix = tone_and_noise();
 
         let from = Preset::Fast;
         let to = Preset::Quality;
@@ -396,7 +426,7 @@ mod tests {
         .unwrap_or_else(|e| panic!("loading {}: {e:#}", from.artefact()));
         println!("started on {} via {}", info.model, info.backend);
         let queue = Arc::new(queue);
-        separate(&queue, "before-the-switch");
+        separate(&jobs, &queue, &mix, "before-the-switch");
 
         let scratch = crate::scratch::Dir::new("switch-test");
         let settings = Arc::new(crate::settings::SettingsFile::open(
@@ -418,22 +448,7 @@ mod tests {
             },
         ));
         assert!(switcher.request(to), "the switch was refused");
-
-        // Wait on `current`: `request` returns before its thread sets a state, so `busy` would read
-        // `Idle` as finished.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
-        while switcher.current() != Some(to) {
-            if let SwitchState::Failed { message, .. } = switcher.state() {
-                panic!("switching to {to:?} failed: {message}");
-            }
-            assert!(std::time::Instant::now() < deadline, "the switch hung");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert_eq!(
-            switcher.state(),
-            SwitchState::Idle,
-            "the switch did not complete"
-        );
+        wait_for_switch(&switcher, to);
         println!("switched to {}", queue.info().model);
         assert_ne!(
             queue.info().model,
@@ -441,7 +456,7 @@ mod tests {
             "the queue still reports the model it started on"
         );
 
-        separate(&queue, "after-the-switch");
+        separate(&jobs, &queue, &mix, "after-the-switch");
     }
 
     /// Every id a client can receive passes its sanitiser unchanged, so the stored value matches
