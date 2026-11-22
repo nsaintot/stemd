@@ -92,14 +92,14 @@ impl Session {
         number: u64,
         output: Output,
         in_format: PcmFormat,
-        peak: Option<f32>,
+        gain: f32,
         track: Arc<Track>,
     ) -> Self {
         let now = Instant::now();
         Self {
             id,
             number,
-            gain: output.gain(peak),
+            gain,
             output,
             in_format,
             track: Mutex::new(track),
@@ -381,6 +381,14 @@ pub struct Request {
     pub norm: Option<Normalisation>,
     pub peak: Option<f32>,
     pub model_id: String,
+    /// The stored track the open names with `track=`, when it named one.
+    pub claim: Option<Claim>,
+}
+
+/// A track id an open names, and the gain its stored pieces were written at.
+pub struct Claim {
+    pub id: String,
+    pub gain: f32,
 }
 
 /// Every open session and the tracks they play.
@@ -470,10 +478,10 @@ impl Sessions {
         self.limits.lock().0
     }
 
-    /// The ids of the verified tracks open sessions play.
+    /// The ids of the verified or claimed tracks open sessions play.
     fn open_track_ids(&self) -> HashSet<String> {
         let tracks: Vec<Arc<Track>> = self.tracks.lock().values().cloned().collect();
-        tracks.iter().filter_map(|t| t.verified()).collect()
+        tracks.iter().filter_map(|t| t.stored_id()).collect()
     }
 
     pub fn cache(&self) -> &Arc<Cache> {
@@ -510,11 +518,16 @@ impl Sessions {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
+        let gain = request
+            .claim
+            .as_ref()
+            .map_or_else(|| request.output.gain(request.peak), |c| c.gain);
         let track = Arc::new(Track::new(
             seq,
             request.model_id.clone(),
             request.track,
             request.norm,
+            request.claim.map(|c| c.id),
         ));
         self.tracks.lock().insert(seq, Arc::clone(&track));
         let session = Arc::new(Session::new(
@@ -522,11 +535,12 @@ impl Sessions {
             seq + 1,
             request.output,
             request.in_format,
-            request.peak,
+            gain,
             track,
         ));
         sessions.insert(session.id.clone(), Arc::clone(&session));
         drop(sessions);
+        session.set_cached(self.cached_for(&session));
         self.changed();
         Ok(session)
     }
@@ -551,12 +565,13 @@ impl Sessions {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
+        let gain = output.gain(peak);
         let session = Arc::new(Session::new(
             format!("s{seq}-{nanos:08x}"),
             seq + 1,
             output,
             in_format,
-            peak,
+            gain,
             Arc::clone(&track),
         ));
         sessions.insert(session.id.clone(), Arc::clone(&session));
@@ -585,6 +600,7 @@ impl Sessions {
                 track = %id,
                 "the client's mean and std are not the mix's; this track is not shared"
             ),
+            Some(Verdict::Mismatch(actual)) => self.refute(&track, &actual),
             Some(Verdict::Verified(id)) => {
                 let track = self.settle(&track, &id);
                 self.store_pieces(&track, 0..track.spec.frames);
@@ -596,6 +612,18 @@ impl Sessions {
         }
         self.changed();
         Ok(())
+    }
+
+    /// End every session on `track`, whose upload hashed to `actual`, and record their file keys against `actual`.
+    fn refute(&self, track: &Track, actual: &str) {
+        let claim = track.claim.as_deref().unwrap_or_default();
+        let reason = format!("upload is not track {claim}");
+        tracing::warn!(track = %claim, "hash mismatch: upload is {actual}; sessions ended");
+        track.close(reason.as_str());
+        for session in self.of_track(track) {
+            self.record_file(&session, actual);
+            self.remove(&session.id, &reason);
+        }
     }
 
     /// Record `session`'s file key against `track_id`, when it sent one.

@@ -14,13 +14,13 @@ use super::view::spans_of;
 use super::{Excerpt, RESAMPLE_CONTEXT, Session, Sessions, Source, StemView, Track};
 
 impl Sessions {
-    /// The track directory of `session`'s output, once its track id is known.
+    /// The track directory of `session`'s output, once its track id is known or claimed.
     pub fn track_dir(&self, session: &Session) -> Option<PathBuf> {
         let track = session.track();
         let type_dir = type_dir(&session.output, session.gain);
         Some(
             self.cache
-                .verified_dir(&track.model_id, &type_dir, &track.verified()?),
+                .verified_dir(&track.model_id, &type_dir, &track.stored_id()?),
         )
     }
 

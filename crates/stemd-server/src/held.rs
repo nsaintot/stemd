@@ -201,6 +201,23 @@ pub fn derivable(
     })
 }
 
+/// A track directory of `output` for `id` that holds a piece or a whole stem, at `gain` when one does.
+pub fn claimable(
+    cache: &Cache,
+    model_id: &str,
+    output: &Output,
+    id: &str,
+    gain: f32,
+) -> Option<TypeDir> {
+    let own = cache.verified_dir(model_id, &type_dir(output, gain), id);
+    let mut found: Vec<TypeDir> = type_dirs(cache, model_id, output, id)
+        .into_iter()
+        .filter(TypeDir::holds_any)
+        .collect();
+    let at = found.iter().position(|f| f.dir == own).unwrap_or(0);
+    (at < found.len()).then(|| found.swap_remove(at))
+}
+
 /// What the server holds for `id` at `output`, queueing consolidation once every piece is stored.
 pub fn lookup(
     cache: &Arc<Cache>,

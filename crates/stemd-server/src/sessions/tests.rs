@@ -158,6 +158,7 @@ fn request() -> Request {
         norm: None,
         peak: None,
         model_id: "model".into(),
+        claim: None,
     }
 }
 

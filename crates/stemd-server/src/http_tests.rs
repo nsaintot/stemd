@@ -485,6 +485,238 @@ mod session_api {
         assert_eq!(joined.status, StatusCode::CREATED, "{}", joined.json);
         assert_ne!(joined.json["id"], opened.json["id"]);
     }
+
+    const FILE: &str = "3b0c55e19a7d42f08c6e1d2a";
+
+    /// 16-bit stereo noise, `frames` long, unlike [`pcm`].
+    fn other_pcm(frames: usize) -> Vec<u8> {
+        (0..frames * 2)
+            .flat_map(|i| ((((i * 53) % 2000) as i32 - 1000) as i16 * 8).to_le_bytes())
+            .collect()
+    }
+
+    /// Every file under `dir` but the `.used` marker.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_owned()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|n| n != ".used") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Store the first pieces of [`pcm`] under `FILE`, end the session, and return the track id and its directory.
+    async fn partial_track(
+        state: &crate::state::AppState,
+        app: &axum::Router,
+    ) -> (String, std::path::PathBuf) {
+        let uri = format!("/v2/sessions?frames=30000&file={FILE}");
+        let opened = call(app, Method::POST, &uri, pcm(30_000)).await;
+        assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.json);
+        let sid = opened.json["id"].as_str().unwrap().to_owned();
+        let window = br#"{"regions": [{"at": 0, "ahead": 15000, "priority": 0}]}"#.to_vec();
+        let set = call(
+            app,
+            Method::PUT,
+            &format!("/v2/sessions/{sid}/window"),
+            window,
+        )
+        .await;
+        assert_eq!(set.status, StatusCode::OK, "{}", set.json);
+        state.queue.wake();
+        let sessions = state.queue.sessions();
+        let session = sessions.get(&sid).expect("the session");
+        until(|| sessions.cached_for(&session).len() >= 4).await;
+        let id = session.track().verified().expect("hashed");
+        let type_name = crate::cache::type_dir(&session.output, session.gain);
+        let dir = state
+            .cache
+            .verified_dir(&state.switcher.cache_id(), &type_name, &id);
+        let ended = call(
+            app,
+            Method::DELETE,
+            &format!("/v2/sessions/{sid}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(ended.status, StatusCode::NO_CONTENT);
+        // A segment running at the end may still write its pieces.
+        let mut seen = files_under(&dir);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let now = files_under(&dir);
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+        let stored = crate::cache::Cache::cached(
+            &dir,
+            &session.output.served(),
+            "flac",
+            session.track().spec.grid.len(),
+        );
+        assert!(stored.len() < session.track().spec.grid.len(), "{stored:?}");
+        (id, dir)
+    }
+
+    #[tokio::test]
+    async fn a_session_on_a_partial_track_serves_its_pieces_then_stores_the_rest() {
+        let state = state();
+        let app = crate::api::router(std::sync::Arc::clone(&state));
+        let (id, dir) = partial_track(&state, &app).await;
+        let lookup = format!("/v2/separations?file={FILE}");
+        let found = call(&app, Method::GET, &lookup, Vec::new()).await;
+        assert_eq!(found.json["state"], "partial", "{}", found.json);
+
+        let uri = format!("/v2/sessions?track={id}&file={FILE}");
+        let opened = call(&app, Method::POST, &uri, Vec::new()).await;
+        assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.json);
+        for stem in opened.json["stems"].as_array().unwrap() {
+            assert_eq!(stem["stored"], "pieces", "{stem}");
+            assert_eq!(stem["pieces"][0][0], 0, "{stem}");
+        }
+        let sid = opened.json["id"].as_str().unwrap().to_owned();
+        let base = format!("/v2/sessions/{sid}");
+        let read = call(
+            &app,
+            Method::GET,
+            &format!("{base}/stems/vocals?from=0&to=1000"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+
+        let uploaded = call(
+            &app,
+            Method::PUT,
+            &format!("{base}/pcm?offset=0"),
+            pcm(30_000),
+        )
+        .await;
+        assert_eq!(uploaded.status, StatusCode::OK, "{}", uploaded.json);
+        assert_eq!(uploaded.json["track"]["id"], id.as_str());
+        let window = br#"{"regions": [{"at": 0, "ahead": 30000, "priority": 0}]}"#.to_vec();
+        let set = call(&app, Method::PUT, &format!("{base}/window"), window).await;
+        assert_eq!(set.status, StatusCode::OK, "{}", set.json);
+        let segments = set.json["grid"]["segments"].as_u64().unwrap();
+        assert!(
+            set.json["planned"].as_u64().unwrap() < segments,
+            "{}",
+            set.json
+        );
+        state.queue.wake();
+        let session = state.queue.sessions().get(&sid).expect("the session");
+        let served = session.output.served();
+        let count = session.track().spec.grid.len();
+        until(|| crate::cache::Cache::cached(&dir, &served, "flac", count).len() == count).await;
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_is_not_the_claimed_track_ends_the_session_and_stores_nothing() {
+        let state = state();
+        let app = crate::api::router(std::sync::Arc::clone(&state));
+        let (id, dir) = partial_track(&state, &app).await;
+        let before = files_under(dir.parent().unwrap());
+
+        let uri = format!("/v2/sessions?track={id}&file={FILE}");
+        let opened = call(&app, Method::POST, &uri, Vec::new()).await;
+        assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.json);
+        let base = format!("/v2/sessions/{}", opened.json["id"].as_str().unwrap());
+        let window = br#"{"regions": [{"at": 0, "ahead": 30000, "priority": 0}]}"#.to_vec();
+        let set = call(&app, Method::PUT, &format!("{base}/window"), window).await;
+        assert_eq!(set.status, StatusCode::OK, "{}", set.json);
+        let other = other_pcm(30_000);
+        let first = call(
+            &app,
+            Method::PUT,
+            &format!("{base}/pcm?offset=0"),
+            other[..60_000].to_vec(),
+        )
+        .await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.json);
+        state.queue.wake();
+        let rest = call(
+            &app,
+            Method::PUT,
+            &format!("{base}/pcm?offset=15000"),
+            other[60_000..].to_vec(),
+        )
+        .await;
+        assert_eq!(rest.json["state"], "closed", "{}", rest.json);
+        let reason = format!("upload is not track {id}");
+        assert_eq!(rest.json["error"], reason.as_str());
+        let gone = call(&app, Method::GET, &base, Vec::new()).await;
+        assert_eq!(gone.status, StatusCode::NOT_FOUND);
+        assert!(
+            state
+                .queue
+                .sessions()
+                .ended()
+                .iter()
+                .any(|e| e.reason == reason),
+            "the window shows why it ended"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            files_under(dir.parent().unwrap()),
+            before,
+            "something was written"
+        );
+        let lookup = format!("/v2/separations?file={FILE}");
+        let found = call(&app, Method::GET, &lookup, Vec::new()).await;
+        assert_eq!(found.status, StatusCode::NOT_FOUND, "{}", found.json);
+    }
+
+    #[tokio::test]
+    async fn a_session_on_stored_pieces_takes_their_length_and_an_unknown_id_is_404() {
+        let state = state();
+        let app = crate::api::router(std::sync::Arc::clone(&state));
+        let (id, _) = partial_track(&state, &app).await;
+        let longer = call(
+            &app,
+            Method::POST,
+            &format!("/v2/sessions?track={id}&frames=30001"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(longer.status, StatusCode::BAD_REQUEST, "{}", longer.json);
+        let same = call(
+            &app,
+            Method::POST,
+            &format!("/v2/sessions?track={id}&frames=30000"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(same.status, StatusCode::CREATED, "{}", same.json);
+
+        let unknown = "1".repeat(crate::ident::TRACK_ID_LEN);
+        let missing = call(
+            &app,
+            Method::POST,
+            &format!("/v2/sessions?track={unknown}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.json);
+        assert_eq!(missing.json["code"], "unknown_separation");
+        assert!(
+            missing.json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no open or stored track")),
+            "{}",
+            missing.json
+        );
+    }
 }
 
 mod v1 {

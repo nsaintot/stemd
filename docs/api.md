@@ -426,14 +426,22 @@ POST /v2/sessions?frames=13230000&format=f32le&output_format=flac
 | Parameter | |
 | --- | --- |
 | `frames` | Track length. Required unless `track` is set. |
-| `track` | A track id the lookup reports as `open`: join it and upload nothing. |
+| `track` | A track id. An `open` track is joined and takes no upload. For `partial` or `consolidating`, the session opens on the stored pieces, which are ready at once; the client uploads the rest with `PUT /pcm`. Upload the whole track to have the new pieces stored. |
 | `file` | Optional. The client's [file key](#file-key). |
 | `sample_rate`, `channels`, `format` | The upload. Rate and channels must be the model's. |
 | output parameters | As for jobs. `mp3` is refused. |
 | `mean`, `std` | Optional, both or neither. See [Upload methods](#upload-methods) and [Track statistics](#track-statistics). |
 | `peak` | Optional. Sets the session's gain, see [Gain](#gain). |
 
-The body is optional audio from sample 0; it must be empty with `track`.
+The body is optional audio from sample 0; it must be empty when joining an `open` track.
+
+A `track` id on stored pieces is a claim:
+
+- It is trusted for reading the stored pieces. The session takes their gain.
+- New pieces are stored, and the track is shared, only once the whole upload
+  hashes to the id.
+- An upload that hashes to another id ends the session with
+  `upload is not track <id>`, stores nothing, and makes the file key ambiguous.
 
 An open reserves `(1 + parts) × channels × frames × 4` bytes for the mix and the
 parts. Open tracks may reserve half of physical memory together; a join reserves
@@ -442,8 +450,8 @@ nothing.
 | Status | |
 | --- | --- |
 | `201` | The [session view](#view). |
-| `400` | A bad parameter: wrong rate or channels, `frames=0`, only one of `mean` and `std`, `frames` that differs from the joined track. |
-| `404` | `unknown_separation`: the track to join is no longer open. Open with `frames` and upload. |
+| `400` | A bad parameter: wrong rate or channels, `frames=0`, only one of `mean` and `std`, `frames` that differs from the track `track` names. |
+| `404` | `unknown_separation`: nothing is open or stored for `track`. Open with `frames` and upload. |
 | `409` | The loaded model cannot run segment by segment. |
 | `413` | Longer than `max_track_seconds`, or needs more memory than open tracks may reserve. |
 | `429` | The session limit is reached, or the open tracks reserve too much memory for this one. |
@@ -677,7 +685,7 @@ unknown_separation` for a key the server has not recorded or found ambiguous.
 | `consolidating` | every piece; whole files are being written | asks again shortly, or joins with a session |
 | `separating` | a job for this output is running; `job` is its id | posts `/v2/jobs/<job>/join`, follows the job, fetches its stems when done, deletes it when leaving; on 404, 410, `failed` or `cancelled`, looks up again |
 | `open` | the mix, in a session | opens a session with `track=<id>` |
-| `partial` | some pieces or whole files | opens a session and uploads |
+| `partial` | some pieces or whole files | opens a session with `track=<id>` and uploads |
 
 `404 unknown_separation` means nothing is held for this output.
 
@@ -731,7 +739,8 @@ A player skips an entry whose `sources` holds a bit it does not know.
    the client's own cache, stop here.
 2. `GET /v2/separations?file=<key>&<output>`. On `stored` or `derivable`, fetch
    the bundle and stop. On `separating`, join `/v2/jobs/<job>` and follow it. On
-   `open`, open a session with `track=<track>`.
+   `open`, open a session with `track=<track>`. On `partial`, open one with
+   `track=<track>` and `file=<key>`, and upload the whole track with `PUT /pcm`.
 3. Otherwise open a session with `file=<key>` and the method `/v2/health`
    allows, send a window, long-poll the view, read ranges near the needle.
 4. When the view says `complete`, fetch each stem whole, or the bundle once the
