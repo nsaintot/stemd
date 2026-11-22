@@ -18,6 +18,9 @@ pub const ROW_HEIGHT: f32 = 40.0;
 
 const RADIUS: f32 = 16.0;
 
+/// Rows shown before the list scrolls; the cut row fades out.
+pub const MAX_VISIBLE: f32 = 5.75;
+
 /// Hit target and drawn box of the remove control.
 const CROSS_BOX: f32 = 26.0;
 
@@ -26,8 +29,8 @@ pub fn height(rows: usize, max_height: f32) -> f32 {
     (ROW_HEIGHT * rows as f32).min(max_height.max(ROW_HEIGHT))
 }
 
-/// Draw the list. Returns a running drop whose cross was clicked, for the
-/// caller to stop.
+/// Draw the list, at least `min_rows` tall, or that many sample rows when it is
+/// empty. Returns a running drop whose cross was clicked, for the caller to stop.
 pub fn list(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -35,13 +38,17 @@ pub fn list(
     drops: &Drops,
     items: &[Arc<Dropped>],
     max_height: f32,
+    min_rows: usize,
 ) -> Option<Arc<Dropped>> {
     if items.is_empty() {
-        placeholder(ui, palette, brushes, max_height);
+        placeholder(ui, palette, brushes, max_height, min_rows);
         return None;
     }
 
-    let height = height(items.len(), max_height);
+    let height = height(
+        items.len().max(min_rows),
+        max_height.min(MAX_VISIBLE * ROW_HEIGHT),
+    );
     let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     brushes.glass(ui.painter(), panel, RADIUS, Glass::List);
 
@@ -63,19 +70,30 @@ pub fn list(
         .max_height(height)
         .auto_shrink([false, true])
         .show(&mut inside, |ui| {
+            let mark = super::widgets::paint_mark(ui);
             for (n, item) in items.iter().enumerate() {
                 if row(ui, palette, drops, item, n == 0, n + 1 == items.len(), now) {
                     stop = Some(Arc::clone(item));
                 }
             }
+            if ui.cursor().top() > panel.bottom() + 0.5 {
+                let zone = super::widgets::fade_zone(panel, ROW_HEIGHT);
+                super::widgets::fade_out(ui.painter(), mark, zone);
+            }
         });
     stop
 }
 
-/// The empty list: the panel at three rows, or what fits, faded, with faint
+/// The empty list: the panel at `rows` rows, or what fits, faded, with faint
 /// sample rows under one line of text.
-fn placeholder(ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes, max_height: f32) {
-    let height = height(3, max_height);
+fn placeholder(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    brushes: &Brushes,
+    max_height: f32,
+    rows: usize,
+) {
+    let height = height(rows, max_height);
     let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let mut painter = ui.painter().with_clip_rect(ui.clip_rect());
     painter.multiply_opacity(0.5);
@@ -292,7 +310,11 @@ fn detail(state: &State) -> String {
             format!("{} parts{dot}already separated", finished.parts.len())
         }
         State::Done(finished) => {
-            format!("{} parts{dot}{:.0} s", finished.parts.len(), finished.secs)
+            format!(
+                "{} parts{dot}{}",
+                finished.parts.len(),
+                super::eta::duration_text(finished.secs)
+            )
         }
         State::Failed(why) => why.clone(),
     }

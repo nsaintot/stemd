@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
@@ -68,7 +68,37 @@ pub struct QueueFull {
 struct Running {
     id: String,
     from_api: bool,
+    /// See [`Pending::number`].
+    number: Option<u64>,
+    /// The job, for its progress in [`Queue::client_jobs`].
+    job: Arc<Job>,
     cancel: Arc<AtomicBool>,
+}
+
+/// A job waiting for the worker.
+struct Pending {
+    work: QueuedWork,
+    /// Counts API jobs from 1 since the server started; `None` for a drop.
+    number: Option<u64>,
+}
+
+/// An API job as the window shows it: no id, since a job id carries a prefix
+/// of the track's hash.
+#[derive(Clone, Debug)]
+pub struct ClientJob {
+    pub number: u64,
+    pub running: bool,
+    pub progress: Progress,
+}
+
+/// The running job, then the waiting ones. A job listed in both keeps only its
+/// running entry.
+fn running_first(running: Option<ClientJob>, waiting: Vec<ClientJob>) -> Vec<ClientJob> {
+    let taken = running.as_ref().map(|r| r.number);
+    running
+        .into_iter()
+        .chain(waiting.into_iter().filter(|w| Some(w.number) != taken))
+        .collect()
 }
 
 /// A model waiting to be built, and the caller waiting to hear how it went.
@@ -81,7 +111,9 @@ struct Staged {
 }
 
 struct Inner {
-    pending: Mutex<VecDeque<QueuedWork>>,
+    pending: Mutex<VecDeque<Pending>>,
+    /// The last API job's number.
+    api_jobs: AtomicU64,
     ready: Condvar,
     running: Mutex<Option<Running>>,
     max_depth: usize,
@@ -136,6 +168,7 @@ impl Queue {
     ) -> Result<(Self, BackendInfo)> {
         let inner = Arc::new(Inner {
             pending: Mutex::new(VecDeque::new()),
+            api_jobs: AtomicU64::new(0),
             ready: Condvar::new(),
             running: Mutex::new(None),
             max_depth,
@@ -275,7 +308,10 @@ impl Queue {
         let position = pending.len();
         work.job
             .set_progress(queued_progress(position, position + 1));
-        pending.push_back(work);
+        let number = work
+            .from_api
+            .then(|| self.inner.api_jobs.fetch_add(1, Ordering::Relaxed) + 1);
+        pending.push_back(Pending { work, number });
         self.inner.ready.notify_one();
         Ok(position)
     }
@@ -289,7 +325,7 @@ impl Queue {
         {
             let mut pending = self.inner.pending.lock();
             let before = pending.len();
-            pending.retain(|w| w.job.id != id);
+            pending.retain(|p| p.work.job.id != id);
             if before != pending.len() {
                 return true;
             }
@@ -312,12 +348,12 @@ impl Queue {
         let dropped = {
             let mut pending = self.inner.pending.lock();
             let (api, kept): (VecDeque<_>, VecDeque<_>) =
-                pending.drain(..).partition(|w| w.from_api);
+                pending.drain(..).partition(|p| p.work.from_api);
             *pending = kept;
             api
         };
-        for work in &dropped {
-            work.job.cancelled();
+        for pending in &dropped {
+            pending.work.job.cancelled();
         }
         // `pending` released first, as in `cancel`.
         let stopped = match self.inner.running.lock().as_ref() {
@@ -336,6 +372,34 @@ impl Queue {
 
     pub fn running(&self) -> Option<String> {
         self.inner.running.lock().as_ref().map(|r| r.id.clone())
+    }
+
+    /// API jobs, the running one first, then the waiting ones in queue order.
+    pub fn client_jobs(&self) -> Vec<ClientJob> {
+        // `pending` before `running`, never both held: the worker holds `pending`
+        // while it takes `running`. A job taken in between shows up twice and
+        // keeps its running entry.
+        let waiting: Vec<ClientJob> = self
+            .inner
+            .pending
+            .lock()
+            .iter()
+            .filter_map(|p| {
+                p.number.map(|number| ClientJob {
+                    number,
+                    running: false,
+                    progress: p.work.job.progress.lock().clone(),
+                })
+            })
+            .collect();
+        let running = self.inner.running.lock().as_ref().and_then(|r| {
+            r.number.map(|number| ClientJob {
+                number,
+                running: true,
+                progress: r.job.progress.lock().clone(),
+            })
+        });
+        running_first(running, waiting)
     }
 
     /// Have the worker build a new separator and run on it from now on.
@@ -384,7 +448,7 @@ impl Queue {
     /// scan on poll is cheaper than fanning out updates.
     pub fn queued_progress_for(&self, id: &str) -> Option<Progress> {
         let pending = self.inner.pending.lock();
-        let position = pending.iter().position(|w| w.job.id == id)?;
+        let position = pending.iter().position(|p| p.work.job.id == id)?;
         Some(queued_progress(position, pending.len()))
     }
 }
@@ -445,11 +509,13 @@ impl Inner {
             if let Some((track, k)) = self.sessions.next(Priority::Critical) {
                 return Some(Next::Segment(track, k));
             }
-            if let Some(work) = pending.pop_front() {
+            if let Some(Pending { work, number }) = pending.pop_front() {
                 let cancel = Arc::new(AtomicBool::new(false));
                 *self.running.lock() = Some(Running {
                     id: work.job.id.clone(),
                     from_api: work.from_api,
+                    number,
+                    job: Arc::clone(&work.job),
                     cancel: Arc::clone(&cancel),
                 });
                 return Some(Next::Job(Claimed { work, cancel }));
@@ -1904,6 +1970,67 @@ mod session_tests {
     }
 
     #[test]
+    fn a_job_taken_between_the_two_reads_is_listed_once_as_running() {
+        let job = |number, running| ClientJob {
+            number,
+            running,
+            progress: Progress::new(Stage::Queued),
+        };
+        let listed: Vec<(u64, bool)> =
+            running_first(Some(job(1, true)), vec![job(1, false), job(2, false)])
+                .into_iter()
+                .map(|j| (j.number, j.running))
+                .collect();
+        assert_eq!(listed, [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn client_jobs_list_the_running_one_then_the_queue_and_skip_drops() {
+        let _gpu = GPU.lock();
+        let mut toy = Toy::new(SEGMENT, 0.25);
+        toy.delay = Duration::from_millis(20);
+        let queue = start(toy);
+
+        let store = crate::jobs::JobStore::new(Duration::from_secs(60));
+        let submit = |key: &str, from_api: bool| {
+            let job = store.create(key.into());
+            queue
+                .submit(QueuedWork {
+                    job: Arc::clone(&job),
+                    mix: track(40 * 3307, 8),
+                    output: output(StemFormat::Pcm32),
+                    model_id: "toy-00000000".into(),
+                    from_api,
+                })
+                .expect("room");
+            job
+        };
+        let first = submit("first", true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while queue.running().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never took the first job"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        let dropped = submit("dropped", false);
+        let second = submit("second", true);
+
+        let listed: Vec<(u64, bool, Stage)> = queue
+            .client_jobs()
+            .into_iter()
+            .map(|j| (j.number, j.running, j.progress.stage))
+            .collect();
+        assert_eq!(listed.len(), 2, "the drop is listed: {listed:?}");
+        assert_eq!((listed[0].0, listed[0].1), (1, true));
+        assert_eq!(listed[1], (2, false, Stage::Queued));
+        for job in [&first, &dropped, &second] {
+            queue.cancel(&job.id);
+        }
+    }
+
+    #[test]
     fn turning_the_server_off_cancels_api_jobs_and_keeps_drops() {
         let _gpu = GPU.lock();
         let mut toy = Toy::new(SEGMENT, 0.25);
@@ -2055,7 +2182,7 @@ mod session_tests {
             );
             thread::sleep(POLL_INTERVAL);
         }
-        queue.sessions().remove(&first.id);
+        queue.sessions().remove(&first.id, "ended by the client");
         let ran = runs.load(Ordering::SeqCst);
 
         // A new session on the same audio, once the first has gone.

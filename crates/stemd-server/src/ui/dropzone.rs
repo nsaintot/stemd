@@ -28,7 +28,7 @@ const PERCENT_WIDTH: f32 = 38.0;
 const PERCENT_GAP: f32 = 12.0;
 
 /// Seconds the fill takes to catch up with a track's progress.
-const TRACK_EASE: f32 = 0.16;
+pub(super) const TRACK_EASE: f32 = 0.16;
 /// The same for a download, whose byte count arrives in uneven steps.
 const DOWNLOAD_EASE: f32 = 0.6;
 
@@ -121,6 +121,8 @@ pub struct Zone<'a> {
     pub batch: Batch,
     /// Shown in place of the subtitle while set.
     pub note: Option<&'a str>,
+    /// Time left on the current drop, added to its caption.
+    pub left: Option<&'a str>,
     /// Quality is selected: the globe wears its halo.
     pub maxed: bool,
     pub switch: Option<Switch<'a>>,
@@ -185,6 +187,10 @@ impl Zone<'_> {
         } else if let Some(note) = self.note {
             note.to_owned()
         } else if let Some((_, caption)) = &progress {
+            let caption = match self.left.filter(|_| switch.is_none()) {
+                Some(left) => format!("{caption}{}{left}", theme::DOT),
+                None => caption.clone(),
+            };
             if let Some(shown) = self.batch.shown
                 && self.batch.total() > 1
             {
@@ -398,9 +404,7 @@ impl Zone<'_> {
             } else {
                 0.0
             };
-            let shown =
-                ui.ctx()
-                    .animate_value_with_time(ui.id().with(("segment", i)), target, 0.16);
+            let shown = eased_fill(ui.ctx(), ui.id().with(("segment", i)), target, TRACK_EASE);
             if shown > 0.0 {
                 ui.painter().rect_filled(
                     Rect::from_min_size(seg.min, vec2(width * shown, seg.height())),
@@ -506,13 +510,11 @@ pub(super) fn progress_row(
         Stroke::new(1.0, white(0.10)),
     );
 
-    let target = fraction.unwrap_or(0.0).clamp(0.0, 1.0);
-    let shown = Tween::follow(
+    let shown = eased_fill(
         ui.ctx(),
         ui.id().with("progress-fill"),
-        target,
+        fraction.unwrap_or(0.0),
         ease,
-        theme::ease_out,
     );
     let fill = Rect::from_min_size(track.min, vec2(track.width() * shown, BAR_HEIGHT));
     if fill.width() > 0.5 {
@@ -531,6 +533,11 @@ pub(super) fn progress_row(
         theme::font(13.0, Weight::Medium),
         palette.text,
     );
+}
+
+/// A progress fill under `id` easing out to `fraction` over `secs`.
+pub(super) fn eased_fill(ctx: &egui::Context, id: egui::Id, fraction: f32, secs: f32) -> f32 {
+    Tween::follow(ctx, id, fraction.clamp(0.0, 1.0), secs, theme::ease_out)
 }
 
 /// A 60-point band of light sweeping across `lane` every 1.6 seconds, clipped to
@@ -587,5 +594,47 @@ pub fn stage_label(stage: stemd_core::Stage) -> &'static str {
         Stage::Done => "done",
         Stage::Failed => "failed",
         Stage::Cancelled => "stopped",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fill this frame for `fraction`, at window time `time`.
+    fn fill_at(ctx: &egui::Context, time: f64, fraction: f32) -> f32 {
+        let input = egui::RawInput {
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut shown = 0.0;
+        let _ = ctx.run_ui(input, |ui| {
+            shown = eased_fill(ui.ctx(), egui::Id::new("fill"), fraction, TRACK_EASE);
+        });
+        shown
+    }
+
+    #[test]
+    fn a_fill_eases_out_to_each_new_fraction() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            fill_at(&ctx, 0.0, 0.2),
+            0.2,
+            "the first fraction shows as is"
+        );
+        assert_eq!(
+            fill_at(&ctx, 1.0, 0.6),
+            0.2,
+            "a new fraction starts from the old"
+        );
+        let half = fill_at(&ctx, 1.0 + f64::from(TRACK_EASE) / 2.0, 0.6);
+        assert!(half > 0.4 && half < 0.6, "ease-out is past halfway: {half}");
+        assert_eq!(fill_at(&ctx, 1.0 + f64::from(TRACK_EASE), 0.6), 0.6);
+        assert_eq!(
+            fill_at(&ctx, 2.0, 1.4),
+            0.6,
+            "clamped to the end, from the old"
+        );
+        assert_eq!(fill_at(&ctx, 3.0, 1.4), 1.0);
     }
 }

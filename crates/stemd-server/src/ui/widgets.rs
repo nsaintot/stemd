@@ -18,6 +18,91 @@ pub fn fade(ui: &egui::Ui, id: egui::Id, on: bool) -> f32 {
         .animate_bool_with_time(id.with("fade"), on, HOVER_SECS)
 }
 
+/// The bottom of a list panel where its cut row fades out.
+pub fn fade_zone(panel: Rect, row_height: f32) -> Rect {
+    let part = (panel.height() / row_height).fract();
+    let cut = if part < 0.05 { 0.5 } else { part };
+    Rect::from_x_y_ranges(
+        panel.x_range(),
+        panel.bottom() - row_height * cut..=panel.bottom() - 1.0,
+    )
+}
+
+/// Where the next shape painted on `ui`'s layer will go, for [`fade_out`].
+pub fn paint_mark(ui: &egui::Ui) -> egui::layers::ShapeIdx {
+    ui.ctx().graphics_mut(|g| g.entry(ui.layer_id()).next_idx())
+}
+
+/// Fade what `painter`'s layer received since `from` out to invisible across `zone`.
+pub fn fade_out(painter: &egui::Painter, from: egui::layers::ShapeIdx, zone: Rect) {
+    let bands = (zone.height().ceil() as usize).max(2);
+    let above = Rect::everything_above(zone.top());
+    let caught: Vec<egui::epaint::ClippedShape> = painter.ctx().graphics_mut(|g| {
+        let list = g.entry(painter.layer_id());
+        let caught: Vec<(usize, egui::epaint::ClippedShape)> = list
+            .all_entries()
+            .enumerate()
+            .skip(from.0)
+            .filter(|(_, c)| {
+                c.clip_rect.intersects(zone) && c.shape.visual_bounding_rect().intersects(zone)
+            })
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
+        for (i, _) in &caught {
+            list.mutate_shape(egui::layers::ShapeIdx(*i), |c| {
+                c.clip_rect = c.clip_rect.intersect(above);
+            });
+        }
+        caught.into_iter().map(|(_, c)| c).collect()
+    });
+    // Band by band, so shapes keep their order where they overlap.
+    for band in 0..bands {
+        let (a, b) = (band as f32 / bands as f32, (band + 1) as f32 / bands as f32);
+        let strip = Rect::from_x_y_ranges(
+            zone.x_range(),
+            zone.top() + zone.height() * a..=zone.top() + zone.height() * b,
+        );
+        let opacity = fade_at(band, bands);
+        if opacity <= 0.0 {
+            continue;
+        }
+        for shape in &caught {
+            painter
+                .with_clip_rect(shape.clip_rect.intersect(strip))
+                .add(faded(&shape.shape, opacity));
+        }
+    }
+}
+
+/// `shape` at `opacity`. Text takes it as its opacity factor, so its galley
+/// stays shared.
+fn faded(shape: &egui::Shape, opacity: f32) -> egui::Shape {
+    match shape {
+        egui::Shape::Text(text) => {
+            let mut text = text.clone();
+            text.opacity_factor *= opacity;
+            egui::Shape::Text(text)
+        }
+        egui::Shape::Vec(shapes) => {
+            egui::Shape::Vec(shapes.iter().map(|s| faded(s, opacity)).collect())
+        }
+        other => {
+            let mut other = other.clone();
+            egui::epaint::shape_transform::adjust_colors(&mut other, move |colour| {
+                if *colour != egui::Color32::PLACEHOLDER {
+                    *colour = colour.gamma_multiply(opacity);
+                }
+            });
+            other
+        }
+    }
+}
+
+/// Opacity of band `band` of `bands`: 1 on the first, 0 on the last, linear between.
+pub fn fade_at(band: usize, bands: usize) -> f32 {
+    1.0 - band as f32 / (bands.max(2) - 1) as f32
+}
+
 /// How a pill button is drawn.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Pill {
@@ -263,5 +348,26 @@ mod tests {
         assert_eq!(column.add(10.0, 4.0), 0.0);
         assert_eq!(column.add(20.0, 6.0), 14.0);
         assert_eq!(column.height(), 34.0);
+    }
+
+    #[test]
+    fn the_fade_covers_the_part_of_the_cut_row_in_view() {
+        let panel = |rows: f32| Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 40.0 * rows));
+        assert_eq!(
+            fade_zone(panel(2.75), 40.0).y_range(),
+            egui::Rangef::new(80.0, 109.0)
+        );
+        assert_eq!(
+            fade_zone(panel(3.0), 40.0).y_range(),
+            egui::Rangef::new(100.0, 119.0),
+            "whole rows fade over half a row"
+        );
+    }
+
+    #[test]
+    fn the_fade_runs_linearly_from_full_to_nothing() {
+        assert_eq!(fade_at(0, 5), 1.0);
+        assert_eq!(fade_at(2, 5), 0.5);
+        assert_eq!(fade_at(4, 5), 0.0, "the bottom row still shows");
     }
 }

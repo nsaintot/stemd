@@ -109,6 +109,20 @@ pub fn clock(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     );
 }
 
+/// A ring with two bars: idle.
+pub fn pause(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
+    let k = rect.width().min(rect.height()) / 12.0;
+    painter.circle_stroke(rect.center(), 4.6 * k, Stroke::new(width, colour));
+    let origin = rect.center() - vec2(6.0, 6.0) * k;
+    paths(
+        painter,
+        Rect::from_min_size(origin, vec2(12.0, 12.0) * k),
+        12.0,
+        &[&[(5.0, 4.4), (5.0, 7.6)], &[(7.0, 4.4), (7.0, 7.6)]],
+        Stroke::new(width, colour),
+    );
+}
+
 /// A faint ring with a quarter arc running round it, `turn` in revolutions.
 pub fn spinner(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32, turn: f32) {
     let k = rect.width().min(rect.height()) / 12.0;

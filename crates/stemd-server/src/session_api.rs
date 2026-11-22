@@ -230,7 +230,7 @@ async fn open(
     if !body.is_empty()
         && let Err(err) = place(&state, &session, 0, body).await
     {
-        state.queue.sessions().remove(&session.id);
+        state.queue.sessions().remove(&session.id, "upload refused");
         return Err(err);
     }
     state.queue.wake();
@@ -282,7 +282,7 @@ async fn end(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    if !state.queue.sessions().remove(&id) {
+    if !state.queue.sessions().remove(&id, "ended by the client") {
         return Err(ApiError::not_found());
     }
     // Lets the worker drop what the track held on the device.
