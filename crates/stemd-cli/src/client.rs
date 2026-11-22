@@ -20,7 +20,7 @@ pub struct Health {
     pub model: String,
     #[serde(default = "default_rate")]
     pub sample_rate: u32,
-    /// The output a job that names no format, rate or parts gets.
+    /// The output a job gets when it names no format, rate or parts.
     #[serde(default)]
     pub default_output: DefaultOutput,
     #[serde(default = "unbounded")]

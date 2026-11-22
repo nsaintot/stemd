@@ -9,18 +9,15 @@ time.
         --ckpt model_bs_roformer_ep_317_sdr_12.9755.ckpt \\
         --out  models/bs_roformer_viperx.safetensors
 
-**Names are kept verbatim and nothing is transposed.** Both are deliberate.
-The Rust side addresses tensors by name through `weights::Scope`, so a rename
-here would be a rename there for no gain, and it would break the one property
-that makes a conversion checkable: that the file still says what the original
-said. Layout is the loader's business — `Linear` transposes its own weight
-because the rearrangement belongs to the weight, and unlike demucs there is
-nothing else to rearrange, since BS-RoFormer has no convolutions.
+**Names are kept verbatim and nothing is transposed.** The Rust side addresses
+tensors by name through `weights::Scope`, so a renamed tensor would need the
+same rename there. Unchanged names also let a conversion be checked against the
+original. `Linear` transposes its own weight at load, and BS-RoFormer has no
+convolutions, so nothing else needs rearranging.
 
-What this does check is that the tensors are the ones the architecture wants.
-A checkpoint that loads `strict=True` into the reference implementation is one
-whose names and shapes are all accounted for, which is a stronger statement
-than "the file parsed" and costs one model construction.
+The script checks that the tensors are the ones the architecture expects: it
+loads the checkpoint with `strict=True` into the reference implementation,
+which accounts for every name and shape.
 """
 
 import argparse
@@ -38,7 +35,7 @@ def check_against_reference(state, config):
     """Construct the reference model and load `state` into it strictly.
 
     Skipped when the reference implementation is not importable, because it is
-    not on PyPI in a form that loads these weights — the published package grew
+    not on PyPI in a form that loads these weights: the published package grew
     hyper-connections and no longer matches. See tools/eval/roformer_hybrid.py.
     """
     try:
@@ -52,8 +49,8 @@ def check_against_reference(state, config):
     dropped = [k for k in spec["model"] if k not in accepted]
     if dropped:
         raise SystemExit(
-            f"the reference implementation does not accept {dropped} — it is a "
-            "different version from the one these weights were trained with"
+            f"the reference implementation does not accept {dropped}: not the "
+            "version these weights were trained with"
         )
     model = BSRoformer(**{k: v for k, v in spec["model"].items() if k in accepted})
     model.load_state_dict(state, strict=True)

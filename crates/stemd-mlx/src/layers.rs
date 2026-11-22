@@ -190,8 +190,8 @@ impl GroupNorm {
         })
     }
 
-    /// Normalising a group is normalising a last axis, so this uses `layer_norm`. mlx's fused
-    /// `layer_norm` accumulates in full precision.
+    /// Fold each group's channels and extent into one axis and run mlx's fused `layer_norm`,
+    /// which accumulates in full precision.
     // Once the channels and the extent after them are folded into one axis, a group norm equals a
     // layer norm over it. Written out, it takes eleven passes plus two dtype conversions,
     // sixty-four times per forward pass. The affine is applied afterwards, because it is per
@@ -212,19 +212,14 @@ impl GroupNorm {
     }
 }
 
-/// A scalar constant in the same precision as the tensor it will meet.
-///
-/// `Array::from_f32` builds a float32 array, which is not a weak scalar, and mlx promotes, so a
-/// single epsilon inside a normalisation would put the whole network back into full precision one
-/// layer in.
+/// A scalar constant in the dtype of `like`, so it does not promote the tensor it meets to f32.
 pub fn scalar_like(value: f32, like: &Array) -> Result<Array> {
     Ok(Array::from_f32(value).as_dtype(like.dtype())?)
 }
 
-/// `x * (1 + erf(x / sqrt(2))) / 2`, the exact gelu mlx computes.
+/// `x * (1 + erf(x / sqrt(2))) / 2`, the exact gelu mlx computes, kept in the input's dtype.
 ///
-/// It is written out because `nn::gelu` builds its constants as float32 arrays, so a half-precision
-/// activation passed to it comes back float32. It runs inside every `DConv`.
+/// Do not use `nn::gelu`: it returns float32 for a half-precision input.
 pub fn gelu(x: &Array) -> Result<Array> {
     let scaled = ops::divide(x, &scalar_like(std::f32::consts::SQRT_2, x)?)?;
     let gated = ops::add(&scalar_like(1.0, x)?, &ops::erf(&scaled)?)?;

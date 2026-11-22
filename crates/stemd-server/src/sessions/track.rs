@@ -286,8 +286,8 @@ impl Track {
         self.state.lock().closed.clone()
     }
 
-    /// True when piece `k` at `output` can be written: the piece and the context a rate conversion
-    /// needs are ready, and the piece has not been written yet.
+    /// True when piece `k` of the `type_dir` output can be written: the piece, and the context a
+    /// rate conversion needs when `converts` is set, are ready, and the piece has not been written.
     pub fn piece_writable(&self, k: usize, type_dir: &str, converts: bool) -> bool {
         let state = self.state.lock();
         if state.closed.is_some() || state.written.contains(&(type_dir.to_owned(), k)) {

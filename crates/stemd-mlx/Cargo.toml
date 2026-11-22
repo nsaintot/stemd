@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The demucs v4 graph on Apple's MLX. It does not depend on stemd-core: it is a
+# The demucs v4 and BS-RoFormer graphs on MLX. It does not depend on stemd-core: it is a
 # model, and keeping it standalone means its tests need only the weights.
 [dependencies]
 mlx-rs = { version = "0.25", features = ["metal", "safetensors"] }

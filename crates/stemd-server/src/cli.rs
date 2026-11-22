@@ -28,9 +28,10 @@ pub struct Args {
 
     /// Run every model at float32.
     ///
-    /// By default each model runs at the precision that suits it on this backend. Half
-    /// precision is about 1.2x faster and differs from full precision by -54 dB on the
-    /// shipped stems, 20 dB below the model's own residual. Use this flag if half precision
+    /// By default each model runs at the precision that suits it on this backend: float16 on
+    /// Metal, float16 for demucs and float32 for the RoFormer on CUDA, float32 on the CPU. On
+    /// Metal, half precision is about 1.3x faster and differs from full precision by -54 dB on
+    /// the shipped stems, 20 dB below the model's own residual. Use this flag if half precision
     /// sounds wrong on some material.
     #[arg(long)]
     pub full_precision: bool,
@@ -54,10 +55,11 @@ pub struct Args {
     #[arg(long, alias = crate::migrate::PIECES_DIR)]
     pub cache_dir: Option<PathBuf>,
 
-    /// How stems are written when a request does not say: `flac`, `s16le` or `f32le`.
+    /// How stems are written when a request does not say: `flac`, `wav`, `mp3`, `pcm16`
+    /// (`s16le`) or `pcm32` (`f32le`).
     ///
-    /// FLAC carries the same 16-bit samples as `s16le` in roughly half the bytes.
-    /// `f32le` doubles the size and exists for an exact null with no quantisation.
+    /// FLAC carries the same 16-bit samples as `pcm16` in roughly half the bytes.
+    /// `pcm32` doubles the size and exists for an exact null with no quantisation.
     /// Overrides the saved default for this run.
     #[arg(long)]
     pub output_format: Option<String>,
@@ -65,7 +67,7 @@ pub struct Args {
     /// Rate stems are converted to when a request does not say: 24000, 44100,
     /// 48000 or 96000. 44100 is the model's own rate and runs no conversion.
     ///
-    /// Overrides the saved default for this run. Unset uses it.
+    /// Overrides the saved default for this run.
     #[arg(long)]
     pub output_sample_rate: Option<String>,
 
@@ -75,7 +77,6 @@ pub struct Args {
     pub settings: Option<PathBuf>,
 
     /// Jobs that may wait for the worker before submissions are refused with 429.
-    /// Separation runs one job at a time on purpose; see queue/mod.rs.
     #[arg(long, default_value_t = 16)]
     pub queue_depth: usize,
 

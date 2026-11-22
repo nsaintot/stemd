@@ -9,8 +9,8 @@ becomes one test in `crates/stemd-mlx/tests/roformer.rs`.
         --ckpt ...ckpt --config ...yaml --out <fixture dir>
 
 Needs the same three things `tools/eval/roformer_hybrid.py` does; see its
-docstring. Writes about 40 MB at the default length, which is why it takes an
-output directory rather than writing into the repo — the tests read it through
+docstring. Writes about 40 MB at the default length, so it writes to an output
+directory outside the repo. The tests read it through
 `STEMD_MLX_ROFORMER_FIXTURES`.
 
 The input is one second rather than the model's 8-second chunk. BS-RoFormer

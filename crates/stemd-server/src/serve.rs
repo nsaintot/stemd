@@ -170,10 +170,7 @@ async fn limit_body(
         .await
 }
 
-/// Shut down cleanly when the system asks the process to stop.
-///
-/// A signal does not unwind the stack, so no `Drop` runs. Without this, the worker would still be
-/// in the model during teardown, and clients would chase a dead server until its record expired.
+/// Shut down cleanly when the system asks the process to stop; a signal runs no `Drop`.
 fn watch_for_signals(runtime: &tokio::runtime::Runtime, launch: &Arc<Launch>) {
     let launch = Arc::clone(launch);
     runtime.spawn(async move {
@@ -203,11 +200,10 @@ async fn asked_to_stop() -> bool {
     true
 }
 
-/// Windows has no signals; the console control handlers are the equivalent.
+/// Resolve on `ctrl_c` (Ctrl-C, Ctrl-Break), `ctrl_close` (close box) or `ctrl_shutdown`
+/// (system shutdown).
 ///
-/// There are three, because SIGINT and SIGTERM do not map one to one: `ctrl_c` covers Ctrl-C and
-/// Ctrl-Break, `ctrl_close` the console's close box, and `ctrl_shutdown` a system shutdown. Each
-/// runs on a thread the system spawns, which gets a few seconds before the process is killed.
+/// The system kills the process a few seconds after the event.
 #[cfg(windows)]
 async fn asked_to_stop() -> bool {
     let (mut close, mut shutdown) = match (

@@ -1,4 +1,4 @@
-//! demucs v4 on Apple's MLX, in Rust.
+//! demucs v4 and BS-RoFormer on MLX, in Rust, on Metal or CUDA.
 //!
 //! The model is built here layer by layer, because MLX has no equivalent of TorchScript for loading
 //! a traced graph. Every layer can therefore differ from the original, so each stage is nulled

@@ -1,7 +1,7 @@
 """Dump the Python MLX spectrogram for a known input, as a fixture to null against.
 
 Taken from the real loaded model rather than reconstructed from the STFT
-parameters, so the fixture carries demucs's own padding and trimming — the
+parameters, so the fixture carries demucs's own padding and trimming: the
 `_spec` in mlx_htdemucs.py, not a textbook STFT. Those two differ, and the
 difference is exactly the kind of thing a port gets wrong silently.
 """

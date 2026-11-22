@@ -69,8 +69,8 @@ pub fn fetch_one(
     if digest != file.sha256 {
         let _ = std::fs::remove_file(&partial);
         bail!(
-            "{} failed its checksum (expected {}, got {digest}) — the download \
-             was corrupted or the release was replaced",
+            "{} failed its checksum (expected {}, got {digest}): corrupted download \
+             or replaced release",
             file.name,
             file.sha256
         );

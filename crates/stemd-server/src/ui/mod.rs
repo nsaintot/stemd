@@ -232,11 +232,8 @@ impl eframe::App for App {
         false
     }
 
-    /// The window's only shutdown hook.
-    ///
-    /// Cmd-Q goes from `[NSApp terminate:]` to `applicationWillTerminate:` to winit's `LoopExiting`
-    /// to here, and AppKit calls `exit()` as soon as this returns. This is the last chance to make
-    /// the worker leave the model.
+    /// The window's only shutdown hook: makes the worker leave the model before AppKit calls
+    /// `exit()`.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         crate::update::run_installer();
         crate::shutdown::quit(&self.launch, "window closed")
@@ -757,10 +754,8 @@ impl Window {
         frame.response.rect.height()
     }
 
-    /// Hand anything dropped on the window to [`crate::drops`].
-    ///
-    /// Files that do not look like audio are refused here, before any decoding, so dropping a
-    /// folder of artwork gives one clear message instead of one failure per file.
+    /// Hand dropped files to [`crate::drops`], refusing files that do not look like audio before
+    /// any decoding.
     fn take_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -794,10 +789,8 @@ impl Window {
         }
     }
 
-    /// Fold new drops into the batch and fire the start and finish effects.
-    ///
-    /// Reads the drop list directly, so a track chosen with the file picker on
-    /// another thread counts too.
+    /// Fold new drops, including file-picker drops, into the batch and fire the start and finish
+    /// effects.
     fn follow_batch(&mut self, now: f64) {
         let fresh: Vec<Arc<Dropped>> = self
             .state
@@ -833,11 +826,8 @@ impl Window {
         self.batch_running = running;
     }
 
-    /// Let the user choose a track in a file dialog, for a track that is hard to drag.
-    ///
-    /// The system's own dialog runs as a separate program, which keeps this short and off the event
-    /// loop; an in-process panel would need a crate and, on macOS, the main thread. See
-    /// [`choose_files`].
+    /// Let the user choose a track in the system file dialog, run as a separate program off the
+    /// event loop. See [`choose_files`].
     fn pick_a_file(&self) {
         let drops = Arc::clone(&self.state.drops);
         let state = Arc::clone(&self.state);
@@ -890,9 +880,8 @@ fn paths_of(text: &str) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// The type list is `public.audio` plus every accepted extension. `public.audio` alone greys out
-/// `.mp4`, because an MPEG-4 file conforms to `public.movie` even with no video in it, and a drop
-/// accepts it.
+/// The macOS file picker. Its type list is `public.audio` plus every accepted extension, so `.mp4`,
+/// which conforms to `public.movie`, is selectable.
 #[cfg(target_os = "macos")]
 fn picker() -> Option<std::process::Command> {
     let types = std::iter::once("public.audio")

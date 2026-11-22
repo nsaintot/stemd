@@ -1,8 +1,7 @@
 //! Timing measurements for the model and the segmenting around it.
 //!
-//! The Python implementation separates a two-minute track in about 6.7 s, one segment at a time, so
-//! the Rust port has no structural reason to be slower. These tests time the model on one segment
-//! and the segmenting and overlap-add around it separately.
+//! Target: a two-minute track in about 6.7 s, one segment at a time. These tests time the model on
+//! one segment and the segmenting and overlap-add around it separately.
 //!
 //! Ignored by default: they need the weights, and they measure without asserting.
 //! `STEMD_MLX_WEIGHTS=... cargo test --release -p stemd-mlx --test speed --

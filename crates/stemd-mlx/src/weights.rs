@@ -33,11 +33,7 @@ impl Weights {
         self.tensors.len()
     }
 
-    /// The same tensors at another precision.
-    ///
-    /// Casting the weights is enough to move the network to half precision: mlx promotes, so a half
-    /// weight meeting a half activation stays half, and the shape checks are unaffected. It takes a
-    /// [`Precision`] so callers need not name mlx.
+    /// The same tensors at another precision; casting the weights moves the whole network.
     pub fn cast(&self, precision: Precision) -> Result<Self> {
         let dtype = precision.dtype();
         let tensors = self
@@ -101,9 +97,6 @@ impl<'a> Scope<'a> {
     }
 
     /// A tensor, checked against the shape the layer expects.
-    ///
-    /// The check matters most for convolutions: a weight in the wrong layout has the right number
-    /// of elements and the wrong meaning, and the model would run and silently separate nothing.
     pub fn get_shaped(&self, name: &str, shape: &[i32]) -> Result<Array> {
         let array = self.get(name)?;
         if array.shape() != shape {

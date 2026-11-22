@@ -528,8 +528,8 @@ fn a_running_job_stops_between_segments() {
 
 #[test]
 fn an_abandoned_track_does_not_hold_up_the_one_cued_behind_it() {
-    // Separation runs one job at a time, so without cancelling the running job, a deck that skips a
-    // track would wait for a full separation of the skipped track.
+    // Separation runs one job at a time, so without cancelling the running job, a player that
+    // skips a track would wait for a full separation of the skipped track.
     let state = shared();
     let queue = start(
         Segmented {

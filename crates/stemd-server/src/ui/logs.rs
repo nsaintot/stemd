@@ -203,14 +203,14 @@ fn level_menu(ui: &mut egui::Ui, palette: &Palette, view: &mut View) {
 
 /// The buffered lines that pass the level and text filters.
 fn visible_lines(view: &View, lines: &[LogLine]) -> Vec<LogLine> {
-    let needle = view.filter.to_lowercase();
+    let query = view.filter.to_lowercase();
     lines
         .iter()
         .filter(|l| view.min_level.admits(&l.level))
         .filter(|l| {
-            needle.is_empty()
-                || l.message.to_lowercase().contains(&needle)
-                || l.target.to_lowercase().contains(&needle)
+            query.is_empty()
+                || l.message.to_lowercase().contains(&query)
+                || l.target.to_lowercase().contains(&query)
         })
         .cloned()
         .collect()
@@ -249,9 +249,9 @@ mod tests {
     #[test]
     fn the_text_filter_reads_the_target_as_well_as_the_message() {
         let lines = [line("INFO", "queued a track"), line("INFO", "reaping")];
-        let seeking = |needle: &str| {
+        let seeking = |query: &str| {
             let view = View {
-                filter: needle.to_owned(),
+                filter: query.to_owned(),
                 ..Default::default()
             };
             visible_lines(&view, &lines).len()

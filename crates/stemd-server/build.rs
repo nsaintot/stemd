@@ -46,16 +46,13 @@ fn icon_and_version() {
         .expect("embedding the icon and version resource");
 }
 
-/// Nothing to embed: the resource compiler is a Windows tool, and a build script on another host
-/// has none. This is reached only when cross-compiling to msvc, which this project does not do, so
-/// it prints no warning.
+/// Nothing to embed: the resource compiler is a Windows tool.
 #[cfg(not(windows))]
 fn icon_and_version() {}
 
 /// Every DLL `mlx-sys` delay-loads. The linker keeps the ones this binary imports and reports
-/// `LNK4199` for the others; on MLX v0.31.2, four are kept and thirty-two ignored. Keep the full
-/// list: if a later MLX calls cuBLAS directly, a trimmed list would give it a hard import, and the
-/// release would no longer start without CUDA.
+/// `LNK4199` for the others. Keep the full list: if a later MLX calls cuBLAS directly, a trimmed
+/// list would give it a hard import, and the release would no longer start without CUDA.
 const DELAY_LOADED: &[&str] = &[
     "cublas64_13.dll",
     "cublasLt64_13.dll",

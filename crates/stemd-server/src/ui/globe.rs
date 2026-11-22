@@ -72,8 +72,7 @@ const CLOCK_WRAP: f32 = 280.0;
 
 /// Seconds since the previous frame, measured on egui's clock.
 ///
-/// egui's `stable_dt` reports a fixed 1/60 s after a frame that asked for a
-/// delayed repaint, which runs animations fast on a faster display.
+/// Do not use `stable_dt`: it reports a fixed 1/60 s after a delayed repaint.
 pub fn frame_dt(ctx: &egui::Context) -> f32 {
     let id = egui::Id::new("stemd-frame-dt");
     let now = ctx.input(|i| i.time);

@@ -33,6 +33,7 @@ pub(crate) struct Health {
     /// not cover precision or overlap, which change the audio and are part of the server's own
     /// cache key.
     model_id: String,
+    /// The jobs the server keeps, finished or running.
     completed_jobs: usize,
     queue_depth: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

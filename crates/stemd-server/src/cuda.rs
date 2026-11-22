@@ -105,11 +105,10 @@ pub fn beside_the_executable() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// Fetch every component and put its libraries next to the executable. The ordinary DLL search
-/// order checks that directory first, and the probe and the delay-load helper look there.
+/// Fetch every component and put its libraries in `into`, the executable's directory, which the
+/// DLL search order checks first.
 ///
-/// `on_progress` is called with `(component, bytes_done, bytes_total)`, the same
-/// shape the model download reports, so one progress bar serves both.
+/// `on_progress` is called with `(component, bytes_done, bytes_total)`.
 pub fn install(into: &Path, mut on_progress: impl FnMut(&str, u64, u64)) -> Result<usize> {
     if !into.is_dir() {
         bail!("{} is not a directory", into.display());
@@ -224,9 +223,7 @@ fn writable(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The two hosts a component may come from. They are defined here because the URLs in
-    /// [`COMPONENTS`] are written out in full: `concat!` takes only literals, and a prefix used
-    /// only by the assertion below would be dead code in every real build.
+    /// The two hosts a component may come from.
     const CUDA: &str = "https://developer.download.nvidia.com/compute/cuda/redist/";
     const CUDNN: &str = "https://developer.download.nvidia.com/compute/cudnn/redist/";
 

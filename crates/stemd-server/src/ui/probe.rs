@@ -10,10 +10,7 @@ fn screen() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(560.0, 600.0))
 }
 
-/// A context with the window's fonts and style in place.
-///
-/// Fonts are bound at the start of the frame after they are set, and the
-/// weighted families do not exist before that, so this runs one empty frame.
+/// A context with the window's fonts and style installed, then bound by one empty frame.
 fn themed() -> egui::Context {
     let ctx = egui::Context::default();
     frame(&ctx, None, false, |_| {});
@@ -106,10 +103,7 @@ fn a_short_log_stays_short() {
     );
 }
 
-/// Text drawn outside the region it is clipped to, with its content.
-///
-/// A string placed in a region too small for it renders as ribbons and raises no error; comparing
-/// each galley's rect with its clip rect catches it.
+/// Text whose galley is taller than its clip rect, as `(content, overflow in points)`.
 fn clipped_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
     fn walk(shape: &egui::epaint::Shape, clip: egui::Rect, out: &mut Vec<(String, f32)>) {
         match shape {
@@ -467,10 +461,6 @@ fn the_quit_confirmation_offers_both_answers() {
 }
 
 /// The height the separated list takes in the layout, given `rows` finished drops.
-///
-/// The tests check the layout height, because the window measures the sections panel and resizes
-/// itself by the difference: a list that reports twelve rows grows the window whether or not it
-/// paints them.
 fn recents_height(rows: usize) -> f32 {
     let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);

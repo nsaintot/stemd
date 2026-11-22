@@ -30,7 +30,7 @@ pub enum Class {
 /// first.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Region {
-    /// Track sample the region is centred on, such as the needle or a cue.
+    /// Track sample the region is centred on, such as the playhead or a cue.
     pub at: usize,
     #[serde(default)]
     pub ahead: usize,

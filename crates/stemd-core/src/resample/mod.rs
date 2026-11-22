@@ -72,10 +72,8 @@ impl DspMode {
         }
     }
 
-    /// The numbered mode that covers exactly this conversion, if any.
-    ///
-    /// It lets the server tell a client that a matching filter exists for the pair without choosing
-    /// that filter for it: most callers do not want it, and those that do must ask.
+    /// The numbered mode that covers exactly this conversion, if any. The server reports it to
+    /// clients and never selects it.
     pub fn for_pair(from: u32, to: u32) -> Option<Self> {
         Self::ALL
             .into_iter()

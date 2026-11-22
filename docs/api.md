@@ -28,8 +28,8 @@ GET    /v2/logs                                    recent log lines
 ```
 
 - **Jobs** separate a whole track and return finished stems.
-- **Sessions** separate a track in pieces around a playhead, for a deck that
-  plays before the separation ends.
+- **Sessions** separate a track in pieces around a playhead, for a player that
+  starts before the separation ends.
 - **Separations** tell a client what is already stored, by track id, before it
   uploads anything.
 
@@ -42,10 +42,13 @@ The reference client is [stemd-cli](../crates/stemd-cli/src/main.rs).
 An error body is JSON:
 
 ```json
-{"error": "no filter 3fa4…; upload it with PUT /v2/filters/3fa4…", "code": "unknown_filter"}
+{
+  "error": "no filter 3fa4…; upload it with PUT /v2/filters/3fa4…",
+  "code": "unknown_filter"
+}
 ```
 
-`code` is present only on errors that a client acts on:
+Errors a client can act on carry a `code`:
 
 | `code` | Status | The client |
 | --- | --- | --- |
@@ -53,30 +56,55 @@ An error body is JSON:
 | `unknown_separation` | `404` | opens a session and uploads, or submits a job |
 | `protocol_1` | `410` | uses `/v2/sessions`: sessions are on `/v2` only |
 
-A malformed query or JSON body gets a plain-text `400`, `415` or `422`; a
-malformed window gets a JSON `400`. Every route, `/v2/health` included, answers
-`503` while the server is switched off in its window.
+A malformed query or JSON body gets a plain-text `400`, `415` or `422`, and a
+body over the upload limit a plain-text `413`. A malformed window gets a JSON
+`400`. While the server is off, **every** route answers `503`.
 
 ### Health
 
 `GET /v2/health`:
 
 ```json
-{"version": "0.2.1", "backend": "mlx", "model": "htdemucs", "device": "gpu",
- "sample_rate": 44100, "channels": 2, "preset": "Fast",
- "model_id": "htdemucs-22c7f2c9",
- "completed_jobs": 0, "queue_depth": 0,
- "cached_tracks": 0, "cached_bytes": 0, "cache_max_bytes": 8000000000,
- "max_track_seconds": 600.0,
- "output_sample_rates": [24000, 44100, 48000, 96000],
- "dsp_modes": [0, 1], "dsp_mode_pairs": {"1": [44100, 96000]},
- "parts": ["harmonics", "vocals", "drums", "bass", "other"],
- "default_output": {"format": "flac", "sample_rate": 44100,
-                    "parts": ["harmonics", "vocals"], "derived": "drums"},
- "features": [],
- "segment_run_seconds": 0.41,
- "session": {"methods": {"partial": {"requires": ["mean", "std"], "optional": ["peak"]},
-                         "whole": {"requires": [], "optional": ["peak"]}}}}
+{
+  "version": "0.3.0",
+  "backend": "mlx",
+  "model": "htdemucs",
+  "device": "gpu",
+  "sample_rate": 44100,
+  "channels": 2,
+  "preset": "Fast",
+  "model_id": "htdemucs-22c7f2c9",
+  "completed_jobs": 0,
+  "queue_depth": 0,
+  "cached_tracks": 0,
+  "cached_bytes": 0,
+  "cache_max_bytes": 8000000000,
+  "max_track_seconds": 600.0,
+  "output_sample_rates": [24000, 44100, 48000, 96000],
+  "dsp_modes": [0, 1],
+  "dsp_mode_pairs": {"1": [44100, 96000]},
+  "parts": ["harmonics", "vocals", "drums", "bass", "other"],
+  "default_output": {
+    "format": "flac",
+    "sample_rate": 44100,
+    "parts": ["harmonics", "vocals"],
+    "derived": "drums"
+  },
+  "features": [],
+  "segment_run_seconds": 0.41,
+  "session": {
+    "methods": {
+      "partial": {
+        "requires": ["mean", "std"],
+        "optional": ["peak"]
+      },
+      "whole": {
+        "requires": [],
+        "optional": ["peak"]
+      }
+    }
+  }
+}
 ```
 
 | Field | |
@@ -84,7 +112,7 @@ malformed window gets a JSON `400`. Every route, `/v2/health` included, answers
 | `sample_rate`, `channels` | The model's rate and channel count. Positions in sessions are samples at this rate. |
 | `preset` | `Fast`, `Balanced` or `Quality`; absent for a custom model. |
 | `model_id` | The model that produced the stems. Key a cache on it; see [Identifiers](#identifiers). |
-| `completed_jobs` | The number of jobs the server still answers for, finished or not. |
+| `completed_jobs` | The jobs the server keeps, finished or running. |
 | `running_job` | The id of the job running now; absent when the server is idle. |
 | `cached_tracks`, `cached_bytes`, `cache_max_bytes` | The tracks and bytes the [cache](#cache) holds on disk, and its byte cap. |
 | `max_track_seconds` | The longest track the server accepts. A longer track gets `413`. |
@@ -96,16 +124,18 @@ malformed window gets a JSON `400`. Every route, `/v2/health` included, answers
 | `segment_run_seconds` | The median time in seconds that the loaded model took per segment, over the last 16 segments. It is `null` until a segment has run, and again after a model switch. |
 | `session` | The [upload methods](#upload-methods) a session accepts; `null` when the model cannot run segment by segment. |
 
-Read `/v2/health` again after a model switch: `model_id`, `preset`,
-`segment_run_seconds` and `session` change with the model.
-
 ### The output block
 
 Job results, session views and lookups describe their stems with the same block:
 
 ```json
-"output": {"format": "flac", "sample_rate": 44100, "gain": 0.7071068,
-           "parts": ["harmonics", "vocals"], "derived": "drums"}
+"output": {
+  "format": "flac",
+  "sample_rate": 44100,
+  "gain": 0.7071068,
+  "parts": ["harmonics", "vocals"],
+  "derived": "drums"
+}
 ```
 
 | Field | |
@@ -122,7 +152,7 @@ The server keeps every separation from jobs, sessions and window drops in one
 cache that survives restarts, keyed by model, output and track id. A job finds
 the stems a session stored, and a session finds the stems a job stored.
 
-| A track is | |
+| Track state | |
 | --- | --- |
 | in use | played by an open session, or part of a job result with a stem that was not fetched within `--unfetched-ttl` (300 s) of the job ending or of the last fetch |
 | whole | every stem is stored as one file |
@@ -172,14 +202,14 @@ audio share an id.
 
 ### File key
 
-Computing the track id needs the whole file decoded. A file key finds a track
+The track id needs the whole file decoded. A file key finds a track
 without decoding: the client derives it from the encoded file, for example from
 its size, its decoded length and a sample of its bytes. The server never
 computes it; it only stores and matches it.
 
 - Send `file=<key>` on `POST /v2/sessions` or `POST /v2/jobs`. Once the server
   has hashed the whole upload, it records `key → track id` and persists the
-  mapping with the stored stems.
+  mapping with the stored stems. A join records no key.
 - `GET /v2/separations?file=<key>&<output>` then answers like a lookup by that
   track id, and includes `track`.
 - When a key arrives with a second, different track id, it becomes ambiguous:
@@ -239,7 +269,7 @@ a session refuses it.
 - `pcm32` has headroom: its gain is always `1.0`. In a 16-bit format, a sample
   that is still past full scale after the gain is clipped and counted in
   `x-stemd-clipped`.
-- `mp3` suits stems that someone imports or archives. A deck should not use it:
+- Use `mp3` for stems to import or archive. A player should not use it:
   moving a fader unmasks the coding noise, and lossy parts do not sum to the
   mix. `mp3` goes up to 48 kHz (`96000` with `mp3` gets `400`), and sessions
   refuse it.
@@ -309,18 +339,44 @@ POST /v2/jobs?sample_rate=44100&channels=2&format=s16le     body: the whole trac
 
 ```json
 GET /v2/jobs/{id}
-{"id": "a8e29ff15c16-1",
- "progress": {"stage": "done", "completed": 12, "total": 12, "fraction": 1.0, "detail": null},
- "result": {
-   "output": {"format": "flac", "sample_rate": 44100,
-              "parts": ["harmonics", "vocals"], "derived": "drums"},
-   "channels": 2, "frames": 1323000,
-   "stems": [{"name": "harmonics", "url": "/v2/jobs/a8e29ff15c16-1/stems/harmonics",
-              "bytes": 2216440, "gain": 0.7255},
-             {"name": "vocals", "url": "/v2/jobs/a8e29ff15c16-1/stems/vocals",
-              "bytes": 1120333, "gain": 0.7255}],
-   "model_residual_db": -35.2, "separation_secs": 1.39, "realtime_factor": 21.6,
-   "cached": false}}
+{
+  "id": "a8e29ff15c16-1",
+  "progress": {
+    "stage": "done",
+    "completed": 12,
+    "total": 12,
+    "fraction": 1.0,
+    "detail": null
+  },
+  "result": {
+    "output": {
+      "format": "flac",
+      "sample_rate": 44100,
+      "parts": ["harmonics", "vocals"],
+      "derived": "drums"
+    },
+    "channels": 2,
+    "frames": 1323000,
+    "stems": [
+      {
+        "name": "harmonics",
+        "url": "/v2/jobs/a8e29ff15c16-1/stems/harmonics",
+        "bytes": 2216440,
+        "gain": 0.7255
+      },
+      {
+        "name": "vocals",
+        "url": "/v2/jobs/a8e29ff15c16-1/stems/vocals",
+        "bytes": 1120333,
+        "gain": 0.7255
+      }
+    ],
+    "model_residual_db": -35.2,
+    "separation_secs": 1.39,
+    "realtime_factor": 21.6,
+    "cached": false
+  }
+}
 ```
 
 - `stage` goes through `queued`, `analysing`, `separating`, `reconstructing` and
@@ -336,9 +392,10 @@ GET /v2/jobs/{id}
   It is around −30 dB on `Fast`, where the residual ends up in the rebuilt
   `drums`, and about −160 dB on `Balanced` and `Quality`, which build one part
   as the remainder. Do not compare it across presets.
-- `separation_secs` is the time taken by the run that made the stems; for a
-  cached answer, that run was an earlier one. For stems a session stored,
-  `separation_secs` is `0` and `model_residual_db` is `null`.
+- `separation_secs` is how long the separation took. A cached answer reports
+  the earlier separation. For stems a session stored,
+  `separation_secs` is `0`, `realtime_factor` is `0` and `model_residual_db` is
+  `null`.
 
 ### Download and release
 
@@ -351,10 +408,11 @@ GET /v2/jobs/{id}
 | `409` | The job has not finished. |
 | `410` | The stems were evicted from the cache; submit the job again. |
 
-`DELETE /v2/jobs/{id}` releases the job (`204`). The last client to release a
-running job cancels it. A finished job answers for `--unfetched-ttl` (300 s)
-after it ended or after its last stem fetch, and answers `404` after that;
-submitting the track again finds the stems in the cache.
+`DELETE /v2/jobs/{id}` releases the job (`204`), or answers `404` for an unknown
+job. The last client to release a
+running job cancels it. A finished job stays for `--unfetched-ttl` (300 s)
+after it ends or after its last stem fetch. Then it answers `404`. Submitting
+the track again finds the stems in the cache.
 
 A finished job also stores its stems for [lookups](#separations) and sessions on
 the same track.
@@ -402,7 +460,7 @@ and does not compensate any delay. `B` is at most 1024 and `n` at most
 1,048,576.
 
 - A malformed file, or a file whose hash is not `<id>`, gets `400`; an oversized
-  file gets `413`.
+  file gets a plain-text `413`.
 - The server keeps 64 filters across restarts and evicts the least recently used
   one. A job naming an evicted filter gets `404 unknown_filter`.
 - A job with `dsp_filter` must ask for exactly the filter's rate pair, and may
@@ -410,7 +468,7 @@ and does not compensate any delay. `B` is at most 1024 and `n` at most
 
 ## Sessions
 
-A session separates one track segment by segment, in the order its window asks.
+A session separates one track segment by segment, in the order its window asks for.
 Positions are samples at the model's rate.
 
 ```text
@@ -489,14 +547,14 @@ parameter; a value whose definition changes gets a new name. A client:
 
 ### Gain
 
-A session has one gain, fixed when it opens: 3 dB over `peak`, or over full
-scale when the open sends no `peak`.
+A session's gain is set when it opens. It leaves 3 dB of headroom above
+`peak`, or above full scale without `peak`.
 
 ```text
 gain = 1 / (peak × √2)   when that is below 1, else 1      (pcm32: always 1)
 ```
 
-Without `peak` a 16-bit session ships at `0.7071068`. A stem that still passes
+Without `peak` a 16-bit session ships at `0.7071068`. A stem that still exceeds
 full scale is clipped, and `x-stemd-clipped` counts the samples.
 
 ### Upload
@@ -517,9 +575,12 @@ closed session gets `410`.
 PUT /v2/sessions/{id}/window
 Content-Type: application/json
 
-{"regions": [
-  {"at": 661500,  "ahead": 705600, "behind": 88200, "priority": 0},
-  {"at": 2205000, "ahead": 352800, "priority": 60}]}
+{
+  "regions": [
+    {"at": 661500,  "ahead": 705600, "behind": 88200, "priority": 0},
+    {"at": 2205000, "ahead": 352800, "priority": 60}
+  ]
+}
 ```
 
 A region asks for the segments covering `at − behind .. at + ahead`. `at` and
@@ -535,18 +596,17 @@ to 32 regions, and `{"regions": []}` asks for nothing.
   where a distance behind `at` counts twice. The same order holds across
   sessions; on a tie, the session served longest ago goes first.
 - A window replaces this session's regions only. The server never moves a
-  region: send a new window when the needle or the cues move.
+  region: send a new window when the playhead or the cues move.
 - A new window lets the running segment finish. A segment that has already run
   or is stored does not run again.
 
 The answer is the [view](#view). A malformed body, a priority over 99 or more
 than 32 regions gets `400`; a closed session gets `410`.
 
-To have audio ready where the needle will be, lead it by the time two segments
-take:
+Set `at` ahead of the playhead by the time two segments take:
 
 ```text
-at = needle + (w + 2 × segment_run_seconds) × play rate × sample_rate
+at = playhead + (w + 2 × segment_run_seconds) × play rate × sample_rate
 w  = 0 when the worker is idle, else up to one segment_run_seconds
 ```
 
@@ -554,19 +614,49 @@ w  = 0 when the worker is idle, else up to one segment_run_seconds
 
 ```json
 GET /v2/sessions/{id}
-{"id": "s1-0a1b2c3d", "state": "open", "rev": 7212845571041349902,
- "track": {"id": "f9c29cbfe3466b674f9903d9", "frames": 13230000,
-           "sample_rate": 44100, "channels": 2},
- "output": {"format": "flac", "sample_rate": 96000, "gain": 0.7071068,
-            "parts": ["harmonics", "vocals"], "derived": "drums"},
- "grid": {"segment_frames": 343980, "stride_frames": 257985, "segments": 52,
-          "segment_run_seconds": 0.41},
- "arrived": [[0, 13230000]],
- "ready": [[0, 1031940]],
- "stems": [
-   {"name": "harmonics", "sources": 6, "stored": "whole", "bytes": 28114522},
-   {"name": "vocals", "sources": 8, "stored": "pieces", "pieces": [[0, 4], [7, 9]]}],
- "complete": false, "planned": 6, "idle_timeout_secs": 30}
+{
+  "id": "s1-0a1b2c3d",
+  "state": "open",
+  "rev": 7212845571041349902,
+  "track": {
+    "id": "f9c29cbfe3466b674f9903d9",
+    "frames": 13230000,
+    "sample_rate": 44100,
+    "channels": 2
+  },
+  "output": {
+    "format": "flac",
+    "sample_rate": 96000,
+    "gain": 0.7071068,
+    "parts": ["harmonics", "vocals"],
+    "derived": "drums"
+  },
+  "grid": {
+    "segment_frames": 343980,
+    "stride_frames": 257985,
+    "segments": 52,
+    "segment_run_seconds": 0.41
+  },
+  "arrived": [[0, 13230000]],
+  "ready": [[0, 1031940]],
+  "stems": [
+    {
+      "name": "harmonics",
+      "sources": 6,
+      "stored": "whole",
+      "bytes": 28114522
+    },
+    {
+      "name": "vocals",
+      "sources": 8,
+      "stored": "pieces",
+      "pieces": [[0, 4], [7, 9]]
+    }
+  ],
+  "complete": false,
+  "planned": 6,
+  "idle_timeout_secs": 30
+}
 ```
 
 | Field | |
@@ -619,8 +709,7 @@ is in the session's `output_format`, at the output rate.
 | `404` | The session does not exist. |
 | `409` | A sample is neither ready nor stored, the range is empty or past the end, the stem is not served, or the session is closed. |
 
-- The server reads a range from memory where it is ready there, and from stored
-  files elsewhere. At the model's rate both give the same samples. At another
+- The server reads ready samples from memory and the rest from stored files. At the model's rate both give the same samples. At another
   rate, about 1 sample in 10,000 can differ by 1 LSB, since each stored piece
   was converted on its own.
 - The first read of a whole stem stores it as one file; later reads send that
@@ -682,21 +771,42 @@ instead, and answers `404 unknown_separation` for a key that the server has not
 recorded or has found ambiguous.
 
 ```json
-{"track": "f9c29cbfe3466b674f9903d9", "model_id": "htdemucs-22c7f2c9",
- "frames": 13230000, "sample_rate": 44100, "channels": 2,
- "output": {"format": "flac", "sample_rate": 96000, "gain": 0.7071068,
-            "parts": ["harmonics", "vocals"], "derived": "drums"},
- "state": "stored",
- "stems": [
-   {"name": "harmonics", "sources": 6, "stored": "whole", "bytes": 28114522},
-   {"name": "vocals", "sources": 8, "stored": "whole", "bytes": 9120333}]}
+{
+  "track": "f9c29cbfe3466b674f9903d9",
+  "model_id": "htdemucs-22c7f2c9",
+  "frames": 13230000,
+  "sample_rate": 44100,
+  "channels": 2,
+  "output": {
+    "format": "flac",
+    "sample_rate": 96000,
+    "gain": 0.7071068,
+    "parts": ["harmonics", "vocals"],
+    "derived": "drums"
+  },
+  "state": "stored",
+  "stems": [
+    {
+      "name": "harmonics",
+      "sources": 6,
+      "stored": "whole",
+      "bytes": 28114522
+    },
+    {
+      "name": "vocals",
+      "sources": 8,
+      "stored": "whole",
+      "bytes": 9120333
+    }
+  ]
+}
 ```
 
 | `state` | The server holds | The client |
 | --- | --- | --- |
 | `stored` | every stem whole | fetches the stems or the bundle |
 | `derivable` | every stem whole in another 16-bit container, or in `pcm32` at the default gain; `from` is that output block | fetches the stems; the server converts them once, stores the result and sends it |
-| `consolidating` | every piece; whole files are being written | asks again shortly, or joins with a session |
+| `consolidating` | every piece; whole files are being written | asks again shortly, or opens a session with `track=<id>` |
 | `separating` | a job for this output is running; `job` is its id | posts `/v2/jobs/<job>/join`, follows the job, fetches its stems when it is done and deletes it when leaving; on 404, 410, `failed` or `cancelled`, looks up again |
 | `open` | the mix, held by an open session | opens a session with `track=<id>` |
 | `partial` | some pieces or whole files | opens a session with `track=<id>` and uploads |
@@ -707,8 +817,8 @@ recorded or has found ambiguous.
 - `output.gain` is the gain the stems were stored at; a lookup matches stems at
   any gain. It is absent for `open` and `separating`.
 - For `derivable`, every `stems[].stored` is `none`.
-- When writing a track's whole files fails, the track reads as `partial`, and
-  the server retries after 10 minutes.
+- If writing the whole files fails, lookups report `partial`. The server
+  retries after 10 minutes.
 
 ### Stems and bundle
 
@@ -720,7 +830,7 @@ GET /v2/separations/<track id>/bundle?<output parameters>
 Both routes answer `200` when the state is `stored` or `derivable`, `409` in any
 other state, `404 unknown_separation` when nothing is held, and `410` when the
 stems are evicted during the request, in which case the client asks again. A
-stem carries the [read headers](#read). A bundle carries `x-stemd-frames` and
+stem that the output does not serve gets `404` without a `code`. A stem carries the [read headers](#read). A bundle carries `x-stemd-frames` and
 has the content type `application/octet-stream`.
 
 A bundle is an index followed by each stem's file, back to back, with the same
@@ -749,7 +859,7 @@ bytes that `/stems/<name>` sends. All fields are little-endian:
 
 A player skips an entry whose `sources` holds a bit it does not know.
 
-## A deck loading a track
+## A player loading a track
 
 1. Compute the [file key](#file-key). If the client's own cache holds this
    `model_id`, key and output, stop here.
@@ -759,7 +869,7 @@ A player skips an entry whose `sources` holds a bit it does not know.
    `track=<track>` and `file=<key>`, and upload the whole track with `PUT /pcm`.
 3. Otherwise, open a session with `file=<key>` and an upload method that
    `/v2/health` allows, send a window, long-poll the view, and read ranges near
-   the needle.
+   the playhead.
 4. When the view says `complete`, fetch each stem whole, or the bundle once the
    lookup says `stored`. Store the bytes as they are, keyed on `model_id`, the
    track id, the format and the rate. End the session.
@@ -771,7 +881,7 @@ Store the shipped parts losslessly and rebuild the derived one on playback.
 The server advertises `_stemd._tcp` over mDNS:
 
 ```
-features=  model=htdemucs  path=/v2  v=2  version=0.2.1
+features=  model=htdemucs  path=/v2  v=2  version=0.3.0
 ```
 
 | Entry | |
@@ -785,7 +895,7 @@ features=  model=htdemucs  path=/v2  v=2  version=0.2.1
 | Protocol | Path | Servers |
 | --- | --- | --- |
 | 1 | `/v1` | 0.2.0 and earlier; deprecated, served beside protocol 2 |
-| 2 | `/v2` | 0.2.1 and later |
+| 2 | `/v2` | 0.3.0 and later |
 
 Any change to a route, a field or a default in this document needs protocol 3.
 

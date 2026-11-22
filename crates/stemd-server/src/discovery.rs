@@ -24,9 +24,8 @@ const SERVICE_TYPE: &str = "_stemd._tcp";
 
 /// Holds the registration. Call [`Advertiser::withdraw`] before exiting.
 ///
-/// `Drop` alone is not enough: a macOS Cmd-Q terminates without unwinding, a
-/// signal does not unwind, and [`crate::shutdown::now`] leaves through `_exit`, so
-/// destructors never run. `Drop` is the backstop.
+/// `Drop` also withdraws, but does not run on a macOS Cmd-Q, on a signal, or after
+/// [`crate::shutdown::now`], which exits through `_exit`.
 pub struct Advertiser {
     registration: backend::Registration,
     /// The fully qualified name the system granted on the network, which can differ from the name
@@ -126,21 +125,15 @@ fn full_name(instance: &str) -> String {
     format!("{instance}.{SERVICE_TYPE}.local")
 }
 
-/// True when two instance names refer to the same service.
-///
-/// On Windows, this tells a granted name apart from a rename after a collision. DNS names are
-/// case-insensitive and the root dot is optional, so neither difference counts as a rename.
+/// True when two instance names refer to the same service, ignoring case and a trailing root dot.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn same_name(a: &str, b: &str) -> bool {
     a.trim_end_matches('.')
         .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
 
-/// Non-loopback IPv4 interfaces, as `(name, address)`.
-///
-/// Diagnostics on macOS and Linux: Bonjour picks the interfaces itself. On
-/// Windows the first of these also becomes the advertised A record; see
-/// [`backend::register`] there.
+/// Non-loopback IPv4 interfaces, as `(name, address)`. On Windows the first one is the advertised
+/// A record.
 fn local_addrs() -> Vec<(String, IpAddr)> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -267,18 +260,14 @@ mod backend {
     }
 
     impl Registration {
-        /// Always `None`: Bonjour reports the granted name to the registration callback, and this
-        /// passes a null callback to avoid pumping a run loop for the life of the process. The
-        /// caller falls back to the name it asked for.
+        /// Always `None`: registration passes no callback, so the caller uses the name it asked
+        /// for.
         pub fn granted_name(&self) -> Option<String> {
             None
         }
 
-        /// Deallocating the ref closes the connection to the responder, which sends the
-        /// goodbye packet.
-        ///
-        /// Always [`super::Withdrawal::Done`]: the call returns nothing and cannot fail. The
-        /// three-way answer is for Windows.
+        /// Deallocate the ref, which makes the responder send the goodbye packet. Always returns
+        /// [`super::Withdrawal::Done`].
         pub fn withdraw(&self) -> super::Withdrawal {
             // SAFETY: called at most once, guarded by `Advertiser::withdrawn`.
             unsafe { DNSServiceRefDeallocate(self.sd_ref) };
@@ -395,7 +384,7 @@ mod backend {
     }
 
     impl Completion {
-        /// What was reported, or `None` if nothing was within `patience`.
+        /// What the system reported, or `None` if nothing arrived within `patience`.
         fn wait(&self, patience: Duration) -> Option<Outcome> {
             let guard = self.outcome.lock().ok()?;
             let (guard, timeout) = self
@@ -618,9 +607,8 @@ mod backend {
             }
         }
 
-        /// Deregistering is asynchronous too, and takes a request structure that describes the
-        /// instance, so this builds a second request around the registered instance, with its own
-        /// rendezvous, and leaves the registration's request untouched.
+        /// Withdraw through a second request built around the registered instance, with its own
+        /// rendezvous.
         pub fn withdraw(&self) -> super::Withdrawal {
             let completion = Arc::new(Completion::default());
             let request = Box::into_raw(Box::new(RegisterRequest {

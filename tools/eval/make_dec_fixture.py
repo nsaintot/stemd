@@ -1,8 +1,8 @@
 """Dump a decoder step from each branch, with its skip connection.
 
-The decoder returns two things — the layer output and the value from before the
-transposed convolution, which the time branch injects into — and both matter, so
-both are dumped.
+The decoder returns two things: the layer output, and the value from before the
+transposed convolution, which the time branch injects into. Both matter, so both
+are dumped.
 """
 from pathlib import Path
 import mlx.core as mx

@@ -7,11 +7,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-/// Bind the port before [`crate::startup::prepare`] loads the model, so a port in use fails in
-/// milliseconds.
-///
-/// The listener is set non-blocking here, because tokio requires that of a listener adopted from
-/// std.
+/// Bind `addr` non-blocking, before [`crate::startup::prepare`] loads the model, so a port in use
+/// fails fast.
 pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     listener

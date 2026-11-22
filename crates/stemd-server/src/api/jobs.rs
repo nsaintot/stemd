@@ -21,10 +21,8 @@ use crate::state::{AppState, Refused};
 use super::error::ApiError;
 use super::params::{CreateParams, Submission};
 
-/// Decode the upload to planar float at the model's rate, off the async runtime.
-///
-/// An upload at another rate is converted here with the general resampler. A filter that a client
-/// names applies only to the output stems; the model consumes the mix and never returns it.
+/// Decode the upload to planar float at the model's rate, off the async runtime, with the general
+/// resampler.
 pub(super) async fn decode_upload(body: Bytes, submission: Submission) -> Result<Audio, ApiError> {
     let model_rate = submission.model_rate;
     let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Audio> {
@@ -211,7 +209,7 @@ pub(crate) async fn delete_job(
 ) -> Result<Response, ApiError> {
     let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
 
-    // Two decks can share one job, so only the last waiter's `DELETE` stops the work.
+    // Two clients can share one job, so only the last waiter's `DELETE` stops the work.
     let remaining = job.release();
     if remaining > 0 {
         tracing::debug!(job = %id, "released, {remaining} waiter(s) still want it");

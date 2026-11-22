@@ -43,8 +43,7 @@ fn sin_embedding(length: i32, dim: i32) -> Result<Array> {
 /// Two-dimensional sinusoidal position: `[1, d_model, height, width]`.
 ///
 /// Half the channels encode width and half encode height, and within each half
-/// sine and cosine alternate channel by channel. A version that concatenated the halves would have
-/// the right shape and the wrong meaning.
+/// sine and cosine alternate channel by channel.
 fn sin_embedding_2d(d_model: i32, height: i32, width: i32) -> Result<Array> {
     let half = d_model / 2;
     let terms = half / 2;
@@ -158,9 +157,7 @@ impl LayerScale {
 struct Linear {
     /// Held as `[chin, chout]`, the transpose of the artefact's `[out, in]`.
     ///
-    /// Torch keeps a linear weight as `[out, in]` and matmul wants `[in, out]`. Transposing once at
-    /// load measures the same as inside `forward`, since mlx is lazy, and keeps the rearrangement
-    /// out of the pass.
+    /// Transposed once at load because matmul wants `[in, out]`.
     weight: Array,
     bias: Array,
 }
@@ -180,9 +177,7 @@ impl Linear {
     }
 }
 
-/// Multi-head attention: the projections and the head split are written out, and the attention
-/// itself is mlx's. The projections stay explicit because their scaling and layout would need
-/// checking against a library's conventions anyway.
+/// Multi-head attention: explicit projections and head split, then mlx's attention.
 struct Attention {
     query: Linear,
     key: Linear,

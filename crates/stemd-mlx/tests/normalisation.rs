@@ -2,14 +2,10 @@
 //!
 //! `fast::rms_norm` and `fast::layer_norm` are single kernels that replace four or five slower ops,
 //! and every backend picks the kernel by row width. A backend can get a band of widths wrong in
-//! that dispatch, silently: the shapes still fit, nothing errors, and the model separates audio
-//! that is merely wrong.
+//! that dispatch, silently: the shapes still fit, nothing errors, and the stems come out wrong.
 //!
-//! MLX v0.31.2's CUDA RMSNorm gave one block two rows to reduce while sizing its
-//! shared storage for one, for widths 129 to 256 at f32 and 257 to 512 at f16: a
-//! band the ordinary suite only crosses from inside a loaded model.
-//!
-//! So this sweeps every width these kernels could receive, beyond the widths today's artefacts use.
+//! CUDA RMSNorm can merge two rows in one block for widths 129 to 256 at f32 and 257 to 512 at
+//! f16. This test sweeps every width up to [`WIDEST`], beyond the widths today's artefacts use.
 //! It runs by default: it needs only a GPU, with no artefact and no fixture.
 //!
 //! `layer_norm` is swept too, although the pinned version has no dispatch by group for it.
@@ -28,11 +24,8 @@ const WIDEST: i32 = 1024;
 const RMS_EPS: f32 = 1e-12;
 const LAYER_EPS: f32 = 1e-5;
 
-/// Four rows whose scales differ by 4x per step.
-///
-/// One row would catch nothing: a dispatch fault that reduces two rows into one row's storage needs
-/// a neighbouring row to show, and rows with the same distribution would let it land within
-/// tolerance. Four rows spanning 64x in RMS mean any merge of two of them misses by a large factor.
+/// Four rows whose scales differ by 4x per step, so a fault that merges two rows misses by a large
+/// factor.
 const ROWS: i32 = 4;
 
 fn input(width: i32) -> Array {
@@ -56,9 +49,7 @@ fn gamma(width: i32) -> Array {
     Array::from_slice(&data, &[width])
 }
 
-/// The reference is computed at f32 whatever the kernel ran at, because the kernels accumulate at
-/// f32 too. An f16 reference computed in f16 would compare two different roundings and report the
-/// difference as a kernel bug.
+/// `a` as f32. The reference runs at f32 because the kernels accumulate at f32.
 fn as_f32(a: &Array) -> Array {
     a.as_dtype(Dtype::Float32).expect("upcast to f32")
 }
@@ -76,9 +67,7 @@ fn rms_norm_written_out(x: &Array, gamma: &Array, eps: f32) -> Array {
     ops::multiply(ops::multiply(&x, &scale).expect("normalise"), &gamma).expect("weight")
 }
 
-/// The unweighted form, which is the one htdemucs uses at both of its call
-/// sites. The affine is elementwise and lands after the reduction; the
-/// reduction is the part a dispatch bug corrupts.
+/// `layer_norm` without weight or bias, written out, as htdemucs calls it.
 fn layer_norm_written_out(x: &Array, eps: f32) -> Array {
     let x = as_f32(x);
     let centred = ops::subtract(&x, x.mean_axis(-1, true).expect("mean")).expect("centre");
@@ -123,7 +112,7 @@ fn sweep(
         "fast::{what} at {dtype:?} disagrees with the same arithmetic \
          written out: {null:.1} dB at width {width}, floor {floor:.1} dB. \
          A fused normalisation that is wrong for one band of widths is an \
-         MLX backend bug, not a stemd one — see the note at the top of this file."
+         MLX backend bug, not a stemd one; see the note at the top of this file."
     );
 }
 

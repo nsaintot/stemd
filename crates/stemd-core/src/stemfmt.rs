@@ -6,8 +6,7 @@
 //! Four of the five formats are lossless; `mp3` is lossy. A perceptual codec hides its noise under
 //! a masking threshold computed for the signal as encoded, and a stem's gain is changed afterwards,
 //! which unmasks that noise. Lossy parts also do not sum, and the client's rebuild of the third
-//! part needs them to. Nothing stops a client from choosing `mp3`; the choice is left to the
-//! caller.
+//! part needs them to. A client may still choose `mp3`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::pcm::{Audio, PcmError, PcmFormat};
 use crate::resample::OutputRate;
 
-/// The bits per sample in a WAV stem: 16, the same as [`stemd_audio::wire::FLAC_BITS`] and for the
-/// same reason. A 16-bit WAV also opens everywhere.
+/// The bits per sample in a WAV stem: 16, as [`stemd_audio::wire::FLAC_BITS`], since the
+/// quantisation floor is already below the model's own error. A 16-bit WAV also opens everywhere.
 const WAV_BITS: u16 = 16;
 
 /// How hard LAME searches when quantising: its own recommended setting.
@@ -167,9 +166,6 @@ pub fn encode(audio: &Audio, format: StemFormat, gain: f32) -> anyhow::Result<Ve
 
 /// A 16-bit WAV: a 44-byte canonical RIFF header, then the same interleaved
 /// samples `pcm16` would have carried.
-///
-/// Written by hand because a WAV is only a header and samples, and the samples must be
-/// bit-identical to the other 16-bit formats.
 fn to_wav(audio: &Audio, gain: f32) -> Vec<u8> {
     let samples = audio.to_interleaved_scaled(PcmFormat::S16le, gain);
     let channels = audio.channels() as u16;
@@ -193,11 +189,7 @@ fn to_wav(audio: &Audio, gain: f32) -> Vec<u8> {
     out
 }
 
-/// MP3 at a constant 320 kbps, the format's highest bitrate, since a stem's gain is changed against
-/// the other stems afterwards.
-///
-/// LAME receives the float samples directly: it works in float internally, so 16-bit input would
-/// quantise twice.
+/// MP3 at a constant 320 kbps, encoded from the float samples.
 fn to_mp3(audio: &Audio, gain: f32) -> anyhow::Result<Vec<u8>> {
     to_mp3_at(audio, gain, MP3_QUALITY)
 }
@@ -272,10 +264,7 @@ fn to_mp3_at(
     Ok(out)
 }
 
-/// FLAC-encode at [`stemd_audio::wire::FLAC_BITS`].
-///
-/// Samples are quantised by exactly the routine `s16le` uses, so a client rebuilds
-/// the derived part identically whichever format it asked for.
+/// FLAC-encode at [`stemd_audio::wire::FLAC_BITS`], quantised as `s16le` is.
 fn to_flac(audio: &Audio, gain: f32) -> anyhow::Result<Vec<u8>> {
     // One below the crate's default of 10: 13% faster encoding for 0.7% more bytes, measured by
     // `encode_cost`. Order 4 costs 9.5% more size, and no LPC costs 25%. Encoding dominates the
@@ -310,7 +299,7 @@ mod tests {
         assert_eq!(StemFormat::Flac.rates().count(), OutputRate::ALL.len());
     }
 
-    /// The encoder refuses 96 kHz on its own, as a last check behind the rate selection: LAME would
+    /// The MP3 encoder refuses 96 kHz even when the rate selection is bypassed, since LAME would
     /// accept the rate and resample.
     #[test]
     fn the_mp3_encoder_refuses_a_rate_it_has_no_mode_for() {
@@ -674,8 +663,7 @@ mod mp3_bench {
     use crate::stemfmt::{StemFormat, encode};
 
     /// A signal closer to music than a tone or noise: a moving harmonic stack, transients on a
-    /// beat, and a little noise for air. Pure tones flatter every encoder, and white noise punishes
-    /// every encoder.
+    /// beat, and a little noise for air.
     fn musical(secs: f64, rate: u32) -> Audio {
         let n = (secs * f64::from(rate)) as usize;
         let mut state = 0x2545_F491_4F6C_DD1D_u64;

@@ -14,8 +14,8 @@
 //! **The halves are chained.** The drums model receives the audio the vocals model left behind.
 //! Chaining cannot change the vocals, which come from the same forward pass over the same audio
 //! either way; it only moves the line between drums and harmonics. Its benefit depends on the
-//! vocals model in front, so [`HybridSeparator::demucs_specialists`] does not chain: feeding a
-//! demucs vocals specialist into a demucs drums specialist measured worse on every track tried.
+//! vocals model in front, so [`HybridSeparator::demucs_specialists`] does not chain: a demucs
+//! vocals specialist chained into a demucs drums specialist separates worse.
 //!
 //! **`harmonics` is the remainder.** It is never demucs's `bass + other`. The player derives `drums
 //! = mix - harmonics - vocals`, which with this arrangement returns the drums estimate unchanged.

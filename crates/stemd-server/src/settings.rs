@@ -25,8 +25,8 @@ use crate::models::{self, DEFAULT_PRESET, Preset, RETIRED};
 /// What the window can change and the next launch reads back.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
-    /// The preset loaded at launch. It is always a preset: `--demucs-model` can name a hand-traced
-    /// artefact, but only for one run, so neither the window nor the file can hold one.
+    /// The preset loaded at launch. A `--demucs-model` artefact applies to one run and is never
+    /// stored here.
     pub preset: Preset,
     /// The format for a request that does not name one.
     pub format: StemFormat,
@@ -336,10 +336,7 @@ pub struct SettingsFile {
 }
 
 impl SettingsFile {
-    /// Read the file, or start from defaults if it is not usable.
-    ///
-    /// This never fails: it runs before the server exists, and no state of a preferences file
-    /// should fail a launch.
+    /// Read the file, or start from defaults if it is missing or unreadable. Never fails.
     pub fn open(path: PathBuf) -> Self {
         let saved = load(&path).unwrap_or_else(|err| {
             // An absent file means a first run, so it gets no warning.
@@ -467,11 +464,8 @@ impl SettingsFile {
         }
     }
 
-    /// Change both copies and write the file.
-    ///
-    /// This is reached only for a field that no flag pinned, so applying the change to `saved`
-    /// cannot carry a flag into the file. A failed write is logged as a warning; the change still
-    /// applies to the running server, and only the next launch misses it.
+    /// Change both copies and write the file. A failed write is logged, and the change still
+    /// applies to this run.
     fn write(&self, change: impl Fn(&mut Settings)) {
         let settings = {
             let mut state = self.state.lock();
@@ -502,11 +496,8 @@ fn load(path: &Path) -> Result<Settings> {
     Ok(stored.into_settings())
 }
 
-/// Write through a temporary file in the same directory.
-///
-/// The file is rewritten whenever a menu changes, even while the machine shuts down. Writing the
-/// real file in place would let an interrupted write leave it half-written, which
-/// [`SettingsFile::open`] would then discard.
+/// Write through a temporary file in the same directory, so an interrupted write never truncates
+/// the real file.
 fn save(path: &Path, settings: &Settings) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;

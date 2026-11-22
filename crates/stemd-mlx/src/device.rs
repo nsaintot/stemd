@@ -51,10 +51,8 @@ impl Accelerator {
         DECIDED.get_or_init(Self::decide).0
     }
 
-    /// True when a GPU was present and this module refused it.
-    ///
-    /// The two kinds of [`Self::Cpu`] need different messages: a machine without a card needs none,
-    /// while a card whose runtime is missing needs a warning, because a download fixes it.
+    /// True when a GPU was present and this module refused it, such as a card whose CUDA runtime
+    /// is missing.
     pub fn gpu_refused() -> bool {
         DECIDED.get_or_init(Self::decide).1
     }
@@ -87,8 +85,7 @@ impl Accelerator {
         Self::Cpu
     }
 
-    /// The name sent to clients in `BackendInfo::device`. It is stable and coarse on purpose:
-    /// clients match on it, and none needs to know which GPU it is.
+    /// The name sent to clients in `BackendInfo::device`: `gpu` for both GPUs, or `cpu`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Metal | Self::Cuda => "gpu",
@@ -112,11 +109,8 @@ impl std::fmt::Display for Accelerator {
     }
 }
 
-/// [`gpu_computes`] on a thread that never exits.
-///
-/// MLX keeps CUDA state per thread, and on Windows its destructor throws when the
-/// thread exits. Windows reports that as a crash and freezes the whole process for
-/// about 3 s while it writes the report.
+/// [`gpu_computes`] on a thread that never exits, because MLX's per-thread CUDA destructor
+/// throws on Windows.
 fn gpu_computes_on_kept_thread() -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -185,10 +179,7 @@ mod runtime {
         fn FreeLibrary(module: *mut c_void) -> i32;
     }
 
-    /// Whether every delay-loaded library can be found.
-    ///
-    /// This executable has no CUDA in its ordinary imports, so the delay-import directory is
-    /// everything that can fault, and loading all of it proves that nothing will.
+    /// Whether every library in this image's delay-import directory loads.
     pub fn resolves() -> bool {
         delay_loaded().iter().all(|name| loads(name))
     }
@@ -212,15 +203,9 @@ mod runtime {
         true
     }
 
-    /// The names in this image's delay-import directory.
-    ///
-    /// They are read from the image: `build.rs` offers the linker 36 candidates and the linker
-    /// keeps only those actually imported, so a hand-written list would be wrong both ways, naming
-    /// libraries the binary never calls and going stale when MLX or the toolkit changes its
-    /// imports.
-    ///
-    /// An empty answer means nothing is delay-loaded, so nothing can fault; that is the correct
-    /// answer for a build without CUDA.
+    /// The DLL names in this image's delay-import directory, empty for a build without CUDA.
+    /// The linker keeps only the `build.rs` candidates the binary imports, so the names are read
+    /// from the image.
     fn delay_loaded() -> Vec<String> {
         /// Where the PE header offset sits in the DOS header.
         const PE_OFFSET: usize = 0x3c;
@@ -297,9 +282,8 @@ mod runtime {
         }
     }
 
-    /// Nothing asserts which libraries these are, since that depends on the build and this module
-    /// deliberately holds no list. What can be checked on any machine is that the walk terminates,
-    /// agrees with itself, and returns plausible names.
+    /// The walk terminates, agrees with itself, and returns plausible names. Which libraries it
+    /// finds depends on the build.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -349,8 +333,7 @@ mod tests {
         assert_eq!(Accelerator::Cuda.backend(), "cuda");
     }
 
-    /// The answer is enforced as well as reported. A build that reports `cpu` while MLX keeps
-    /// sending work to an unusable GPU would only move the failure.
+    /// MLX's default device is the kind `detect` reports, the CPU included.
     #[test]
     fn mlx_uses_the_device_that_detect_reports() {
         let mine = Accelerator::detect();
@@ -379,11 +362,8 @@ mod tests {
         }
     }
 
-    /// The sums the probe checks against are the right ones.
-    ///
-    /// The test does not assert `gpu_computes() == (detect() != Cpu)`: the probe runs on MLX's
-    /// default device, so on a machine with no GPU it passes on the CPU. What it proves on any
-    /// machine is that a healthy backend passes.
+    /// The probe's expected sums are right, so it passes on a healthy backend. With no GPU, it
+    /// runs on the CPU.
     #[test]
     fn the_probe_arithmetic_is_right() {
         Accelerator::detect();

@@ -198,8 +198,8 @@ impl Sessions {
         Ok(runs)
     }
 
-    /// The output-rate samples `span` of `name`, within the part of the track that `run` covers,
-    /// read from `source`.
+    /// Read the samples of `name` in `span`, at the output rate, from `source`, limited to the
+    /// part of the track `run` covers.
     fn read_run(
         &self,
         session: &Session,

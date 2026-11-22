@@ -5,10 +5,8 @@
 //! cache limit defaults to the device's recommended working set, so an idle server can keep most of
 //! the machine's memory, almost none of it model weights, and push the machine into swap.
 //!
-//! Call [`release`] from an idle timer; between tracks it would slow the next track. A cache cap is
-//! worse than releasing between tracks or on idle: MLX evicts inside a separation and re-allocates
-//! what it just gave up, and it still holds the whole cap forever. Releasing on idle has no
-//! measurable cost on the next separation.
+//! Call [`release`] from an idle timer; between tracks it would slow the next track. Do not cap the
+//! cache: MLX evicts and re-allocates inside a separation and still holds the whole cap.
 
 /// The bytes MLX holds for arrays that still exist.
 pub fn active() -> usize {

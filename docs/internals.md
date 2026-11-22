@@ -1,7 +1,6 @@
 # Internals
 
-How the server is built. Clients do not need any of this; the client contract is
-in [api.md](api.md).
+Internals of the server. See [api.md](api.md) for the user-facing API.
 
 ## Cache
 
@@ -29,7 +28,7 @@ Jobs, sessions and drops share one cache in `~/Library/Caches/stemd`
   the preset uses them, `--full-precision` and `--overlap`. New fields are
   appended at the end. Every field after `m=` takes its value from a closed set
   that contains no `;`, so splitting from the right is unambiguous.
-  `--demucs-model` is operator input and goes in `m=`.
+  `m=` holds the `--demucs-model` value as given.
 - A job or a drop decodes the upload, hashes it into a track id, and looks for
   every stem stored whole for its output, at any gain. A hit runs no model. A
   miss runs the model and stores whole stems at the track's gain, `1/(peak·√2)`,
@@ -40,7 +39,7 @@ Jobs, sessions and drops share one cache in `~/Library/Caches/stemd`
 
 ### Deletion
 
-| A track is | |
+| Track state | |
 | --- | --- |
 | in use | played by an open session, being written by a job, or part of a job result with a stem that was not fetched within `--unfetched-ttl` (300 s) of the job ending or of the last fetch |
 | whole | every stem is stored whole, and no piece directory is left |
@@ -96,21 +95,21 @@ The queue gives clients:
 
 `DELETE` drops the job handle. Stems already on disk stay in the cache.
 
-A deck that skips a track needs the running job cancelled. Without that, an
+When a player skips a track, the running job must be cancelled. Without that, an
 abandoned track would hold the next track behind a full separation whose stems
 nobody fetches. The backend polls the progress sink between segments, so a
 cancel takes effect within one segment, well under a second at the default
 preset.
 
-A cancelled job drops its partial overlap-add. Finishing it would leave stems in
-the cache for a later cue, but the next track is the urgent one, and a re-cue of
-a skipped track separates it again.
+A cancelled job drops its partial overlap-add. Finishing it would cache stems for
+a later cue. The next track is more urgent, and a skipped track cued again is
+separated again.
 
 The worker applies a model switch between jobs, because the old separator holds
 GPU state that a running forward pass uses. The worker also builds the new
 separator: MLX weights must be allocated on the thread that evaluates them, so
 the switch sends the worker a closure that builds the model, never a loaded
-model. The switch thread downloads the weights (320 MB) and then waits for the
+model. The switch thread downloads the weights (up to 672 MB) and then waits for the
 worker's answer, so a failed switch can be reported and `/v2/health` never names
 a model the worker has not loaded yet.
 
@@ -129,8 +128,8 @@ The reasons behind the contract in [api.md](api.md).
 - **Numbered `dsp_mode`s and filters.** A client that rebuilds `drums = mix −
   harmonics − vocals` at another rate must resample its mix through the same
   filter as the stems. Two good resamplers agree to about −77 dB of the mix. A
-  part 41 dB below the mix then carries an error only 36 dB under it; the same
-  filter gives −101 dB. A filter's delay is part of the filter: at 96 kHz, mode 1 is 64
+  part 41 dB below the mix then has an error only 36 dB below it. With the same
+  filter, the error is −101 dB. A filter's delay is part of the filter: at 96 kHz, mode 1 is 64
   samples later than mode 0.
 - **`model_residual_db`.** On `Fast` the four sources come straight from the
   model and miss the mix by the residual, which ends up in the rebuilt part.
@@ -138,9 +137,8 @@ The reasons behind the contract in [api.md](api.md).
   reads about −160 dB and only confirms that the arithmetic is right.
 - **Fixed FLAC block size.** STREAMINFO declares `min_blocksize ==
   max_blocksize` and leaves the trailing partial block out of the minimum, as
-  libFLAC and ffmpeg do. When a stream declares unequal sizes, the decoder
-  locates frames by sample number, and decoders then stop early or report frames
-  out of order.
+  libFLAC and ffmpeg do. With unequal sizes, decoders locate frames by
+  sample number. Some then stop early or report frames out of order.
 - **Read costs** for a 6-minute stem at 96 kHz in FLAC on an M1 Pro:
 
   | Read | Time | Memory |
@@ -186,7 +184,7 @@ server's address still works.
 A file dropped on the window becomes the same job that `POST /v2/jobs` makes,
 with the same track id, job table, worker and cache. A drop and a client asking
 for the same track join one separation, and dropping the same file twice is a
-cache hit. `drops.rs` differs at two points: the audio comes from a file, and a
+cache hit. A drop differs from a client job in two ways: the audio comes from a file, and a
 drop always asks for the derived part, because a folder of stems has no mix to
 rebuild it from.
 
@@ -256,9 +254,9 @@ anyway.
 ## Writing the stems
 
 This stage converts each stem to the output rate, then encodes it. Both steps
-run one thread per stem, at most three. Stems share nothing but the staging
-directory, and the GPU work is done before this stage starts, so in parallel the
-stage costs as much as the slowest stem instead of the sum of all three. Times
+run one thread per stem: one per part, plus one for the derived part. Stems
+share only the staging directory, and the GPU work is already done. The stage
+takes as long as the slowest stem. Times
 for a two-minute track with three parts:
 
 | format | rate | serial | concurrent |
@@ -272,9 +270,9 @@ for a two-minute track with three parts:
 WAV and the raw formats need only a conversion and a write, 50 ms for three
 stems. They take the same path and gain nothing from it.
 
-The gain from concurrent conversion depends on the rate. 44.1 → 48 kHz gains
-2.7x, although the converter already uses threads internally. 44.1 → 96 kHz
-gains nothing, because it is bound by writing 92 MB per stem. Neither case gets
+The gain from concurrent conversion depends on the rate. Converting to 48 kHz
+runs 2.7x faster, although the converter already uses threads. Converting to
+96 kHz gains nothing, because it is bound by writing 92 MB per stem. Neither case gets
 slower, so conversion runs concurrently at every rate.
 
 LAME runs at its recommended quality, `q=2`. Do not go back to `q=0`: it takes
@@ -328,10 +326,12 @@ Three constraints hold the design together:
   registry in thread-local storage, so weights allocated on another thread fail
   their first `eval` with `There is no Stream(gpu, N) in current thread`. The
   queue worker constructs its own separator for this reason.
-- **The model runs at float16 by default**, except the normalisations, which
+- **Each model runs at the precision that suits it on the backend**: on Metal,
+  every model runs at float16; on CUDA, demucs runs at float16 and the
+  RoFormer at float32; the CPU runs float32. At float16 the normalisations
   keep their statistics in float32. Without this exception the model produces
   NaN: a group norm with one group sums a million squares. `--full-precision`
-  runs everything at float32 and takes 1.3x the time.
+  runs every model at float32, which on Metal takes 1.3x the time.
 - **Everything around the model stays float32**: the spectrogram and its
   inverse, the per-branch standardisation and the overlap-add across segments.
   These steps cost a few percent of a forward pass, and half precision would

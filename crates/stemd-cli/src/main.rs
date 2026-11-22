@@ -37,7 +37,7 @@ struct Args {
     #[arg(long)]
     host: Option<String>,
 
-    /// Where to write the stems. Defaults to <input stem>-stems/.
+    /// Where to write the stems. Defaults to <input stem>-stems/ in the working directory.
     #[arg(long)]
     out: Option<PathBuf>,
 
@@ -94,7 +94,7 @@ struct Args {
 }
 
 impl Args {
-    /// Where the stems go, defaulting to a directory beside the input.
+    /// Where the stems go, defaulting to `<input stem>-stems` in the working directory.
     fn out_dir(&self) -> PathBuf {
         self.out.clone().unwrap_or_else(|| {
             let stem = self
@@ -269,10 +269,7 @@ fn separate(server: &Server, audio: &Decoded, formats: Formats<'_>) -> Result<Jo
     })
 }
 
-/// Download the shipped stems and rebuild the derived part from the mix.
-///
-/// A player rebuilds this part the same way, so the three files match the three faders. The labels
-/// show which two were downloaded.
+/// Download the shipped stems and rebuild the derived part from the mix, the way a player does.
 fn assemble(
     server: &Server,
     audio: &Decoded,

@@ -351,8 +351,8 @@ fn unknown_length(header: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decode a stored piece to the samples `encode_stem(_, format, 1.0)` turns back
-/// into the same bytes: 16-bit samples as `q / 32767`, `f32le` as stored.
+/// Decode a stored piece: 16-bit samples become `q / 32767`, `f32le` samples stay as stored.
+/// Re-encoding at gain 1.0 gives the same bytes.
 pub fn decode(bytes: Vec<u8>, format: StemFormat, channels: usize, rate: u32) -> Result<Audio> {
     let planar = |samples: Vec<f32>| -> Result<Audio> {
         anyhow::ensure!(

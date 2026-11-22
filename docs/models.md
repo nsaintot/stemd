@@ -1,51 +1,40 @@
 # Model artefacts
 
-This page keeps the README of the former model-hosting repository. It describes
-the `models-v1` tag, which is superseded: the shipping artefacts are safetensors
-under `models-v2` and `models-v3`, and their digests are pinned in
-`crates/stemd-server/src/models/preset.rs`.
+The presets download their weights from this project's releases. stemd pins
+each file's SHA-256 in `crates/stemd-server/src/models/preset.rs` and checks it
+before it puts a download in place. Replacing an asset makes existing installs
+fail with a digest error, so publish a new tag instead.
 
-The provenance and licence position below apply to every release.
+| release | files | preset |
+| --- | --- | --- |
+| [models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) | `htdemucs.safetensors`, `htdemucs_ft.safetensors` | Fast, Balanced |
+| [models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) | `stemd_roformer.safetensors` | Quality |
 
----
+## `models-v2`
 
-Hosting only. This repository carries the traced models that **stemd** downloads
-on first run. The source lives elsewhere.
+demucs v4 in safetensors. The files are byte-for-byte copies of
+[mlx-community's](https://huggingface.co/mlx-community/demucs-mlx) conversions.
 
-## `models-v1`
+| file | preset | bytes | sha256 |
+| --- | --- | --- | --- |
+| `htdemucs.safetensors` | Fast | 168,005,865 | `339d267a7a6983a11eedbdc00413c602a65e9b9103f695fb5c2b2a481cd9d297` |
+| `htdemucs_ft.safetensors` | Balanced | 672,024,519 | `53f03b1ad4b4d211025a35da65460ba61a17547adf9c0544cad0ebcc8d7bbabb` |
 
-Two TorchScript artefacts traced for Apple MPS, each with its manifest:
+### Provenance
 
-| file | preset | size | sha256 |
-|---|---|---|---|
-| `htdemucs_mps.pt` | Quality | 161 MB | `9a5d56dac50cc58258df8576d8fa76f61d8943fbb117c43f55f06ce96c609d65` |
-| `htdemucs_mps.json` | | 290 B | `f26265bc876887eac6934cc347a9a90c8da0b6b89d96199410180fed8c0564cc` |
-| `hdemucs_mmi_mps.pt` | Speed | 320 MB | `dfed3230fb735772502bb4f9453810b84bf574a7d03ed6dc823b28b4f6327975` |
-| `hdemucs_mmi_mps.json` | | 296 B | `00b131cc07b352f977c005485b991502d13f8c05a44813c3b3fe6169e2a18688` |
-
-stemd pins these digests and verifies them before putting a download in place,
-so replacing an asset here makes existing installs fail with a digest error.
-Publish a new tag instead of editing this one.
-
-The artefacts are traced for MPS and do not load on the CPU.
-
-## Provenance
-
-The artefacts are traced from the
+The conversions come from the
 [facebookresearch/demucs](https://github.com/facebookresearch/demucs) pretrained
-models `htdemucs` (v4) and `hdemucs_mmi`.
+models `htdemucs` and `htdemucs_ft`.
 
-The demucs **code** is MIT. The pretrained **weights** are distributed
-separately from that repository and carry no explicit licence: the question was
-asked in [demucs#327](https://github.com/facebookresearch/demucs/issues/327) in
-2022, went unanswered, and the repository is now archived. These artefacts are
+The demucs code is MIT. The pretrained weights are distributed separately from
+that repository and carry no explicit licence. The question was asked in
+[demucs#327](https://github.com/facebookresearch/demucs/issues/327) in 2022 and
+went unanswered, and the repository is now archived. These artefacts are
 derived works of those weights and are published on that understanding.
 
----
+## `models-v3`
 
-## `stemd_roformer` (`models-v3`)
-
-stemd's own separation model, which the `Quality` preset runs.
+`stemd_roformer`, stemd's own separation model, which the `Quality` preset runs.
 
 | | |
 |---|---|
@@ -90,3 +79,19 @@ and 6 of the licence.
 
 To ask about commercial use, open an issue on
 [nsaintot/stemd](https://github.com/nsaintot/stemd/issues).
+
+## Retired
+
+`models-v1` holds two TorchScript artefacts traced for Apple MPS, each with
+its manifest. Nothing loads TorchScript any more; a settings file that names one
+falls back to the default preset with an explanation.
+
+| file | former preset | size | sha256 |
+|---|---|---|---|
+| `htdemucs_mps.pt` | Quality | 161 MB | `9a5d56dac50cc58258df8576d8fa76f61d8943fbb117c43f55f06ce96c609d65` |
+| `htdemucs_mps.json` | | 290 B | `f26265bc876887eac6934cc347a9a90c8da0b6b89d96199410180fed8c0564cc` |
+| `hdemucs_mmi_mps.pt` | Speed | 320 MB | `dfed3230fb735772502bb4f9453810b84bf574a7d03ed6dc823b28b4f6327975` |
+| `hdemucs_mmi_mps.json` | | 296 B | `00b131cc07b352f977c005485b991502d13f8c05a44813c3b3fe6169e2a18688` |
+
+They were traced from the demucs pretrained models `htdemucs` (v4) and
+`hdemucs_mmi`, under the same terms as `models-v2`.

@@ -362,10 +362,7 @@ mod tests {
         }
     }
 
-    /// A caller that refuses to continue stops the track where it is.
-    ///
-    /// Cancellation relies on this return value; without it, a caller could stop only after
-    /// `over_track` returns, when the whole track has been separated.
+    /// A caller that refuses to continue stops the track before `over_track` returns.
     #[test]
     fn refusing_to_continue_stops_at_that_chunk() {
         let _gpu = one_at_a_time();

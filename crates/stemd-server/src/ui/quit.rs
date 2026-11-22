@@ -70,8 +70,6 @@ impl Guard {
 }
 
 /// Draw the question.
-///
-/// It takes only the track's name, so a probe can draw it without any state.
 pub fn dialog(
     ui: &mut egui::Ui,
     palette: &Palette,

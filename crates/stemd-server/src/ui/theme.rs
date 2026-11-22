@@ -865,9 +865,8 @@ fn halo(size: usize) -> egui::ColorImage {
 mod tests {
     use super::*;
 
-    /// A `Color32` whose channels exceed its alpha is additive in epaint, not
-    /// translucent: it adds its own brightness on top of whatever is behind it.
-    /// `from_rgba_unmultiplied`, `white` and `black` spell the intended meaning.
+    /// Every translucent colour keeps each channel at or below its alpha, because epaint draws a
+    /// higher channel additively.
     #[test]
     fn no_palette_colour_is_secretly_additive() {
         let palette = Palette::navy();

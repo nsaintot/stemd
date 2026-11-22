@@ -2,7 +2,7 @@
 
 Run before porting BS-RoFormer to stemd-mlx, to find out whether the model was
 worth the work before doing the work. It was, and the arrangement matters as
-much as the model -- see docs/evaluation.md.
+much as the model; see docs/evaluation.md.
 
 Needs three things this repo does not carry:
 
@@ -11,9 +11,9 @@ Needs three things this repo does not carry:
   * its config of the same name, from ZFTurbo/Music-Source-Separation-Training
     under configs/viperx/
   * that repo's models/bs_roformer/ on PYTHONPATH. The published `bs-roformer`
-    package has moved on -- it grew hyper-connections -- and no longer loads
-    these weights; the vendored copy is the code they were trained with, and it
-    loads them strictly, no missing and no unexpected tensors.
+    package grew hyper-connections and no longer loads these weights. The
+    vendored copy is the code they were trained with, and it loads them
+    strictly, with no missing and no unexpected tensors.
 
     uv run tools/eval/roformer_hybrid.py --ckpt ... --config ... --clips 25
 
@@ -77,7 +77,7 @@ def roformer_vocals(model, chunk, mix, device):
     """`mix` is [C, T]; returns the vocals estimate at the same shape.
 
     Clips are shorter than one chunk, so this pads to the chunk the model was
-    trained on and trims back -- the same thing apply_model does for demucs.
+    trained on and trims back, as apply_model does for demucs.
     """
     length = mix.shape[1]
     padded = np.zeros((mix.shape[0], max(chunk, length)), dtype=np.float32)

@@ -86,12 +86,6 @@ fn main() -> Result<()> {
 }
 
 /// Fetch the CUDA runtime and stop, without loading a model or binding a port.
-///
-/// This runs before `startup::prepare`: on a machine where the GPU was refused, preparing first
-/// would spend a minute loading a model at CPU speed for a process about to exit.
-///
-/// The probe that picks the backend also decides whether there is anything to install: nothing is
-/// needed with a working GPU or with no NVIDIA card.
 #[cfg(windows)]
 fn install_cuda() -> Result<()> {
     use stemd_core::Accelerator;

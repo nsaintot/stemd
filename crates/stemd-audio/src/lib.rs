@@ -117,10 +117,7 @@ fn decode_stream(mss: MediaSourceStream, hint: &Hint, label: &str) -> Result<Dec
     sink.finish(label)
 }
 
-/// The next packet, or `None` at end of stream.
-///
-/// Symphonia signals the end as an `UnexpectedEof` io error, with no dedicated variant, so it is
-/// translated here once for every call site.
+/// The next packet, or `None` at end of stream (Symphonia's `UnexpectedEof`).
 fn next_packet(
     format: &mut dyn symphonia::core::formats::FormatReader,
 ) -> Result<Option<symphonia::core::formats::Packet>> {
@@ -264,8 +261,8 @@ fn elst_media_time(hay: &[u8]) -> Option<usize> {
     None
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+fn find(data: &[u8], pattern: &[u8]) -> Option<usize> {
+    data.windows(pattern.len()).position(|w| w == pattern)
 }
 
 #[cfg(test)]
@@ -326,8 +323,8 @@ mod tests {
         }
     }
 
-    /// `finish` can report a file that declares no channels only if `spread` returns before
-    /// dividing by zero.
+    /// A file that declares no channels gets an error from `finish`, with no division by zero in
+    /// `spread`.
     #[test]
     fn spreading_onto_no_channels_does_not_divide_by_zero() {
         spread(&mut [], &[1.0, 2.0]);

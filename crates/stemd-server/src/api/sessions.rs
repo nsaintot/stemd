@@ -4,7 +4,7 @@
 //! POST   /v2/sessions                          open: track length and output;
 //!                                              body is optional PCM from sample 0
 //! PUT    /v2/sessions/{id}/pcm?offset=N        PCM placed at track sample N
-//! PUT    /v2/sessions/{id}/window              needle and margins, JSON
+//! PUT    /v2/sessions/{id}/window              playhead and margins, JSON
 //! GET    /v2/sessions/{id}                     what has arrived, what is ready;
 //!                                              ?wait= with If-None-Match long-polls
 //! GET    /v2/sessions/{id}/stems/{name}        ?from=&to= in track samples, or the whole track

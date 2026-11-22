@@ -96,8 +96,8 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
     if dir != cache {
         // Logged at info: outside the cache a mismatch is expected.
         tracing::info!(
-            "in {}, {what} — using it anyway, since a local trace is expected \
-             to differ from the published artefact",
+            "in {}, {what}: using it anyway; a local trace may differ from the \
+             published artefact",
             dir.display()
         );
         return Ok(());
@@ -118,8 +118,8 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
     let still_bad = mismatched(dir, preset);
     if !still_bad.is_empty() {
         bail!(
-            "{} still fails verification after refetching — the release may \
-             have been replaced since this build pinned it",
+            "{} still fails verification after refetching: the release may have \
+             been replaced",
             still_bad.join(", ")
         );
     }

@@ -2,7 +2,8 @@
 //!
 //! Every artefact is served from this project's own releases and pinned by digest, so a stale
 //! digest fails on the next fresh install. The project hosts the files so that its own releases are
-//! the only thing to keep available; the digests are the same as upstream.
+//! the only thing to keep available. The demucs files are byte-for-byte copies of mlx-community's
+//! conversions; `stemd_roformer` is this project's own.
 //!
 //! No manifest comes with the weights. The architecture is compiled into `stemd_mlx`, and every
 //! layer checks the shape of each tensor it reads, so a file with another architecture fails at
@@ -35,9 +36,8 @@ pub enum Preset {
     /// `htdemucs_ft`: one artefact with four checkpoints, each fine-tuned for one source; two of
     /// them run.
     ///
-    /// The four sources need not sum to the mix, so shipping `bass + other` as harmonics would put
-    /// that error on the part the player rebuilds. Running the drums and vocals specialists and
-    /// shipping harmonics as the remainder removes the error.
+    /// The drums and vocals checkpoints run, and harmonics is the remainder, so the parts sum to
+    /// the mix.
     Balanced,
     /// stemd's own 4-stem BS-RoFormer. It ships drums and vocals, and harmonics is the remainder.
     /// See docs/evaluation.md.
@@ -82,10 +82,7 @@ impl Preset {
         }
     }
 
-    /// The architectures this preset runs, in the order it runs them.
-    ///
-    /// The family of each model decides which precision suits it, and the families differ on CUDA.
-    /// `None` stands for a hand-named artefact, which is always a single demucs.
+    /// The architectures this preset runs, in order. `None`, a hand-named artefact, is one demucs.
     pub const fn families(preset: Option<Self>) -> &'static [Family] {
         match preset {
             Some(Self::Quality) => &[Family::Roformer],
@@ -104,10 +101,7 @@ impl Preset {
         }
     }
 
-    /// The pinned digest of this preset's weights, for a cache key.
-    ///
-    /// Pointing a preset at a different artefact changes the digest, which invalidates its cached
-    /// separations. See also [`Self::recipe`].
+    /// The pinned digest of this preset's weights, for a cache key. See also [`Self::recipe`].
     pub fn digest(self) -> &'static str {
         self.source()
             .files
@@ -116,9 +110,7 @@ impl Preset {
             .map_or_else(|| self.artefact(), |f| f.sha256)
     }
 
-    /// Match an artefact name to a preset, so `--demucs-model` and the window agree on what is
-    /// loaded. A preset's former name also matches it, so a settings file saved before a rename
-    /// keeps its choice.
+    /// Match an artefact name, or a preset's former name, to a preset.
     pub fn from_artefact(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -258,9 +250,6 @@ mod tests {
 
     /// Every demucs artefact that a preset names is v4, so one runtime serves them all; a v3
     /// artefact would bring back the LSTM.
-    ///
-    /// The test checks artefact names, so it needs no list of presets to skip, which would go stale
-    /// as presets are added.
     #[test]
     fn every_demucs_artefact_is_v4() {
         for preset in Preset::ALL {

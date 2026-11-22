@@ -1,8 +1,8 @@
 """One whole segment through htdemucs, input and output.
 
 The assembly test. Every component below this has its own passing null, so a
-failure here is in the wiring — the interleaved loops, the skip order, the
-normalisation, or the mask — rather than in the arithmetic.
+failure here is in the wiring: the interleaved loops, the skip order, the
+normalisation or the mask.
 """
 from pathlib import Path
 import mlx.core as mx
