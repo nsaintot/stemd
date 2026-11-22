@@ -40,7 +40,7 @@ impl Guard {
     ///
     /// Returns `true` when the close should proceed. A running job with no
     /// answer yet returns `false` and puts the question on screen.
-    pub fn intercept(&mut self, running: Option<String>, closing: bool) -> bool {
+    fn intercept(&mut self, running: Option<String>, closing: bool) -> bool {
         if !closing {
             return false;
         }

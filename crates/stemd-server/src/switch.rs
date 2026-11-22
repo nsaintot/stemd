@@ -357,7 +357,7 @@ mod tests {
                         dsp: DspMode::default().into(),
                         parts: stemd_core::Parts::DEFAULT,
                     },
-                    model_id: "test".into(),
+                    cache_id: "test".into(),
                     from_api: true,
                 })
                 .expect("queue has room");

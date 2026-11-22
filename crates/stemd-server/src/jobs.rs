@@ -52,7 +52,7 @@ impl JobResult {
     ///
     /// The URLs are built here because they differ per job: two decks sharing one entry each poll
     /// their own id.
-    pub fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
+    fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
         Self {
             output: crate::output::OutputView::of(&entry.output, None),
             channels: entry.channels,
@@ -465,7 +465,7 @@ impl Entry {
         })
     }
 
-    pub fn last_used(&self) -> Instant {
+    fn last_used(&self) -> Instant {
         self.state.lock().last_used
     }
 

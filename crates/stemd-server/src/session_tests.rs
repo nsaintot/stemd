@@ -95,7 +95,7 @@ fn open_as(
             },
             norm,
             peak: None,
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             claim: None,
         })
         .expect("room for a session")
@@ -290,7 +290,7 @@ fn high_priority_segments_run_between_the_segments_of_a_job() {
             // About eighty segments, so well over a second of work.
             mix: track(80 * 3307, 4),
             output: output(StemFormat::Pcm32),
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             from_api: true,
         })
         .expect("room");
@@ -326,7 +326,7 @@ fn client_jobs_list_the_running_one_then_the_queue_and_skip_drops() {
                 job: Arc::clone(&job),
                 mix: track(40 * 3307, 8),
                 output: output(StemFormat::Pcm32),
-                model_id: "toy-00000000".into(),
+                cache_id: "toy-00000000".into(),
                 from_api,
             })
             .expect("room");
@@ -372,7 +372,7 @@ fn turning_the_server_off_cancels_api_jobs_and_keeps_drops() {
                 job: Arc::clone(&job),
                 mix: track(40 * 3307, 8),
                 output: output(StemFormat::Pcm32),
-                model_id: "toy-00000000".into(),
+                cache_id: "toy-00000000".into(),
                 from_api,
             })
             .expect("room");
@@ -411,7 +411,7 @@ fn normal_priority_segments_wait_for_waiting_jobs() {
             job: Arc::clone(&job),
             mix: track(40 * 3307, 6),
             output: output(StemFormat::Pcm32),
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             from_api: true,
         })
         .expect("room");
@@ -539,7 +539,7 @@ fn stored_within(queue: &Queue, session: &Session, within: Duration) -> bool {
 /// The status, `x-stemd-*` headers and body of a whole-track read.
 fn whole_file(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>, Vec<u8>) {
     let frames = session.track().spec.frames;
-    parts_of(crate::session_api::encode_range(
+    parts_of(crate::api::sessions::encode_range(
         queue.sessions(),
         session,
         name,
@@ -554,7 +554,7 @@ fn sent_whole(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>
     let response = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a runtime")
-        .block_on(crate::stem_http::send_whole(
+        .block_on(crate::api::stem::send_whole(
             session.output.format,
             session.gain,
             whole,
@@ -607,7 +607,7 @@ fn open_at(queue: &Queue, frames: usize, format: StemFormat, rate: OutputRate) -
             },
             norm: None,
             peak: None,
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             claim: None,
         })
         .expect("room for a session")
@@ -658,7 +658,7 @@ fn four_ways(format: StemFormat, rate: OutputRate, seed: u32) -> [(u16, Vec<Stri
         }
     }
     let (from, to) = (frames / 3, frames / 3 + 7000);
-    let fresh_range = parts_of(crate::session_api::encode_range(
+    let fresh_range = parts_of(crate::api::sessions::encode_range(
         queue.sessions(),
         &fresh,
         "vocals",
@@ -678,7 +678,7 @@ fn four_ways(format: StemFormat, rate: OutputRate, seed: u32) -> [(u16, Vec<Stri
     assert!(view.complete, "the whole file does not count as stored");
     let sent = sent_whole(&queue, &whole_session, "vocals");
     if rate == OutputRate::default() {
-        let cut = parts_of(crate::session_api::encode_range(
+        let cut = parts_of(crate::api::sessions::encode_range(
             queue.sessions(),
             &whole_session,
             "vocals",
@@ -864,7 +864,7 @@ fn a_track_with_every_piece_stored_is_stored_whole_once_the_gate_opens() {
     queue.wake();
     assert!(stored_within(&queue, &first, Duration::from_secs(20)));
     let range = |session: &Session| {
-        parts_of(crate::session_api::encode_range(
+        parts_of(crate::api::sessions::encode_range(
             queue.sessions(),
             session,
             "vocals",
@@ -1292,7 +1292,7 @@ fn a_job_stores_its_stems_whole_and_removes_the_pieces() {
             job: Arc::clone(&job),
             mix: mix.clone(),
             output: output(StemFormat::Flac),
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             from_api: true,
         })
         .expect("room");
@@ -1366,7 +1366,7 @@ fn a_jobs_stems_answer_a_later_job_after_a_restart() {
             job: Arc::clone(&job),
             mix,
             output: output(StemFormat::Flac),
-            model_id: "toy-00000000".into(),
+            cache_id: "toy-00000000".into(),
             from_api: true,
         })
         .expect("room");

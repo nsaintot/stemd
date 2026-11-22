@@ -8,9 +8,9 @@ mod separations {
     use serde_json::json;
 
     use crate::api::params::CreateParams;
+    use crate::api::separations::output_of;
     use crate::jobs::{MixShape, job_key};
     use crate::output::Output;
-    use crate::separations::output_of;
     use crate::state::AppState;
     use crate::testkit::{Answer, call, state};
 
@@ -747,7 +747,7 @@ mod v1 {
     use axum::http::{self, Method, StatusCode};
     use serde_json::{Value, json};
 
-    use crate::v1::{FLOOR_DB, LINK};
+    use crate::api::v1::{FLOOR_DB, LINK};
 
     use crate::testkit::{call, state};
 

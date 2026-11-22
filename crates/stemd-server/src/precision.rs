@@ -52,7 +52,7 @@ impl Precisions {
     ///
     /// There is one entry per model, so the key below can tell "both halves at half precision" from
     /// "one at each" without knowing about presets.
-    pub fn for_preset(self, preset: Option<Preset>) -> Vec<Precision> {
+    fn for_preset(self, preset: Option<Preset>) -> Vec<Precision> {
         Preset::families(preset)
             .iter()
             .map(|f| self.of(*f))

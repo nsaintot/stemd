@@ -25,10 +25,10 @@ use tokio::io::AsyncReadExt;
 
 use crate::api::error::ApiError;
 use crate::api::params::{CreateParams, parse_output};
+use crate::api::stem::{check_file_key, check_id, evicted, open_whole, send_whole};
 use crate::held::{Lookup, TypeDir, derivable, derive, lookup, whole_dir};
 use crate::output::{Output, sources};
 use crate::state::AppState;
-use crate::stem_http::{check_file_key, check_id, evicted, open_whole, send_whole};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -39,7 +39,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 /// The bundle's format code for `format`; `mp3` has none.
-pub fn format_code(format: StemFormat) -> Option<u16> {
+fn format_code(format: StemFormat) -> Option<u16> {
     match format {
         StemFormat::Flac => Some(0),
         StemFormat::Wav => Some(1),
@@ -50,9 +50,9 @@ pub fn format_code(format: StemFormat) -> Option<u16> {
 }
 
 /// The number of bytes before the first index entry.
-pub const BUNDLE_HEADER: usize = 24;
+const BUNDLE_HEADER: usize = 24;
 /// The number of bytes per index entry.
-pub const BUNDLE_ENTRY: usize = 32;
+const BUNDLE_ENTRY: usize = 32;
 
 /// One stem of a bundle.
 pub struct Entry {
@@ -63,7 +63,7 @@ pub struct Entry {
 }
 
 /// The header and index of a bundle whose stems follow it in `entries` order.
-pub fn bundle_index(
+fn bundle_index(
     format: StemFormat,
     frames: usize,
     rate: u32,
@@ -148,11 +148,11 @@ async fn answer_for(
     params: &CreateParams,
 ) -> Result<Response, ApiError> {
     let output = output_of(state, params)?;
-    let model_id = state.switcher.cache_id();
+    let cache_id = state.switcher.cache_id();
     let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
     let jobs = Arc::clone(&state.jobs);
     let found = tokio::task::spawn_blocking(move || {
-        lookup(&cache, &sessions, &jobs, &model_id, &output, &id).ok_or_else(|| unknown(&id))
+        lookup(&cache, &sessions, &jobs, &cache_id, &output, &id).ok_or_else(|| unknown(&id))
     })
     .await
     .map_err(|e| ApiError::internal(format!("looking up the separation: {e}")))??;
@@ -171,18 +171,18 @@ async fn resolve(
 ) -> Result<TypeDir, ApiError> {
     check_id(&id)?;
     let output = output_of(state, params)?;
-    let model_id = state.switcher.cache_id();
+    let cache_id = state.switcher.cache_id();
     let (cache, sessions) = (Arc::clone(&state.cache), Arc::clone(state.queue.sessions()));
     let jobs = Arc::clone(&state.jobs);
     tokio::task::spawn_blocking(move || {
-        if let Some(best) = whole_dir(&cache, &model_id, &output, &id) {
+        if let Some(best) = whole_dir(&cache, &cache_id, &output, &id) {
             return Ok(best);
         }
-        if let Some((source, gain)) = derivable(&cache, &model_id, &output, &id) {
-            return derive(&cache, &model_id, &id, &source, &output, gain)
+        if let Some((source, gain)) = derivable(&cache, &cache_id, &output, &id) {
+            return derive(&cache, &cache_id, &id, &source, &output, gain)
                 .map_err(|e| ApiError::internal(format!("converting: {e:#}")));
         }
-        match lookup(&cache, &sessions, &jobs, &model_id, &output, &id) {
+        match lookup(&cache, &sessions, &jobs, &cache_id, &output, &id) {
             Some(held) => Err(ApiError::new(
                 StatusCode::CONFLICT,
                 format!("{id}: expected stored, got {}", held.state.as_str()),

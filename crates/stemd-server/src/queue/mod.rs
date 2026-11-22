@@ -37,7 +37,7 @@ pub struct QueuedWork {
     pub output: Output,
     /// The cache id the job was submitted under, which names the model's
     /// directory in the cache.
-    pub model_id: String,
+    pub cache_id: String,
     /// True for a job submitted over the API, which turning the server off cancels; false for a
     /// drop.
     pub from_api: bool,

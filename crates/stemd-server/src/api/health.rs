@@ -59,7 +59,7 @@ pub(crate) struct Health {
     /// The output a request gets when it names no format, rate or parts. The window sets the format
     /// and rate, which can change while the server runs.
     default_output: OutputView,
-    /// Behaviors a client can test for; see [`FEATURES`].
+    /// Behaviors a client can test for; see [`crate::ident::FEATURES`].
     features: &'static [&'static str],
     /// The median time in seconds the loaded model takes to run one segment; `null` until a segment
     /// has run.
@@ -112,9 +112,6 @@ impl SessionMethods {
     }
 }
 
-/// Behaviors added after protocol 2, listed in `/v2/health` and the TXT record.
-pub const FEATURES: &[&str] = &[];
-
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
     // Ask the queue: the worker owns the separator, so only the queue can name the loaded model
     // without racing a pending switch.
@@ -151,7 +148,7 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
             parts: Parts::DEFAULT.names().map(str::to_owned).collect(),
             derived: Parts::DEFAULT.derived(),
         },
-        features: FEATURES,
+        features: crate::ident::FEATURES,
         segment_run_seconds: state.queue.segment_run_seconds(),
         session: SessionMethods::of(&state.queue),
     })

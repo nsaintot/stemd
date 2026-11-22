@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 
-pub const SERVICE_TYPE: &str = "_stemd._tcp";
+const SERVICE_TYPE: &str = "_stemd._tcp";
 
 /// Holds the registration. Call [`Advertiser::withdraw`] before exiting.
 ///
@@ -43,7 +43,7 @@ impl Advertiser {
         props.insert("version", env!("CARGO_PKG_VERSION").to_owned());
         props.insert("model", model.to_owned());
         props.insert("path", "/v2".to_owned());
-        props.insert("features", crate::api::health::FEATURES.join(","));
+        props.insert("features", crate::ident::FEATURES.join(","));
 
         // Log the interfaces at debug, so a discovery failure on a multi-homed host can be
         // diagnosed from one line; the log buffer keeps debug lines.
@@ -108,7 +108,7 @@ impl Drop for Advertiser {
 /// outcome on exit can be unknown. On the Bonjour platforms, only `Done` occurs.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Withdrawal {
+enum Withdrawal {
     /// The system confirmed it.
     Done,
     /// The system refused it, and the reason is in the log above.

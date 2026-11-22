@@ -195,7 +195,7 @@ pub(super) struct TrackDir {
     whole: bool,
 }
 
-/// How many `<model_id>/<type>/<track>` directories `root` holds.
+/// How many `<cache_id>/<type>/<track>` directories `root` holds.
 pub(super) fn count_tracks(root: &Path) -> usize {
     subdirs(root)
         .iter()
@@ -205,7 +205,7 @@ pub(super) fn count_tracks(root: &Path) -> usize {
         .sum()
 }
 
-/// Every `<model_id>/<type>/<track>` directory under `root`. A directory without a `.used` file
+/// Every `<cache_id>/<type>/<track>` directory under `root`. A directory without a `.used` file
 /// counts as last used when its newest file was written.
 pub(super) fn track_dirs(root: &Path) -> Vec<TrackDir> {
     let mut out = Vec::new();

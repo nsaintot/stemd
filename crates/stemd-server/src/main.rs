@@ -36,10 +36,8 @@ mod precision;
 mod queue;
 #[cfg(test)]
 mod scratch;
-mod separations;
 mod serve;
 mod serving;
-mod session_api;
 #[cfg(test)]
 mod session_tests;
 mod sessions;
@@ -47,13 +45,11 @@ mod settings;
 mod shutdown;
 mod startup;
 mod state;
-mod stem_http;
 mod switch;
 #[cfg(test)]
 mod testkit;
 mod ui;
 mod update;
-mod v1;
 mod whole;
 
 use anyhow::Result;
@@ -75,16 +71,17 @@ fn main() -> Result<()> {
         return install_cuda();
     }
     // Lock before `prepare`, which clears the cache root, and hold the lock until the process ends.
-    let _instance = cache::lock(&args.cache_root()?)?;
-    let settings = std::sync::Arc::new(startup::open_settings(&args)?);
+    let config = args.config()?;
+    let _instance = cache::lock(&config.cache_root)?;
+    let settings = std::sync::Arc::new(args.open_settings()?);
     let (listener, taken) = match args.bind {
         Some(addr) => (endpoint::bind(addr)?, None),
         None => endpoint::bind_saved(settings.get().port)?,
     };
-    if args.headless {
-        serve::headless(&args, logs, settings, listener, taken)
+    if config.headless {
+        serve::headless(&config, logs, settings, listener, taken)
     } else {
-        serve::windowed(args, logs, settings, listener, taken)
+        serve::windowed(config, logs, settings, listener, taken)
     }
 }
 

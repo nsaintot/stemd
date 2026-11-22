@@ -514,7 +514,7 @@ fn save(path: &Path, settings: &Settings) -> Result<()> {
     let text = serde_json::to_string_pretty(&Stored::from_settings(settings))?;
     let staging = path.with_extension("json.new");
     std::fs::write(&staging, &text).with_context(|| format!("writing {}", staging.display()))?;
-    std::fs::rename(&staging, path).with_context(|| format!("installing {}", path.display()))
+    crate::disk::publish(&staging, path)
 }
 
 #[cfg(test)]

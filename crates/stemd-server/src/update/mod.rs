@@ -24,6 +24,7 @@ use release as imp;
 use sparkle as imp;
 
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -75,6 +76,24 @@ static CTX: OnceLock<egui::Context> = OnceLock::new();
 pub fn start(ctx: &egui::Context) {
     if CTX.set(ctx.clone()).is_ok() {
         imp::start();
+    }
+}
+
+/// How long "Up to date" and "Check failed" stay in the slot.
+const NOTICE: Duration = Duration::from_millis(2600);
+
+/// When a notice in the slot expires.
+#[derive(Clone, Copy, Debug)]
+struct Notice(Instant);
+
+impl Notice {
+    /// A notice shown from now for [`NOTICE`].
+    fn now() -> Self {
+        Self(Instant::now() + NOTICE)
+    }
+
+    fn expired(self) -> bool {
+        Instant::now() >= self.0
     }
 }
 

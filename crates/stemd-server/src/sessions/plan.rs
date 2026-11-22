@@ -11,10 +11,11 @@ use stemd_core::Grid;
 pub const BEFORE_JOBS: u8 = 50;
 
 /// The highest priority a region may ask for.
-pub const MAX_PRIORITY: u8 = 99;
+// pub(super) for sessions/tests.rs, as is MAX_REGIONS.
+pub(super) const MAX_PRIORITY: u8 = 99;
 
 /// The most regions one window may hold.
-pub const MAX_REGIONS: usize = 32;
+pub(super) const MAX_REGIONS: usize = 32;
 
 /// Which planned segments the worker takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

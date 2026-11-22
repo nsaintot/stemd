@@ -6,21 +6,20 @@
 //! offers to download Setup. Once Setup is ready and nothing is running, the
 //! app starts it and closes; Setup installs and starts Stemd again.
 
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(windows)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 
 use super::github::{self, Release};
-use super::{Status, VERSION, repaint};
+use super::{Notice, Status, VERSION, repaint};
 
 /// Time between background checks, in wall time so a computer that sleeps still checks daily.
 const RECHECK: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often the check thread looks at the clock.
 const WAKE: Duration = Duration::from_secs(60 * 60);
-
-/// How long "Up to date" and "Check failed" stay in the slot.
-const NOTICE: Duration = Duration::from_millis(2600);
 
 /// A download that has not moved for this long has stalled.
 #[cfg(windows)]
@@ -33,13 +32,13 @@ enum Phase {
         user: bool,
     },
     UpToDate {
-        until: Instant,
+        until: Notice,
     },
     /// `after` is the status the slot returns to when the notice expires.
     Failed {
         title: &'static str,
         error: String,
-        until: Instant,
+        until: Notice,
         after: Option<Release>,
     },
     Available(Release),
@@ -130,7 +129,7 @@ fn check_now(user: bool) {
     };
     let latest = github::latest();
     let user = matches!(*PHASE.lock(), Phase::Checking { user: true });
-    let until = Instant::now() + NOTICE;
+    let until = Notice::now();
     set(match latest {
         Ok(release) if super::newer(release.version(), VERSION) => {
             tracing::info!("update available: {}", release.version());
@@ -156,15 +155,16 @@ fn check_now(user: bool) {
 
 pub fn status() -> Status {
     let mut phase = PHASE.lock();
+    #[cfg(windows)]
     let now = Instant::now();
     match &mut *phase {
         Phase::Idle | Phase::Checking { user: false } => Status::Idle,
         Phase::Checking { user: true } => Status::Checking,
-        Phase::UpToDate { until } if now >= *until => {
+        Phase::UpToDate { until } if until.expired() => {
             *phase = Phase::Idle;
             Status::Idle
         }
-        Phase::Failed { until, after, .. } if now >= *until => {
+        Phase::Failed { until, after, .. } if until.expired() => {
             let after = after.take();
             let status = after.as_ref().map_or(Status::Idle, |release| {
                 Status::Available(release.version().to_owned())
@@ -189,7 +189,7 @@ pub fn status() -> Status {
             *phase = Phase::Failed {
                 title: "Download failed",
                 error: error.clone(),
-                until: now + NOTICE,
+                until: Notice::now(),
                 after: Some(release.clone()),
             };
             Status::Failed {
@@ -303,7 +303,7 @@ pub fn answer(install: bool) {
                 Phase::Failed {
                     title: "Download failed",
                     error: format!("{err:#}"),
-                    until: Instant::now() + NOTICE,
+                    until: Notice::now(),
                     after: Some(release),
                 }
             }
@@ -340,7 +340,7 @@ pub fn tick(idle: bool) -> bool {
                             *phase = Phase::Failed {
                                 title: "Install failed",
                                 error: format!("{err:#}"),
-                                until: Instant::now() + NOTICE,
+                                until: Notice::now(),
                                 after: Some(release),
                             };
                         }

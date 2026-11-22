@@ -33,7 +33,7 @@ pub const REMEMBERED: usize = 12;
 
 /// The number of finished drops kept in memory to answer a repeat drop without separating. It is
 /// independent of [`REMEMBERED`]: removing a row from the list keeps its entry here.
-pub const HISTORY: usize = 25;
+const HISTORY: usize = 25;
 
 /// The suffix of a stems folder's name, after the track's name. It is defined once because the
 /// window's delete control checks it before deleting anything recursively.
@@ -606,7 +606,7 @@ fn separate(
                 job: Arc::clone(&job),
                 mix,
                 output,
-                model_id: cache_id,
+                cache_id,
                 from_api: false,
             })?;
             job
