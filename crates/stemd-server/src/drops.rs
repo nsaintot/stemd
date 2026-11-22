@@ -1,7 +1,7 @@
 //! Files dropped on the window.
 //!
 //! A drop is the same job a `POST /v2/jobs` makes: identified by the same track
-//! id, claimed in the same store, separated by the same worker, kept in the same
+//! id, claimed in the same job table, separated by the same worker, kept in the same
 //! cache. Dropping a track a deck already asked for joins that separation, and
 //! dropping the same file twice is a cache hit. What differs is the two ends:
 //! the audio comes from a file, and the stems are written to a folder.
@@ -156,7 +156,7 @@ impl Dropped {
         }
         if !job.view().progress.stage.is_terminal() {
             state.queue.cancel(&job.id);
-            state.store.remove(&job.id);
+            state.jobs.remove(&job.id);
         }
         true
     }
@@ -544,13 +544,14 @@ fn read(state: &AppState, path: &Path) -> Result<Audio> {
         .with_context(|| format!("decoding {}", path.display()))?;
 
     let secs = audio.duration_secs();
-    if secs > state.max_track_secs {
+    let max_secs = state.max_track_secs();
+    if secs > max_secs {
         anyhow::bail!(
             "track is {:.1} minutes; this server accepts up to {:.0}. Separation \
              memory grows with length, so longer tracks are refused rather than \
              risked",
             secs / 60.0,
-            state.max_track_secs / 60.0
+            max_secs / 60.0
         );
     }
 
@@ -605,8 +606,8 @@ fn separate(
     }
 
     // Claim before enqueuing, exactly as the HTTP path does: it is the same
-    // store, so a drop can join a separation a deck already started.
-    let job = match state.store.claim(&key, crate::jobs::MixShape::of(&mix)) {
+    // table, so a drop can join a separation a deck already started.
+    let job = match state.jobs.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Ok(job) => {
             // The stems are stored in the cache first. The folder beside the
             // track is checked for the stems' own size once they exist.

@@ -88,6 +88,24 @@ pub fn memory_pressure() -> bool {
     }
 }
 
+/// Peak memory of a separation: a fixed part, and a part per minute of audio.
+const SEPARATION_BASE: u64 = 1_800_000_000;
+const SEPARATION_PER_MINUTE: u64 = 155_000_000;
+
+/// Longest track, in minutes, whose separation fits in three quarters of this
+/// machine's memory. Assumes 8 GB where memory is not read.
+pub fn longest_track_minutes() -> u32 {
+    static LONGEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LONGEST.get_or_init(|| longest_for(physical_memory().unwrap_or(8 << 30)))
+}
+
+fn longest_for(ram: u64) -> u32 {
+    let room = (ram / 4 * 3).saturating_sub(SEPARATION_BASE);
+    u32::try_from(room / SEPARATION_PER_MINUTE)
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 /// Bytes of physical memory, or `None` where it is not read.
 pub fn physical_memory() -> Option<u64> {
     #[cfg(unix)]
@@ -101,7 +119,17 @@ pub fn physical_memory() -> Option<u64> {
         };
         (pages > 0 && size > 0).then(|| pages as u64 * size as u64)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..MEMORYSTATUSEX::default()
+        };
+        // SAFETY: `status` is a live MEMORYSTATUSEX with its length set.
+        (unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0).then_some(status.ullTotalPhys)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
@@ -142,6 +170,14 @@ fn free_at(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_longest_track_follows_the_machines_memory() {
+        assert_eq!(longest_for(8 << 30), 29);
+        assert_eq!(longest_for(16 << 30), 71);
+        assert_eq!(longest_for(64 << 30), 320);
+        assert_eq!(longest_for(2 << 30), 1, "never below a minute");
+    }
 
     #[test]
     fn the_temp_volume_has_a_free_size() {

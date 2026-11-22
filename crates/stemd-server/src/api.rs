@@ -36,15 +36,15 @@ use tokio_util::io::ReaderStream;
 
 use crate::cache::Cache;
 use crate::filters::{Dsp, Filters};
-use crate::jobs::{Entry, JobStore};
+use crate::jobs::{Entry, Jobs};
 use crate::logbuf::LogBuffer;
 use crate::models::Preset;
 use crate::output::Output;
 use crate::queue::{Queue, QueuedWork};
-use crate::settings::SettingsStore;
+use crate::settings::SettingsFile;
 
 pub struct AppState {
-    pub store: Arc<JobStore>,
+    pub jobs: Arc<Jobs>,
     /// The one cache of separated stems; the same as the sessions'.
     pub cache: Arc<Cache>,
     pub queue: Arc<Queue>,
@@ -54,11 +54,7 @@ pub struct AppState {
     pub drops: Arc<crate::drops::Drops>,
     /// What a request that names no output format or rate gets. Live: the window
     /// changes these while the server is running.
-    pub settings: Arc<SettingsStore>,
-    /// Longest track accepted, from `--max-track-minutes`. Advertised in
-    /// `/v2/health` so a client can refuse locally instead of uploading a track
-    /// it will be told to take back.
-    pub max_track_secs: f64,
+    pub settings: Arc<SettingsFile>,
     /// Whether the API answers, and its mDNS advertisement. Shared so every
     /// exit path can withdraw the advertisement: macOS skips Drop on Cmd-Q.
     pub serving: crate::serving::Serving,
@@ -66,6 +62,26 @@ pub struct AppState {
     pub filters: Arc<Filters>,
     /// Empty the cache at quit, from `--ephemeral`.
     pub ephemeral: bool,
+    /// Where the API listens.
+    pub endpoint: crate::endpoint::Endpoint,
+}
+
+impl AppState {
+    /// Longest track accepted: the saved length, never past what this machine's memory holds.
+    pub fn max_track_secs(&self) -> f64 {
+        self.settings
+            .get()
+            .max_track_secs(crate::disk::longest_track_minutes())
+    }
+
+    /// Largest request body to buffer: the longest track at the widest format.
+    pub fn max_body_bytes(&self) -> usize {
+        crate::startup::max_body_bytes(
+            self.max_track_secs(),
+            crate::startup::highest_rate(),
+            self.queue.info().channels,
+        )
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -232,13 +248,13 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
         channels: info.channels,
         preset: state.switcher.current().map(Preset::label),
         model_id: state.switcher.published_identity(),
-        completed_jobs: state.store.len(),
+        completed_jobs: state.jobs.len(),
         queue_depth: state.queue.depth(),
         running_job: state.queue.running(),
         cached_tracks: cache.tracks,
         cached_bytes: cache.bytes,
         cache_max_bytes: cache.max_bytes,
-        max_track_seconds: state.max_track_secs,
+        max_track_seconds: state.max_track_secs(),
         output_sample_rates: OutputRate::ALL.iter().map(|r| r.hz()).collect(),
         dsp_modes: DspMode::ALL.iter().map(|m| m.id()).collect(),
         dsp_mode_pairs: DspMode::ALL
@@ -503,13 +519,14 @@ impl Submission {
         // Length is exact from the byte count, so an over-long track is refused
         // before it is hashed or decoded rather than after it has been paid for.
         let secs = track_seconds(body.len(), params, in_format);
-        if secs > state.max_track_secs {
+        let max_secs = state.max_track_secs();
+        if secs > max_secs {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
                     "track is {:.1} minutes; this server accepts up to {:.0}",
                     secs / 60.0,
-                    state.max_track_secs / 60.0
+                    max_secs / 60.0
                 ),
             ));
         }
@@ -651,7 +668,7 @@ pub(crate) async fn submit(
     // Claim before the lookup: `claim` registers the job under the same lock
     // that looks for one, so simultaneous requests for the same track collapse
     // onto a single separation.
-    let job = match state.store.claim(&key, crate::jobs::MixShape::of(&mix)) {
+    let job = match state.jobs.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Err(existing) => {
             tracing::debug!(
                 job = %existing.id,
@@ -728,7 +745,7 @@ async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
     Ok(Json(live_view(&state, &job)).into_response())
 }
 
@@ -737,7 +754,7 @@ async fn join_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
     job.join();
     Ok(Json(live_view(&state, &job)).into_response())
 }
@@ -746,7 +763,7 @@ pub(crate) async fn delete_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
 
     // Two decks can share one job. Cancelling on the first `DELETE` would take
     // the separation out from under the other one, so only the last waiter
@@ -761,7 +778,7 @@ pub(crate) async fn delete_job(
     // worker reports what it actually stopped. Removing first would only widen
     // the window in which a re-submission of the same track cannot join.
     let cancelled = state.queue.cancel(&id);
-    state.store.remove(&id);
+    state.jobs.remove(&id);
     if cancelled {
         tracing::info!(job = %id, "cancelled");
     }
@@ -772,7 +789,7 @@ pub(crate) async fn get_stem(
     State(state): State<Arc<AppState>>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
     let entry =
         job.entry.lock().clone().ok_or_else(|| {
             ApiError::new(StatusCode::CONFLICT, "job has not finished separating")

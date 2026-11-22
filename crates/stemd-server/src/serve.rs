@@ -7,12 +7,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request, State};
 
 use crate::api::{self, AppState};
 use crate::cli::Args;
+use crate::endpoint::{Endpoint, Moves};
 use crate::launch::{Launch, Stage};
 use crate::logbuf::LogBuffer;
+use crate::settings::SettingsFile;
 
 /// Take the port before [`crate::startup::prepare`] loads the model, so a port
 /// in use fails in milliseconds.
@@ -27,21 +29,42 @@ pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
     Ok(listener)
 }
 
+/// Bind `port` on every interface, else 8420, else any free port; return `port` after a fallback.
+pub fn bind_saved(port: u16) -> Result<(std::net::TcpListener, Option<u16>)> {
+    let any = |port: u16| SocketAddr::from(([0, 0, 0, 0], port));
+    let err = match bind(any(port)) {
+        Ok(listener) => return Ok((listener, None)),
+        Err(err) => err,
+    };
+    let fallback = crate::settings::DEFAULT_PORT;
+    let listener = match (port != fallback).then(|| bind(any(fallback))) {
+        Some(Ok(listener)) => listener,
+        _ => bind(any(0))?,
+    };
+    tracing::warn!(
+        "{err:#}; serving on port {} instead",
+        listener.local_addr()?.port()
+    );
+    Ok((listener, Some(port)))
+}
+
 /// Prepare the server, then serve until a signal arrives.
-pub fn headless(args: &Args, logs: LogBuffer, listener: std::net::TcpListener) -> Result<()> {
+pub fn headless(
+    args: &Args,
+    logs: LogBuffer,
+    settings: Arc<SettingsFile>,
+    listener: std::net::TcpListener,
+    taken: Option<u16>,
+) -> Result<()> {
     let addr = listener.local_addr().context("reading the bound address")?;
+    let (endpoint, moves) = Endpoint::new(addr, taken);
     let launch = Arc::new(Launch::default());
-    let server = crate::startup::prepare(args, logs, addr, &launch)?;
+    let server = crate::startup::prepare(args, logs, settings, endpoint, &launch)?;
     let runtime = runtime()?;
     launch.finish(Arc::clone(&server.state));
     watch_for_signals(&runtime, &launch);
     runtime
-        .block_on(listen(
-            server.state,
-            listener,
-            server.max_upload,
-            server.cache_summary,
-        ))
+        .block_on(listen(server.state, listener, moves, server.cache_summary))
         .context("serving")
 }
 
@@ -50,11 +73,18 @@ pub fn headless(args: &Args, logs: LogBuffer, listener: std::net::TcpListener) -
 /// With no model on disk the window asks which one to download, then shows the
 /// download and the load. Serving starts when the model is loaded. A failed
 /// startup is shown in the window until it is closed.
-pub fn windowed(args: Args, logs: LogBuffer, listener: std::net::TcpListener) -> Result<()> {
+pub fn windowed(
+    args: Args,
+    logs: LogBuffer,
+    settings: Arc<SettingsFile>,
+    listener: std::net::TcpListener,
+    taken: Option<u16>,
+) -> Result<()> {
     // The address the socket actually got, which is the one to show and to
     // advertise. It answers `--bind :0`, where the requested address names no
     // port anyone could connect to.
     let bind = listener.local_addr().context("reading the bound address")?;
+    let (endpoint, moves) = Endpoint::new(bind, taken);
     let runtime = runtime()?;
     let launch = Arc::new(Launch::windowed());
 
@@ -70,19 +100,14 @@ pub fn windowed(args: Args, logs: LogBuffer, listener: std::net::TcpListener) ->
         .name("stemd-startup".into())
         .spawn(move || {
             let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::startup::prepare(&args, logs, bind, &behind)
+                crate::startup::prepare(&args, logs, settings, endpoint, &behind)
             }));
             match prepared {
                 Ok(Ok(server)) => {
                     let state = Arc::clone(&server.state);
                     handle.spawn(async move {
-                        if let Err(err) = listen(
-                            server.state,
-                            listener,
-                            server.max_upload,
-                            server.cache_summary,
-                        )
-                        .await
+                        if let Err(err) =
+                            listen(server.state, listener, moves, server.cache_summary).await
                         {
                             tracing::error!("{err:#}");
                         }
@@ -101,7 +126,7 @@ pub fn windowed(args: Args, logs: LogBuffer, listener: std::net::TcpListener) ->
         })
         .context("spawning the startup thread")?;
 
-    window(&launch, bind)
+    window(&launch)
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -111,36 +136,72 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("building the tokio runtime")
 }
 
-/// Serve on a listener that is already bound.
-///
-/// The binding is [`bind`]'s, done before the model was loaded. All this does is
-/// hand the socket to tokio, which has to happen on a runtime thread and so
-/// cannot happen there.
+/// Serve on a listener that is already bound, then on each one `moves` hands
+/// over. The first binding is [`bind`]'s, done before the model was loaded.
 async fn listen(
     state: Arc<AppState>,
     listener: std::net::TcpListener,
-    max_upload: usize,
+    moves: Moves,
     cache_summary: String,
 ) -> Result<()> {
     let defaults = state.settings.get();
-    let app = api::router(state)
-        .layer(DefaultBodyLimit::max(max_upload))
+    let app = api::router(Arc::clone(&state))
+        .layer(axum::middleware::from_fn_with_state(state, limit_body))
+        .layer(DefaultBodyLimit::disable())
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let listener =
-        tokio::net::TcpListener::from_std(listener).context("handing the listener to tokio")?;
     tracing::info!(
         "listening on http://{} (stems in {cache_summary}, output {} at {} Hz by default)",
         listener.local_addr()?,
         defaults.format,
         defaults.rate.hz()
     );
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("server failed")
+    serve_moving(app, listener, moves).await
+}
+
+/// Serve `app` on `listener`, then on each listener `moves` hands over. The old
+/// listener stops accepting; its open requests finish on their own.
+async fn serve_moving(
+    app: axum::Router,
+    mut listener: std::net::TcpListener,
+    mut moves: Moves,
+) -> Result<()> {
+    loop {
+        let tokio_listener =
+            tokio::net::TcpListener::from_std(listener).context("handing the listener to tokio")?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served = axum::serve(
+            tokio_listener,
+            app.clone()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        });
+        let mut task = tokio::spawn(served.into_future());
+        tokio::select! {
+            next = moves.recv() => match next {
+                Some(next) => {
+                    let _ = stop.send(());
+                    listener = next;
+                }
+                None => return task.await.context("server task")?.context("server failed"),
+            },
+            done = &mut task => return done.context("server task")?.context("server failed"),
+        }
+    }
+}
+
+/// Refuse a body past the longest track the settings allow, read per request so
+/// a change applies at once.
+async fn limit_body(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let limit = state.max_body_bytes();
+    next.run(request.map(|body| axum::body::Body::new(http_body_util::Limited::new(body, limit))))
+        .await
 }
 
 /// Shut down cleanly when the system asks the process to stop.
@@ -210,7 +271,50 @@ async fn asked_to_stop() -> bool {
 /// `exit()` the moment its delegate returns, so the only path reaching the line
 /// below is `run_native` failing before the window is up. Windows and Linux return
 /// normally when the event loop ends.
-fn window(launch: &Arc<Launch>, bind: SocketAddr) -> Result<()> {
-    crate::ui::run(Arc::clone(launch), bind).map_err(|e| anyhow::anyhow!("{e}"))?;
+fn window(launch: &Arc<Launch>) -> Result<()> {
+    crate::ui::run(Arc::clone(launch)).map_err(|e| anyhow::anyhow!("{e}"))?;
     crate::shutdown::quit(launch, "window closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn get(addr: std::net::SocketAddr) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await?;
+        Ok(reply)
+    }
+
+    #[tokio::test]
+    async fn a_move_serves_on_the_new_port_and_closes_the_old_one() {
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "here" }));
+        let first = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let old = first.local_addr().unwrap();
+        let (endpoint, moves) = Endpoint::new(old, None);
+        tokio::spawn(serve_moving(app, first, moves));
+        assert!(get(old).await.unwrap().ends_with("here"));
+
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        endpoint.move_to(port).unwrap();
+        let new = std::net::SocketAddr::new(old.ip(), port);
+        let mut reply = Err(std::io::ErrorKind::NotConnected.into());
+        for _ in 0..50 {
+            reply = get(new).await;
+            if reply.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(reply.unwrap().ends_with("here"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(get(old).await.is_err(), "the old port still answers");
+    }
 }

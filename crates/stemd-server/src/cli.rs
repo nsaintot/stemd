@@ -34,9 +34,12 @@ pub struct Args {
     #[arg(long, default_value_t = 0.25)]
     pub overlap: f32,
 
-    /// Address to bind.
-    #[arg(long, default_value = "0.0.0.0:8420")]
-    pub bind: SocketAddr,
+    /// Address to bind, such as `127.0.0.1:8420`.
+    ///
+    /// Overrides the saved port for this run. Unset binds every interface on the
+    /// saved port, 8420 by default.
+    #[arg(long)]
+    pub bind: Option<SocketAddr>,
 
     /// Where separated stems are kept, across restarts. Defaults to a `stemd`
     /// directory under the platform's cache directory.
@@ -85,16 +88,20 @@ pub struct Args {
     /// disk minus 2 GB. Past this, partial tracks go first, oldest first, then
     /// whole tracks, least recently used first. A six-minute track costs about
     /// 40 MB as 44.1 kHz FLAC with two parts and the derived one.
-    #[arg(long, alias = "pieces-max-gb", default_value_t = 8.0)]
-    pub cache_max_gb: f64,
+    ///
+    /// Overrides the saved setting, 8 by default, for this run.
+    #[arg(long, alias = "pieces-max-gb")]
+    pub cache_max_gb: Option<f64>,
 
     /// Hours a partial track, with some stem not stored whole, is kept unused.
     #[arg(long, default_value_t = 24.0)]
     pub partial_max_hours: f64,
 
-    /// Days a whole track is kept unused.
-    #[arg(long, default_value_t = 30.0)]
-    pub whole_max_days: f64,
+    /// Days a whole track is kept unused; 0 keeps it until the cache is full.
+    ///
+    /// Overrides the saved setting, 30 by default, for this run.
+    #[arg(long)]
+    pub whole_max_days: Option<f64>,
 
     /// Empty the cache at start and at quit, for a borrowed machine.
     #[arg(long)]
@@ -110,8 +117,12 @@ pub struct Args {
     /// Peak memory is roughly 1.8 GB plus 155 MB per audio-minute, so length is what
     /// bounds it. The HTTP body limit is derived from this rather than configured
     /// separately: the upload is raw PCM, so a second knob could only disagree.
-    #[arg(long, default_value_t = 10.0)]
-    pub max_track_minutes: f64,
+    ///
+    /// Overrides the saved setting, 10 by default, for this run. Capped at the
+    /// longest track that fits in three quarters of the machine's memory; 0 uses
+    /// that cap.
+    #[arg(long)]
+    pub max_track_minutes: Option<f64>,
 
     /// mDNS instance name clients will see.
     #[arg(long, default_value = "stemd")]
@@ -161,27 +172,30 @@ impl Args {
         }
     }
 
-    pub fn max_track_secs(&self) -> f64 {
-        self.max_track_minutes * 60.0
-    }
-
     pub fn unfetched_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.unfetched_ttl)
     }
 
-    pub fn cache_max_bytes(&self) -> u64 {
-        const BYTES_PER_GB: f64 = 1e9;
-        (self.cache_max_gb.max(0.0) * BYTES_PER_GB) as u64
-    }
-
-    /// The cache's deletion rules.
-    pub fn cache_rules(&self) -> crate::cache::Rules {
-        let secs = |s: f64| std::time::Duration::from_secs_f64(s.max(0.0));
+    /// The cache's deletion rules, with the size and whole-track age `settings` holds.
+    pub fn cache_rules(&self, settings: &crate::settings::Settings) -> crate::cache::Rules {
+        let (max_bytes, whole_max_age) = settings.cache_limits();
         crate::cache::Rules {
-            max_bytes: self.cache_max_bytes(),
-            partial_max_age: secs(self.partial_max_hours * 3600.0),
-            whole_max_age: secs(self.whole_max_days * 86400.0),
+            max_bytes,
+            partial_max_age: crate::settings::saturating_secs(self.partial_max_hours * 3600.0),
+            whole_max_age,
             unfetched_ttl: self.unfetched_ttl(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_age_past_what_a_duration_holds_keeps_partial_tracks_forever() {
+        let args = Args::parse_from(["stemd", "--partial-max-hours", "inf"]);
+        let rules = args.cache_rules(&crate::settings::Settings::default());
+        assert_eq!(rules.partial_max_age, std::time::Duration::MAX);
     }
 }

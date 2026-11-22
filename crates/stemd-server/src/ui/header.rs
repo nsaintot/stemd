@@ -11,7 +11,7 @@ use stemd_core::{OutputRate, PART_NAMES, StemFormat};
 
 use crate::api::AppState;
 use crate::models::Preset;
-use crate::settings::{DropParts, SettingsStore};
+use crate::settings::{DropParts, SettingsFile};
 use crate::switch::{SwitchState, Switcher};
 
 use super::icons;
@@ -35,7 +35,7 @@ const CAP_HEIGHT: f32 = 28.0;
 const CHEVRON: f32 = 8.0;
 
 /// Shown on an output control a command-line flag fixed for this run.
-const PINNED_HINT: &str = "Set on the command line for this run. Restart without \
+pub const PINNED_HINT: &str = "Set on the command line for this run. Restart without \
                            the flag to change it here.";
 
 /// Least room between the model control and the capsule.
@@ -374,7 +374,7 @@ fn cap_button(
 /// own parts and are not affected.
 fn parts_menu(
     ui: &mut egui::Ui,
-    settings: &SettingsStore,
+    settings: &SettingsFile,
     current: DropParts,
     state: &AppState,
     palette: &Palette,
@@ -430,12 +430,7 @@ fn parts_menu(
     }
 }
 
-fn format_menu(
-    ui: &mut egui::Ui,
-    settings: &SettingsStore,
-    current: StemFormat,
-    palette: &Palette,
-) {
+fn format_menu(ui: &mut egui::Ui, settings: &SettingsFile, current: StemFormat, palette: &Palette) {
     let labels: Vec<_> = StemFormat::ALL
         .iter()
         .map(|f| (f.label().to_owned(), *f == current, format_hint(*f)))
@@ -449,7 +444,7 @@ fn format_menu(
 /// choice that produces a 48 kHz file anyway.
 fn rate_menu(
     ui: &mut egui::Ui,
-    settings: &SettingsStore,
+    settings: &SettingsFile,
     format: StemFormat,
     current: OutputRate,
     palette: &Palette,

@@ -284,10 +284,12 @@ STEMD_EMBED_MODELS=1 ./scripts/bundle-app.sh   # copy weights in, offline instal
 
 ## Flags
 
-Three settings live in the window rather than here and are remembered between
-launches: the model, and the output format and sample rate a client gets when it
-does not ask for one. The flags below override them for one run without changing
-what is saved, and the window greys out a control a flag has taken over.
+Some settings live in the window and are remembered between
+launches: the model, the output format and sample rate a client gets when it
+does not ask for one, and, in the Settings sheet, the longest track, the port,
+and the cache's size and age. The flags below override them for one run without
+changing what is saved, and the window greys out a control a flag has taken
+over.
 
 `settings.json` in the user data directory holds them. It is plain JSON and safe
 to edit or delete. Anything unreadable in it falls back to the default for that
@@ -296,7 +298,7 @@ launch.
 
 | flag | default | |
 | --- | --- | --- |
-| `--bind` | `0.0.0.0:8420` | |
+| `--bind` | `0.0.0.0` on the saved port | a saved port in use falls back to `8420`, then any free port; `--bind` in use fails the launch |
 | `--demucs-model` | saved, else `htdemucs` | any artefact in `--models` |
 | `--output-format` | saved, else `flac` | `wav`, `mp3`, `pcm16`, `pcm32` |
 | `--output-sample-rate` | saved, else `44100` | `24000`, `48000`, `96000` (not `mp3`) |
@@ -304,12 +306,12 @@ launch.
 | `--overlap` | `0.25` | segment overlap fraction |
 | `--full-precision` | off | float32 model, 1.3x slower |
 | `--cache-dir` | user cache directory | kept across restarts; alias `--pieces-dir` |
-| `--cache-max-gb` | `8` | about 200 six-minute tracks as 44.1 kHz flac; alias `--pieces-max-gb` |
+| `--cache-max-gb` | saved, else `8` | about 200 six-minute tracks as 44.1 kHz flac; alias `--pieces-max-gb` |
 | `--partial-max-hours` | `24` | a track with a stem still in pieces, unused |
-| `--whole-max-days` | `30` | a track with every stem whole, unused |
+| `--whole-max-days` | saved, else `30` | a track with every stem whole, unused; `0` keeps it until the cache is full |
 | `--ephemeral` | off | empty the cache at start and at quit |
 | `--unfetched-ttl` | `300` | seconds a job result is held for its client |
-| `--max-track-minutes` | `10` | the only size limit, body cap derived |
+| `--max-track-minutes` | saved, else `10` | the only size limit, body cap derived; capped by memory, `0` takes that cap |
 | `--queue-depth` | `16` | `429` past this |
 | `--models` | `models` | searched before the download cache |
 | `--instance` | `stemd` | mDNS name |

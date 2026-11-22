@@ -5,7 +5,7 @@
 //! work either way.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -13,8 +13,9 @@ use crate::discovery::Advertiser;
 
 pub struct Serving {
     shared: Arc<Shared>,
-    /// Instance name and port to advertise under; `None` with `--no-mdns`.
-    announce: Option<(String, u16)>,
+    /// Instance name to advertise under; `None` with `--no-mdns`.
+    instance: Option<String>,
+    port: AtomicU16,
 }
 
 #[derive(Default)]
@@ -36,7 +37,8 @@ impl Serving {
                 on: AtomicBool::new(on),
                 ..Shared::default()
             }),
-            announce,
+            port: AtomicU16::new(announce.as_ref().map_or(0, |(_, port)| *port)),
+            instance: announce.map(|(instance, _)| instance),
         };
         if on {
             serving.advertise(model);
@@ -63,6 +65,15 @@ impl Serving {
         }
     }
 
+    /// Advertise `port` from now on, moving the advertisement if it is up.
+    pub fn move_to(&self, port: u16, model: &str) {
+        self.port.store(port, Ordering::SeqCst);
+        if self.is_on() {
+            self.withdraw();
+            self.advertise(model);
+        }
+    }
+
     /// Take the advertisement down, for turning off and for quitting.
     pub fn withdraw(&self) {
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -75,9 +86,10 @@ impl Serving {
     /// enough to stall the window. A failure is a warning: a client with the
     /// address configured out of band still works.
     fn advertise(&self, model: &str) {
-        let Some((instance, port)) = self.announce.clone() else {
+        let Some(instance) = self.instance.clone() else {
             return;
         };
+        let port = self.port.load(Ordering::SeqCst);
         let shared = Arc::clone(&self.shared);
         let model = model.to_owned();
         let generation = shared.generation.load(Ordering::SeqCst);

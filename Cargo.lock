@@ -3474,6 +3474,7 @@ dependencies = [
  "clap",
  "dirs",
  "eframe",
+ "http-body-util",
  "if-addrs",
  "libc",
  "objc2 0.6.4",

@@ -1,5 +1,6 @@
-//! Fixtures shared by the cache, job-store, queue and HTTP tests.
+//! Fixtures shared by the cache, job, queue and HTTP tests.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -114,7 +115,7 @@ pub fn state() -> Arc<AppState> {
             .expect("the toy builds")
             .0,
     );
-    let settings = Arc::new(crate::settings::SettingsStore::open(
+    let settings = Arc::new(crate::settings::SettingsFile::open(
         dir.join("settings.json"),
     ));
     let switcher = Arc::new(crate::switch::Switcher::new(
@@ -131,17 +132,17 @@ pub fn state() -> Arc<AppState> {
         },
     ));
     Arc::new(AppState {
-        store: Arc::new(crate::jobs::JobStore::new(Duration::from_secs(60))),
+        jobs: Arc::new(crate::jobs::Jobs::new(Duration::from_secs(60))),
         cache,
         queue,
         switcher,
         logs: crate::logbuf::LogBuffer::new(16),
         drops: Arc::default(),
         settings,
-        max_track_secs: 600.0,
         serving: crate::serving::Serving::new(true, None, "toy"),
         filters: crate::filters::Filters::open(dir.join("filters"), 4).expect("filters"),
         ephemeral: false,
+        endpoint: crate::endpoint::Endpoint::new(SocketAddr::from(([127, 0, 0, 1], 0)), None).0,
     })
 }
 

@@ -1,5 +1,5 @@
-//! The bottom bar: the server switch and port, what is stored, and the way to
-//! the log. On Linux, also a newer release.
+//! The bottom bar: the server switch and port, and the ways to the settings
+//! and the log. On Linux, also a newer release.
 //!
 //! It shows the state `/v2/health` reports.
 
@@ -14,6 +14,7 @@ use super::theme::{self, Palette, Weight, white};
 pub const HEIGHT: f32 = 20.0;
 
 const TEXT: f32 = 12.0;
+#[cfg(all(unix, not(target_os = "macos")))]
 const GAP: f32 = 14.0;
 
 /// A fraction as a whole number of per cent.
@@ -37,10 +38,17 @@ fn free_space(ctx: &egui::Context, state: &AppState) -> Option<u64> {
     free
 }
 
-/// What a click in the bar asked for. Emptying the cache is done in place.
+/// What the bar's two buttons open: the settings sheet or the log pane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    Settings,
+    Logs,
+}
+
+/// What a click in the bar asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    ToggleLogs,
+    Toggle(Pane),
     ToggleServer,
 }
 
@@ -69,9 +77,10 @@ pub fn bar(
     ui: &mut egui::Ui,
     state: &AppState,
     palette: &Palette,
-    port: u16,
+    settings_open: bool,
     logs_open: bool,
 ) -> Option<Action> {
+    let port = state.endpoint.port();
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEIGHT), Sense::hover());
     let rect = rect.shrink2(vec2(6.0, 0.0));
     let font = theme::font(TEXT, Weight::Regular);
@@ -134,91 +143,45 @@ pub fn bar(
         action = Some(Action::ToggleServer);
     }
 
-    // Right to left: the log button, "Empty cache", what is stored.
+    // Right to left: the log button, the settings button.
     let logs = icons::square(pos2(rect.right() + 5.0 - 12.0, y), 24.0);
-    let logs_response = ui
-        .interact(logs, ui.id().with("logs"), Sense::click())
-        .on_hover_text(if logs_open {
-            "Hide the log"
-        } else {
-            "Show the log"
-        });
-    let lit = ui.ctx().animate_bool_with_time(
-        logs_response.id.with("hover"),
-        logs_response.hovered() || logs_open,
-        0.15,
-    );
-    if lit > 0.0 {
-        ui.painter().rect_filled(logs, 7.0, white(0.1 * lit));
-    }
-    icons::lines(
-        ui.painter(),
-        icons::square(logs.center(), 14.0),
-        theme::mix(palette.muted, egui::Color32::WHITE, lit),
-        1.4,
-    );
-
-    let stats = state.cache.stats();
-    let empty = ui.painter().layout_no_wrap(
-        "Empty cache".to_owned(),
-        font.clone(),
-        egui::Color32::PLACEHOLDER,
-    );
-    let empty_rect = egui::Rect::from_min_size(
-        pos2(
-            logs.left() + 6.0 - GAP - empty.size().x,
-            y - empty.size().y / 2.0,
+    let gear = icons::square(pos2(logs.left() - 4.0 - 12.0, y), 24.0);
+    for (pane, button, hint) in [
+        (Pane::Logs, logs, ["Show the log", "Hide the log"]),
+        (
+            Pane::Settings,
+            gear,
+            ["Show the settings", "Hide the settings"],
         ),
-        empty.size(),
-    );
-    let has_any = stats.tracks > 0;
-    let empty_response = ui.interact(
-        empty_rect,
-        ui.id().with("empty-cache"),
-        if has_any {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let danger = ui.ctx().animate_bool_with_time(
-        empty_response.id.with("hover"),
-        empty_response.hovered() && has_any,
-        0.15,
-    );
-    let colour = if has_any {
-        theme::mix(palette.text, palette.danger, danger)
-    } else {
-        palette.muted.gamma_multiply(0.6)
-    };
-    ui.painter().galley(empty_rect.min, empty, colour);
-    // No confirmation: every byte is re-computable from audio that still exists,
-    // so a misclick costs one separation.
-    if empty_response
-        .on_hover_text("Delete all separated tracks")
-        .on_hover_cursor(if has_any {
-            egui::CursorIcon::PointingHand
-        } else {
-            egui::CursorIcon::Default
-        })
-        .clicked()
-    {
-        let (tracks, freed) = state.cache.clear();
-        tracing::info!("cache reset: {tracks} tracks, {:.0} MB", freed as f64 / 1e6);
+    ] {
+        let shown = match pane {
+            Pane::Settings => settings_open,
+            Pane::Logs => logs_open,
+        };
+        let response = ui
+            .interact(button, ui.id().with(("pane", pane as u8)), Sense::click())
+            .on_hover_text(hint[usize::from(shown)]);
+        let lit = ui.ctx().animate_bool_with_time(
+            response.id.with("hover"),
+            response.hovered() || shown,
+            0.15,
+        );
+        if lit > 0.0 {
+            ui.painter().rect_filled(button, 7.0, white(0.1 * lit));
+        }
+        let colour = theme::mix(palette.muted, egui::Color32::WHITE, lit);
+        let icon = icons::square(button.center(), 14.0);
+        match pane {
+            Pane::Logs => icons::lines(ui.painter(), icon, colour, 1.4),
+            Pane::Settings => icons::gear(ui.painter(), icon, colour, 1.3),
+        }
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            action = Some(Action::Toggle(pane));
+        }
     }
-
-    let _stats = ui.painter().text(
-        pos2(empty_rect.left() - GAP, y),
-        egui::Align2::RIGHT_CENTER,
-        format!(
-            "{} cached{}{:.0} MB",
-            stats.tracks,
-            theme::DOT,
-            stats.bytes as f64 / 1e6
-        ),
-        font,
-        palette.muted,
-    );
 
     // Linux has no title bar of its own to carry the version, so a newer
     // release shows here, between the two groups, where it fits.
@@ -226,19 +189,13 @@ pub fn bar(
     {
         let status = crate::update::status();
         if status.opens()
-            && let Some(x) = super::update::fits(ui, &status, hit.right(), _stats.left())
+            && let Some(x) = super::update::fits(ui, &status, hit.right(), gear.left() - GAP)
         {
             let anchor = pos2(x, y);
             super::update::slot(ui, anchor, egui::Align2::LEFT_CENTER, palette, 1.0);
         }
     }
 
-    if logs_response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-    {
-        action = Some(Action::ToggleLogs);
-    }
     action
 }
 
