@@ -290,7 +290,10 @@ fn assemble(
         let raw = server.fetch_stem(stem)?;
         // Each stem carries its own scale so a quiet one keeps its bits.
         let samples = if result.output.format == "flac" {
-            rescale(stemd_audio::decode_flac(raw)?.data, stem.gain)
+            rescale(
+                stemd_audio::decode_flac(raw)?.data,
+                DECODED_S16_TO_STEM * inverse(stem.gain),
+            )
         } else {
             deinterleave(&raw, f32_wire, stem.gain)
         };
@@ -390,11 +393,13 @@ fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, el
     println!("total        : {elapsed:.1}s end to end");
 }
 
-/// Undo a stem's transfer gain.
-fn rescale(data: Planar, gain: f32) -> Planar {
-    let inv = inverse(gain);
+/// Stems are quantised as `round(x × 32767)`; the FLAC decoder reads an `i16` as `v / 32768`.
+const DECODED_S16_TO_STEM: f32 = 32768.0 / 32767.0;
+
+/// Multiply every sample by `scale`.
+fn rescale(data: Planar, scale: f32) -> Planar {
     data.into_iter()
-        .map(|ch| ch.into_iter().map(|v| v * inv).collect())
+        .map(|ch| ch.into_iter().map(|v| v * scale).collect())
         .collect()
 }
 
@@ -409,7 +414,7 @@ fn deinterleave(raw: &[u8], f32_format: bool, gain: f32) -> Planar {
         }
     } else {
         for (i, chunk) in raw.chunks_exact(2).enumerate() {
-            let v = f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0;
+            let v = f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32767.0;
             out[i % 2].push(v * inv);
         }
     }
@@ -448,9 +453,18 @@ mod tests {
 
     #[test]
     fn rescaling_restores_the_original_level() {
-        let restored = rescale(vec![vec![0.25, -0.5]], 0.5);
+        let restored = rescale(vec![vec![0.25, -0.5]], inverse(0.5));
         assert!((restored[0][0] - 0.5).abs() < 1e-6);
         assert!((restored[0][1] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_full_scale_16_bit_stem_sample_reads_as_one() {
+        let raw = i16::MAX.to_le_bytes();
+        assert_eq!(deinterleave(&raw, false, 1.0)[0][0], 1.0);
+        let decoded = f32::from(i16::MAX) / 32768.0;
+        let restored = rescale(vec![vec![decoded]], DECODED_S16_TO_STEM);
+        assert!((restored[0][0] - 1.0).abs() < 1e-7, "{}", restored[0][0]);
     }
 
     #[test]
