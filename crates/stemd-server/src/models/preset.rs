@@ -1,13 +1,12 @@
 //! The model catalogue: which artefacts exist, and their pinned digests.
 //!
-//! All of them are served from this project's own release, pinned by digest, so a
-//! stale digest fails loudly on the next fresh install. Re-hosted rather than
-//! fetched from upstream so that one release under this project's control is the
-//! only thing to keep alive; the digests are unchanged by the move.
+//! Every artefact is served from this project's own releases and pinned by digest, so a stale
+//! digest fails on the next fresh install. The project hosts the files so that its own releases are
+//! the only thing to keep available; the digests are the same as upstream.
 //!
-//! No manifest travels with the weights. The architecture is compiled into
-//! `stemd_mlx` and every layer checks the shape of the tensor it pulls, so a file
-//! that is not this architecture fails at load naming the tensor that disagreed.
+//! No manifest comes with the weights. The architecture is compiled into `stemd_mlx`, and every
+//! layer checks the shape of each tensor it reads, so a file with another architecture fails at
+//! load with the name of the tensor that disagreed.
 
 use stemd_core::Family;
 
@@ -25,25 +24,23 @@ pub struct ModelSource {
     pub files: &'static [RemoteFile],
 }
 
-/// What the window offers, and what each choice costs.
-///
-/// Named for the trade rather than the checkpoint. See docs/evaluation.md for the
-/// measurements.
+/// The presets the window offers. Each is named for its speed and quality trade-off;
+/// docs/evaluation.md has the measurements.
 ///
 /// Fast and Balanced are demucs v4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     /// `htdemucs` (demucs v4), the cheapest preset.
     Fast,
-    /// `htdemucs_ft`: four checkpoints, each fine-tuned for one source, in a single
-    /// artefact, of which two are run.
+    /// `htdemucs_ft`: one artefact with four checkpoints, each fine-tuned for one source; two of
+    /// them run.
     ///
-    /// The four sources have no reason to sum to the mix, so shipping `bass + other`
-    /// as harmonics put all of that error on the part the player rebuilds. Running the
-    /// drums and vocals specialists and shipping harmonics as the remainder removes it.
+    /// The four sources need not sum to the mix, so shipping `bass + other` as harmonics would put
+    /// that error on the part the player rebuilds. Running the drums and vocals specialists and
+    /// shipping harmonics as the remainder removes the error.
     Balanced,
-    /// stemd's own 4-stem BS-RoFormer; ships drums and vocals, harmonics is the
-    /// remainder. See docs/evaluation.md.
+    /// stemd's own 4-stem BS-RoFormer. It ships drums and vocals, and harmonics is the remainder.
+    /// See docs/evaluation.md.
     Quality,
 }
 
@@ -67,9 +64,8 @@ impl Preset {
         }
     }
 
-    /// Artefact name, i.e. what `--demucs-model` takes, what identifies the
-    /// preset in the settings file, and what the weights file is called
-    /// without its extension.
+    /// The artefact name: the value `--demucs-model` takes, the preset's name in the settings file,
+    /// and the weights file's name without its extension.
     pub const fn artefact(self) -> &'static str {
         match self {
             Self::Fast => "htdemucs",
@@ -88,9 +84,8 @@ impl Preset {
 
     /// The architectures this preset runs, in the order it runs them.
     ///
-    /// Not a detail of the weights: which family a half is decides what
-    /// precision suits it, and the two answer differently on CUDA. `None` is a
-    /// hand-named artefact, which is always a single demucs.
+    /// The family of each model decides which precision suits it, and the families differ on CUDA.
+    /// `None` stands for a hand-named artefact, which is always a single demucs.
     pub const fn families(preset: Option<Self>) -> &'static [Family] {
         match preset {
             Some(Self::Quality) => &[Family::Roformer],
@@ -99,8 +94,8 @@ impl Preset {
         }
     }
 
-    /// How the preset uses its weights, part of the cache key. Bumped when that changes,
-    /// since the weights digest alone does not change with it.
+    /// A version of how the preset uses its weights, part of the cache key. Bump it when that use
+    /// changes, since the weights digest stays the same.
     pub const fn recipe(self) -> u32 {
         match self {
             Self::Fast => 1,
@@ -109,11 +104,10 @@ impl Preset {
         }
     }
 
-    /// What identifies this preset's weights, for a cache key.
+    /// The pinned digest of this preset's weights, for a cache key.
     ///
-    /// The pinned digest of the weights, so repointing a preset at a different
-    /// artefact invalidates its cached separations by itself. Not the whole
-    /// story on its own: see [`Self::recipe`].
+    /// Pointing a preset at a different artefact changes the digest, which invalidates its cached
+    /// separations. See also [`Self::recipe`].
     pub fn digest(self) -> &'static str {
         self.source()
             .files
@@ -122,9 +116,9 @@ impl Preset {
             .map_or_else(|| self.artefact(), |f| f.sha256)
     }
 
-    /// Match an artefact name back to a preset, so `--demucs-model` and the
-    /// window cannot disagree about what is loaded. A preset's former name
-    /// matches it too, so a settings file saved before a swap keeps its choice.
+    /// Match an artefact name to a preset, so `--demucs-model` and the window agree on what is
+    /// loaded. A preset's former name also matches it, so a settings file saved before a rename
+    /// keeps its choice.
     pub fn from_artefact(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -145,18 +139,17 @@ impl Preset {
 /// The preset loaded when `--demucs-model` is not given.
 pub const DEFAULT_PRESET: Preset = Preset::Fast;
 
-/// What a weights file is called. One place, because both the catalogue and the
-/// loader have to agree on it.
+/// The weights file extension, defined once because the catalogue and the loader must agree on it.
 pub const WEIGHTS_EXTENSION: &str = ".safetensors";
 
 /// Artefacts a preset used to name, and the preset that replaced them.
 const FORMER: [(&str, Preset); 1] = [("bs_polarformer", Preset::Quality)];
 
-/// Retired artefacts, still named so a settings file that mentions one can say
-/// what happened rather than falling back in silence.
+/// Retired artefacts, still listed so that a settings file naming one gets an explanation when it
+/// falls back.
 ///
-/// Three are TorchScript, which nothing loads. `bs_roformer_viperx` is a lone vocals
-/// model, which is not a separator on its own.
+/// Three are TorchScript, which nothing loads. `bs_roformer_viperx` is a vocals-only model and
+/// cannot separate on its own.
 pub const RETIRED: [&str; 4] = [
     "hdemucs_mmi_mps",
     "htdemucs_mps",
@@ -205,8 +198,8 @@ mod tests {
     fn presets_and_artefacts_round_trip() {
         for preset in Preset::ALL {
             assert_eq!(Preset::from_artefact(preset.artefact()), Some(preset));
-            // Every file of a preset must belong to its artefact, which is what
-            // keeps the download and the loader in step.
+            // Every file of a preset belongs to its artefact, which keeps the download and the
+            // loader in step.
             assert!(
                 preset
                     .source()
@@ -222,8 +215,8 @@ mod tests {
 
     /// One weights file per preset, named for its artefact.
     ///
-    /// This is what lets the loader look for `<artefact>.safetensors` without
-    /// consulting the catalogue, and what makes the digest unambiguous.
+    /// This lets the loader look for `<artefact>.safetensors` without the catalogue, and makes the
+    /// digest unambiguous.
     #[test]
     fn every_artefact_has_its_weights_file() {
         for preset in Preset::ALL {
@@ -250,8 +243,8 @@ mod tests {
         }
     }
 
-    /// A retired artefact must not quietly match a preset again, or a settings
-    /// file naming it would load something other than what it says.
+    /// A retired artefact never matches a preset, so a settings file naming it never loads a
+    /// different model.
     #[test]
     fn a_retired_artefact_is_not_a_preset() {
         for name in RETIRED {
@@ -263,34 +256,32 @@ mod tests {
         }
     }
 
-    /// Every demucs artefact any preset names is v4, which is what lets one runtime
-    /// serve them all. A v3 artefact would put the LSTM back.
+    /// Every demucs artefact that a preset names is v4, so one runtime serves them all; a v3
+    /// artefact would bring back the LSTM.
     ///
-    /// Stated over artefacts rather than presets, and by what the name says rather
-    /// than by a list of presets to skip: a skip list names exceptions that go stale
+    /// The test checks artefact names, so it needs no list of presets to skip, which would go stale
     /// as presets are added.
     #[test]
     fn every_demucs_artefact_is_v4() {
         for preset in Preset::ALL {
-            // v3 is `hdemucs_*`, v4 is `htdemucs*`. Anything else is not a
-            // demucs at all and this test has no opinion on it.
+            // v3 is `hdemucs_*` and v4 is `htdemucs*`. Other names are not demucs, and this test
+            // ignores them.
             assert!(
                 !preset.artefact().starts_with("hdemucs"),
                 "{preset:?} names {}, which is demucs v3",
                 preset.artefact()
             );
         }
-        // And the guard is not vacuous: the name it exists to reject would be.
+        // A retired name fails this check.
         assert!(RETIRED.iter().any(|name| name.starts_with("hdemucs")));
     }
 
     /// Every artefact comes from one release over https, at a URL ending in the
     /// filename the loader will look for.
     ///
-    /// That last is not pedantry: the loader finds a model by looking for
-    /// `<artefact>.safetensors` on disk and the downloader saves under `file.name`, so
-    /// a URL whose last segment disagreed would download something the loader cannot
-    /// see.
+    /// The loader finds a model by looking for `<artefact>.safetensors` on disk and the downloader
+    /// saves under `file.name`, so a URL whose last segment differed would download a file the
+    /// loader cannot find.
     #[test]
     fn every_file_is_pinned_over_https() {
         for file in Preset::ALL.iter().flat_map(|p| p.source().files) {
@@ -304,8 +295,7 @@ mod tests {
                 "{} url must end in its filename",
                 file.name
             );
-            // A placeholder digest here would mean shipping a build that
-            // accepts whatever the network returns.
+            // A placeholder digest would ship a build that accepts whatever the network returns.
             assert_eq!(file.sha256.len(), 64, "{} needs a real sha256", file.name);
             assert!(
                 file.sha256.chars().all(|c| c.is_ascii_hexdigit()),

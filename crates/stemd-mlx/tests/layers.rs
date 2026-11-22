@@ -1,10 +1,9 @@
 //! Null the first encoder layer of each branch against the reference.
 //!
-//! This is the step where a mistake is silent. demucs is channels-first and MLX
-//! is channels-last, so a missed transpose convolves over frequency instead of
-//! channels and returns a tensor of exactly the right shape. Nothing errors; the
-//! model just separates nothing. The whole point of this file is that the
-//! weights are real, the input is real, and the output has to match.
+//! This is the step where a mistake is silent. demucs is channels-first and MLX is channels-last,
+//! so a missed transpose convolves over the frequency axis and returns a tensor of exactly the
+//! right shape. Nothing errors; the model just separates nothing. So this file uses real weights
+//! and real input, and the output must match.
 
 mod common;
 
@@ -77,9 +76,9 @@ fn the_first_time_encoder_matches_the_reference() {
 /// The frequency decoder: gated rewrite, dilated branch, transposed
 /// convolution, then the frequency axis trimmed back by the padding.
 ///
-/// Both returns are checked. `pre` is what the time branch injects into, so a
-/// decoder that produced the right output from the wrong intermediate would
-/// pass a laxer test and break the branch that reads it.
+/// Both return values are checked. `pre` is what the time branch injects into, so a decoder that
+/// produced the right output from the wrong intermediate would pass a laxer test and break the
+/// branch that reads it.
 #[test]
 fn the_first_frequency_decoder_matches_the_reference() {
     let _gpu = one_at_a_time();

@@ -17,13 +17,11 @@ use crate::jobs::Entry;
 use crate::output::Output;
 use crate::state::AppState;
 
-/// Makes each test root unique. A timestamp alone is not enough: tests run in
-/// parallel within one process, and two starting inside the same clock tick
-/// would share a root.
+/// Makes each test root unique: tests run in parallel in one process, and two that start in the
+/// same clock tick would share a timestamp.
 static ROOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A cache rooted somewhere no other test will touch, holding job results
-/// for `ttl`.
+/// A cache in a directory no other test uses, holding job results for `ttl`.
 pub fn cache(max_bytes: u64, ttl: Duration) -> Arc<Cache> {
     let root = std::env::temp_dir().join(format!(
         "stemd-test-{}-{}",
@@ -73,8 +71,8 @@ pub fn output() -> Output {
     }
 }
 
-/// Store [`stems`] of `frames` whole as track `track`, and return the job
-/// result held in `cache`.
+/// Store [`stems`] of length `frames` whole as track `track`, and return the job result held in
+/// `cache`.
 pub fn publish(cache: &Cache, track: &str, frames: usize, separation_secs: f64) -> Arc<Entry> {
     let (_, parts) = stems(frames);
     let output = output();

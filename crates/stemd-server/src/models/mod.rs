@@ -1,15 +1,14 @@
-//! Locating, verifying and fetching the model artefacts.
+//! Locates, verifies and downloads the model artefacts.
 //!
-//! The bundle ships without weights (~170 MB per preset); each is fetched from a
-//! pinned URL and checked against its digest.
+//! The bundle ships without weights; each artefact is downloaded from a pinned URL and checked
+//! against its digest.
 //!
 //! # Where they land
 //!
-//! Not next to the executable. On macOS the bundle's contents are covered by the
-//! code signature and writing into them invalidates it; on Windows and Linux the
-//! install directory is not writable by the user who runs the program. So they
-//! land in the per-user data directory: see [`support_dir`] for where that is
-//! on each platform.
+//! The weights go in the per-user data directory (see [`support_dir`]), never next to the
+//! executable. On macOS the code signature covers the bundle's contents, and writing into them
+//! invalidates it; on Windows and Linux the user who runs the program cannot write to the install
+//! directory.
 //!
 //! # Layering
 //!
@@ -33,10 +32,9 @@ pub use integrity::verify;
 pub use load::{BuildSeparator, builder};
 pub use preset::{DEFAULT_PRESET, ModelSource, Preset, RETIRED, WEIGHTS_EXTENSION};
 
-// One pinned file at a time, and the type describing one. Only `cuda` wants
-// either: everything else fetches a whole `ModelSource`. Gated rather than
-// always exported, so the platform that cannot install CUDA does not carry two
-// names nothing there can use.
+// The download function for one pinned file, and the type that describes the file. Only `cuda` uses
+// them; everything else downloads a whole `ModelSource`. They are exported only on Windows, where
+// CUDA can be installed.
 #[cfg(windows)]
 pub use download::fetch_one as fetch_file;
 /// Used by the updater to download Setup.
@@ -45,8 +43,8 @@ pub use download::stream_to_file;
 #[cfg(windows)]
 pub use preset::RemoteFile;
 
-/// Bytes hashed or copied per read. Large enough that a 675 MB artefact is not
-/// resident, small enough to stay in cache.
+/// The bytes hashed or copied per read: a 675 MB artefact is streamed in chunks small enough to
+/// stay in the CPU cache.
 const READ_CHUNK: usize = 1 << 20;
 
 /// The application's data directory, created if absent.
@@ -57,17 +55,13 @@ const READ_CHUNK: usize = 1 << 20;
 /// Windows  %LOCALAPPDATA%\stemd\data
 /// ```
 ///
-/// Everything the server keeps that a user would not want swept: the model
-/// artefacts and the settings file. Separated stems are the other half, and they
-/// live under the cache root instead, because losing them costs a separation and
-/// nothing else.
+/// It holds what a user would not want cleaned up: the model artefacts and the settings file.
+/// Separated stems live under the cache root instead, since losing them costs only a separation.
 ///
-/// Local rather than roaming on Windows: `dirs::data_local_dir`, not
-/// `dirs::data_dir`. A roaming profile is copied to and from the domain
-/// controller at every logon, and 170 MB of weights that any machine can
-/// re-download is precisely what must not be in one. The extra `data` component
-/// is the other half of the split described on [`crate::cache::default_dir`]:
-/// local app data is also where the cache lands.
+/// On Windows this uses `dirs::data_local_dir`, the local profile: a roaming profile is copied to
+/// and from the domain controller at every logon, and weights that any machine can download again
+/// do not belong there. The extra `data` component keeps it apart from the cache, which also lives
+/// in local app data (see [`crate::cache::default_dir`]).
 pub fn support_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
         .context("no data directory for this platform")?
@@ -84,10 +78,10 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Where a preset's artefact is, if it is anywhere.
+/// The directory that holds a preset's artefact, if any.
 ///
-/// Mirrors the startup search order, so the window and the command line cannot
-/// disagree about whether a switch needs the network.
+/// It follows the startup search order, so the window and the command line agree on whether a
+/// switch needs the network.
 pub fn locate(dirs: &[PathBuf], preset: Preset) -> Option<PathBuf> {
     dirs.iter()
         .find(|d| is_complete(d, preset.source()))
@@ -108,8 +102,7 @@ mod tests {
     #[test]
     fn completeness_needs_every_file() {
         let dir = crate::scratch::dir("models");
-        // Named from the preset rather than spelled out, so retiring or
-        // renaming one moves this test with it instead of breaking it.
+        // Take the name from the preset, so retiring or renaming a preset updates this test.
         let source = Preset::Fast.source();
 
         assert!(!is_complete(&dir, source));

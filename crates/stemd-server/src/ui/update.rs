@@ -18,24 +18,24 @@ use crate::update::{self, Status};
 use super::theme::{self, Brushes, Palette, Weight, white};
 use super::widgets::{self, Pill};
 
-/// Size of the version's text, and of the slot's.
+/// The text size of the version and of the slot.
 const VERSION_TEXT: f32 = 12.0;
 const SLOT_TEXT: f32 = 12.5;
 
-/// The version button: height, side padding, and its icon's size and gap.
+/// The version button's height and side padding, and its icon's size and gap.
 const BUTTON_HEIGHT: f32 = 20.0;
 const PAD: f32 = 6.0;
 const ICON: f32 = 10.0;
 const ICON_GAP: f32 = 5.0;
 
-/// Gap between a status's text and its icon.
+/// The gap between a status's text and its icon.
 const SLOT_GAP: f32 = 6.0;
 
-/// A status change: fade time and slide distance.
+/// A status change's fade time and slide distance.
 const CHANGE_SECS: f64 = 0.28;
 const SLIDE: f32 = 7.0;
 
-/// Colours of the slot's icons, and the stops of "New update available!".
+/// The colours of the slot's icons, and the stops of "New update available!".
 const ARROW: Color32 = Color32::from_rgb(0xBB, 0xCE, 0xF7);
 const SHEEN: [Color32; 4] = [
     Color32::from_rgb(0xF3, 0xB9, 0xB3),
@@ -44,7 +44,7 @@ const SHEEN: [Color32; 4] = [
     Color32::from_rgb(0xF3, 0xB9, 0xB3),
 ];
 
-/// Frame interval of the slot's looping animations.
+/// The frame interval of the slot's looping animations.
 const FRAME: Duration = Duration::from_millis(33);
 
 /// How long the gradient and arrow move after an update appears: 7 cycles of
@@ -59,7 +59,7 @@ fn version_galley(ui: &egui::Ui) -> Arc<Galley> {
     )
 }
 
-/// Width of the version button.
+/// The width of the version button.
 pub fn version_width(ui: &egui::Ui) -> f32 {
     let icon = if update::present() {
         ICON_GAP + ICON
@@ -171,7 +171,7 @@ pub fn slot(ui: &mut egui::Ui, anchor: Pos2, align: Align2, palette: &Palette, d
     );
 }
 
-/// Width of `status` in the slot.
+/// The width of `status` in the slot.
 fn item_width(ui: &egui::Ui, status: &Status) -> f32 {
     let Some((text, icon)) = parts(status) else {
         return 0.0;
@@ -455,7 +455,7 @@ fn draw_icon(painter: &egui::Painter, origin: Pos2, icon: Icon, palette: &Palett
     }
 }
 
-/// CSS's cubic-bezier(.3, .8, .3, 1), near enough: a fast start that settles.
+/// An approximation of CSS `cubic-bezier(.3, .8, .3, 1)`: a fast start that settles.
 fn ease(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
@@ -528,7 +528,7 @@ fn question(
     answer
 }
 
-/// Gap kept on each side of the slot in the status bar.
+/// The gap kept on each side of the slot in the status bar.
 #[cfg(all(unix, not(target_os = "macos")))]
 const SPACE: f32 = 14.0;
 

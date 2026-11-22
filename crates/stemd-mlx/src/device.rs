@@ -1,27 +1,24 @@
-//! Which backend MLX will run on, and whether it can actually do the work.
+//! Which backend MLX runs on, and whether it can do the work.
 //!
-//! Three values rather than two, because Metal and CUDA do not want the same
-//! precision from the same model. See [`crate::Precision::preferred`].
+//! There are three values because Metal and CUDA want different precisions from the same model. See
+//! [`crate::Precision::preferred`].
 //!
-//! Asking MLX which device it picked is not enough. MLX seeds that from
-//! `gpu::is_available()`, which on CUDA is satisfied by the driver alone, so a
-//! machine carrying `nvcuda.dll` and none of cuBLAS, cuFFT or cuDNN answers yes
-//! and then dies on the first separation. Removing that is what makes a Windows
-//! build shippable without the CUDA runtime beside it: the binary delay-loads
-//! those DLLs, so it starts anywhere, and the answer here decides whether it uses
-//! them.
+//! Asking MLX which device it picked is not enough. MLX bases that on `gpu::is_available()`, which
+//! on CUDA needs only the driver, so a machine with `nvcuda.dll` and none of cuBLAS, cuFFT or cuDNN
+//! answers yes and then dies on the first separation. The checks here let a Windows build ship
+//! without the CUDA runtime beside it: the binary delay-loads those DLLs, so it starts anywhere,
+//! and the answer here decides whether it uses them.
 //!
-//! So the decision is taken in two steps, in this order:
+//! The decision takes two steps, in this order:
 //!
 //! 1. Can the CUDA runtime be resolved at all? A delay-load stub that cannot find
-//!    its DLL raises a structured exception, which kills the process, so this has
-//!    to be settled before MLX is asked anything.
-//! 2. Does a GPU produce right answers? Matmul, both transforms and a
-//!    convolution, evaluated and checked, which is every kind of work the two
-//!    models are built from.
+//!    its DLL raises a structured exception, which kills the process, so this is
+//!    settled before MLX is asked anything.
+//! 2. Does the GPU produce right answers? A matmul, both transforms and a
+//!    convolution are evaluated and checked; together they cover every kind of
+//!    work the two models do.
 //!
-//! Not a device selection: nothing here picks a GPU. It picks the CPU, and only
-//! ever as a demotion.
+//! Nothing here selects a GPU. This module can only move the run to the CPU.
 
 use std::sync::OnceLock;
 
@@ -40,25 +37,24 @@ pub enum Accelerator {
     Cpu,
 }
 
-/// What [`Accelerator::decide`] worked out, kept because the probe costs a
-/// handful of GPU operations and `detect` is called per request.
+/// The result of [`Accelerator::decide`], cached because the probe costs a handful of GPU
+/// operations and `detect` is called per request.
 static DECIDED: OnceLock<(Accelerator, bool)> = OnceLock::new();
 
 impl Accelerator {
-    /// What MLX will actually use.
+    /// The backend MLX uses.
     ///
-    /// Decided once, on the first call, and enforced: if this answers [`Self::Cpu`]
-    /// then MLX's own default device has been set to the CPU too. Which GPU is a
-    /// build-time fact: Metal on Apple, CUDA everywhere else.
+    /// It is decided once, on the first call, and enforced: when this returns [`Self::Cpu`], MLX's
+    /// own default device is also set to the CPU. The GPU kind is fixed at build time: Metal on
+    /// Apple, CUDA everywhere else.
     pub fn detect() -> Self {
         DECIDED.get_or_init(Self::decide).0
     }
 
-    /// True when a GPU was there and this module turned it down.
+    /// True when a GPU was present and this module refused it.
     ///
-    /// The two kinds of [`Self::Cpu`] want different things said: a machine without a
-    /// card is nothing to report, while a card whose runtime is missing needs telling,
-    /// because the fix is a download.
+    /// The two kinds of [`Self::Cpu`] need different messages: a machine without a card needs none,
+    /// while a card whose runtime is missing needs a warning, because a download fixes it.
     pub fn gpu_refused() -> bool {
         DECIDED.get_or_init(Self::decide).1
     }
@@ -85,15 +81,14 @@ impl Accelerator {
         (which, false)
     }
 
-    /// Point MLX at the CPU as well as saying so.
+    /// Point MLX at the CPU and return [`Self::Cpu`].
     fn demote() -> Self {
         Device::set_default(&Device::cpu());
         Self::Cpu
     }
 
-    /// The name this carries over the wire, in `BackendInfo::device`. Stable,
-    /// and deliberately coarse: clients match on it, and none of them has any
-    /// use for which GPU it is.
+    /// The name sent to clients in `BackendInfo::device`. It is stable and coarse on purpose:
+    /// clients match on it, and none needs to know which GPU it is.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Metal | Self::Cuda => "gpu",
@@ -101,8 +96,7 @@ impl Accelerator {
         }
     }
 
-    /// The backend by name, for logs and for anything reasoning about the
-    /// difference between the two GPUs.
+    /// The backend by name, for logs and for code that tells the two GPUs apart.
     pub const fn backend(self) -> &'static str {
         match self {
             Self::Metal => "metal",
@@ -136,14 +130,13 @@ fn gpu_computes_on_kept_thread() -> bool {
     spawned.is_ok() && rx.recv().unwrap_or(false)
 }
 
-/// Whether the GPU MLX offered returns right answers.
-///
-/// One operation of each kind the models use, on inputs small enough that the
-/// expected sums can be written down: matmul, the real transform both ways, and a
-/// convolution. Each is evaluated, because MLX is lazy.
-///
-/// Values are checked rather than only the absence of an error: a defect this port
-/// found returned a number, and it was 65 times too large.
+/// Whether the GPU that MLX offered returns right answers.
+// It runs one operation of each kind the models use, on inputs small enough that the expected sums
+// can be written down: matmul, the real transform both ways, and a convolution. Each is evaluated,
+// because MLX is lazy.
+//
+// The values are checked as well as the absence of an error, because a broken kernel can return
+// wrong values without failing.
 fn gpu_computes() -> bool {
     fn probe() -> Result<bool> {
         let square = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
@@ -167,25 +160,22 @@ fn gpu_computes() -> bool {
     probe().unwrap_or(false)
 }
 
-/// Whether the CUDA libraries this build imports can be found.
-///
-/// Only Windows needs this, because Windows is the platform where the runtime is
-/// optional. `mlx-sys` emits one `/DELAYLOAD` per CUDA DLL, so none is bound at
-/// process start and a build with no CUDA installed starts cleanly. The cost is
-/// that a missing one surfaces as a structured exception at the first call, which
-/// nothing can catch usefully, so the libraries are looked for before MLX is
-/// asked anything and a miss means the CPU.
-///
-/// Elsewhere they are ordinary imports resolved before `main`, so a missing one
-/// is a process that does not start. Nothing to check.
+/// Whether the CUDA libraries this build imports can be found. Only Windows needs this, because
+/// only there is the runtime optional.
+// `mlx-sys` emits one `/DELAYLOAD` per CUDA DLL, so none is bound at process start and a build with
+// no CUDA installed starts cleanly. In exchange, a missing library surfaces as a structured
+// exception at the first call, which nothing can usefully catch, so the libraries are looked for
+// before MLX is asked anything, and a miss means the CPU.
+//
+// On other platforms they are ordinary imports resolved before `main`, so a missing one stops the
+// process from starting, and there is nothing to check.
 #[cfg(all(windows, target_env = "msvc"))]
 mod runtime {
     use std::ffi::c_void;
 
-    /// The driver. Installed by the display driver rather than by the toolkit,
-    /// so it is present on any machine with an NVIDIA card and absent on any
-    /// machine without one, which is the question `gpu::is_available()` is
-    /// really answering. It is not imported, hard or delayed, so it has to be
+    /// The driver. The display driver installs it, and the CUDA toolkit does not, so it is present
+    /// on every machine with an NVIDIA card and absent on every machine without one, which is what
+    /// `gpu::is_available()` really tests. It is neither a hard nor a delayed import, so it is
     /// named here.
     const DRIVER: &str = "nvcuda.dll";
 
@@ -197,9 +187,8 @@ mod runtime {
 
     /// Whether every delay-loaded library can be found.
     ///
-    /// This executable has no CUDA in its ordinary imports at all, so the
-    /// delay-import directory is the whole of what can fault, and loading all
-    /// of it is the exact statement that nothing will.
+    /// This executable has no CUDA in its ordinary imports, so the delay-import directory is
+    /// everything that can fault, and loading all of it proves that nothing will.
     pub fn resolves() -> bool {
         delay_loaded().iter().all(|name| loads(name))
     }
@@ -208,12 +197,11 @@ mod runtime {
         loads(DRIVER)
     }
 
-    /// The ordinary search order, which the delay-load helper uses too: beside the
-    /// executable first, then `PATH`. A load rather than a test for the file, so a
-    /// library whose own dependencies are missing counts as missing.
-    ///
-    /// MLX's helper also tries the toolkit directory from the machine that built it,
-    /// so a developer tree whose DLLs are neither staged nor on `PATH` runs on the CPU.
+    /// Load `name` with the ordinary search order, which the delay-load helper also uses: next to
+    /// the executable first, then `PATH`. Loading the library also fails when one of its own
+    /// dependencies is missing.
+    // MLX's helper also tries the toolkit directory of the machine that built it, so a developer
+    // tree whose DLLs are neither staged nor on `PATH` runs on the CPU.
     fn loads(name: &str) -> bool {
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let module = unsafe { LoadLibraryW(wide.as_ptr()) };
@@ -226,21 +214,19 @@ mod runtime {
 
     /// The names in this image's delay-import directory.
     ///
-    /// Read out of the image rather than kept as a list. `build.rs` offers the linker
-    /// 36 candidates and the linker keeps whichever are genuinely imported, so a
-    /// hand-written list would be wrong in both directions: naming libraries the
-    /// binary never calls, and going stale when MLX or the toolkit changes which it
-    /// does.
+    /// They are read from the image: `build.rs` offers the linker 36 candidates and the linker
+    /// keeps only those actually imported, so a hand-written list would be wrong both ways, naming
+    /// libraries the binary never calls and going stale when MLX or the toolkit changes its
+    /// imports.
     ///
-    /// An empty answer means nothing is delay-loaded and so nothing can fault, which
-    /// is the correct answer for a build without CUDA rather than a failure to look.
+    /// An empty answer means nothing is delay-loaded, so nothing can fault; that is the correct
+    /// answer for a build without CUDA.
     fn delay_loaded() -> Vec<String> {
         /// Where the PE header offset sits in the DOS header.
         const PE_OFFSET: usize = 0x3c;
-        /// Signature and file header, before the optional header.
+        /// The size of the signature and the file header, before the optional header.
         const NT_TO_OPTIONAL: usize = 24;
-        /// Within a PE32+ optional header: the data directories, and the count
-        /// of them that precedes them.
+        /// The offset of the data directories in a PE32+ optional header, just past their count.
         const OPTIONAL_TO_DIRECTORIES: usize = 112;
         const OPTIONAL_TO_DIRECTORY_COUNT: usize = 108;
         /// IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT.
@@ -278,11 +264,9 @@ mod runtime {
             let mut at = table;
             while table != 0 && at + DESCRIPTOR <= table + bytes {
                 let name = u32_at(base, at + NAME_RVA) as usize;
-                // The table ends in a descriptor of zeroes. Bit 0 of the
-                // attributes says the addresses in it are RVAs, which every
-                // linker since VC7 sets; without it this is an image from
-                // before delay loading looked like this, and guessing is worse
-                // than stopping.
+                // The table ends in a descriptor of zeroes. Bit 0 of the attributes says the
+                // addresses are RVAs, which every linker since VC7 sets; without it the image uses
+                // the older delay-load layout, and stopping is safer than guessing.
                 if name == 0 || u32_at(base, at) & 1 == 0 {
                     break;
                 }
@@ -313,10 +297,9 @@ mod runtime {
         }
     }
 
-    /// Nothing asserts *which* libraries these are: that is the build's
-    /// business and this module's whole point is not to hold an opinion about
-    /// it. What can be checked anywhere is that the walk terminates, agrees
-    /// with itself, and returns plausible names rather than rubble.
+    /// Nothing asserts which libraries these are, since that depends on the build and this module
+    /// deliberately holds no list. What can be checked on any machine is that the walk terminates,
+    /// agrees with itself, and returns plausible names.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -349,8 +332,8 @@ mod runtime {
 mod tests {
     use super::*;
 
-    /// Whichever this machine is, the coarse name is one of the two a client
-    /// knows, and the two GPUs both report as one.
+    /// On any machine, the coarse name is one of the two a client knows, and both GPUs report the
+    /// same name.
     #[test]
     fn the_wire_name_stays_coarse() {
         assert_eq!(Accelerator::Metal.as_str(), "gpu");
@@ -359,19 +342,17 @@ mod tests {
         assert!(matches!(Accelerator::detect().as_str(), "gpu" | "cpu"));
     }
 
-    /// The backend name is the one that distinguishes them, and it is what
-    /// picks the precision.
+    /// The backend name tells the GPUs apart, and it picks the precision.
     #[test]
-    fn the_backend_name_does_not() {
+    fn the_backend_name_tells_the_gpus_apart() {
         assert_eq!(Accelerator::Metal.backend(), "metal");
         assert_eq!(Accelerator::Cuda.backend(), "cuda");
     }
 
-    /// The answer is enforced rather than reported. This is the whole point of
-    /// the probe: a build that says `cpu` while MLX keeps sending work to a
-    /// GPU it cannot use has moved the failure, not removed it.
+    /// The answer is enforced as well as reported. A build that reports `cpu` while MLX keeps
+    /// sending work to an unusable GPU would only move the failure.
     #[test]
-    fn mlx_is_left_agreeing_with_the_answer() {
+    fn mlx_uses_the_device_that_detect_reports() {
         let mine = Accelerator::detect();
         let mlx = Device::try_default().and_then(|d| d.get_type());
         match mine {
@@ -382,15 +363,15 @@ mod tests {
         }
     }
 
-    /// Taken once. Callers ask per request, and the probe is not free.
+    /// The accelerator is decided once, because callers ask per request and the probe runs GPU
+    /// work.
     #[test]
-    fn the_decision_does_not_change_under_it() {
+    fn the_accelerator_is_decided_once() {
         assert_eq!(Accelerator::detect(), Accelerator::detect());
     }
 
-    /// A refusal needs a GPU to refuse. Whatever this machine is, the two
-    /// answers cannot both be "there is a card and we are using it" and "there
-    /// is a card and we turned it down".
+    /// A GPU can be refused only if one was found, so on any machine "a card is in use" and "a card
+    /// was refused" never both hold.
     #[test]
     fn a_working_gpu_is_never_reported_as_refused() {
         if Accelerator::detect() != Accelerator::Cpu {
@@ -400,9 +381,9 @@ mod tests {
 
     /// The sums the probe checks against are the right ones.
     ///
-    /// Deliberately not `gpu_computes() == (detect() != Cpu)`: the probe runs on MLX's
-    /// default device, so on a machine with no GPU it passes on the CPU. What it can
-    /// prove anywhere is that a healthy backend clears it.
+    /// The test does not assert `gpu_computes() == (detect() != Cpu)`: the probe runs on MLX's
+    /// default device, so on a machine with no GPU it passes on the CPU. What it proves on any
+    /// machine is that a healthy backend passes.
     #[test]
     fn the_probe_arithmetic_is_right() {
         Accelerator::detect();

@@ -1,14 +1,15 @@
-//! Client file keys, each naming the track id an upload under it hashed to.
+//! Client file keys, each mapped to the track id that an upload with that key hashed to.
 
 use anyhow::{Context, Result};
 
 use super::{Cache, FILES};
 
-/// What a file key's file holds once two uploads under it hashed differently.
+/// The content of a file key's file once two uploads with that key hashed to different tracks.
 const AMBIGUOUS: &str = "ambiguous";
 
 impl Cache {
-    /// Record that an upload sent with `key` hashed to `track`; a key of two tracks is ambiguous.
+    /// Record that an upload sent with `key` hashed to `track`; a key seen with two tracks becomes
+    /// ambiguous.
     pub fn record_file(&self, key: &str, track: &str) -> Result<()> {
         let path = self.root.join(FILES).join(key);
         let _held = self.lock.lock();

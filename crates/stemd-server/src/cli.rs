@@ -1,4 +1,4 @@
-//! Command-line surface.
+//! The command-line flags.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,18 +15,18 @@ pub struct Args {
 
     /// Weights file inside --models, without the extension.
     ///
-    /// Overrides the saved model for this run without replacing it: a flag is
-    /// how you try something, and the window is how you choose. Unset loads
-    /// whatever the window last selected. Unlike the window, this accepts an
-    /// artefact that is not one of the presets.
+    /// Overrides the saved model for this run and leaves the saved choice unchanged. Unset,
+    /// the server loads the model last selected in the window. Unlike the window, this
+    /// accepts an artefact that is not a preset.
     #[arg(long)]
     pub demucs_model: Option<String>,
 
-    /// Run the model at float32 instead of float16.
+    /// Run every model at float32.
     ///
-    /// Half precision is the default: 1.2x faster, and -54 dB against full precision
-    /// on the stems that ship, which is 20 dB below the model's own residual. This is
-    /// the way back if that trade ever looks wrong on some material.
+    /// By default each model runs at the precision that suits it on this backend. Half
+    /// precision is about 1.2x faster and differs from full precision by -54 dB on the
+    /// shipped stems, 20 dB below the model's own residual. Use this flag if half precision
+    /// sounds wrong on some material.
     #[arg(long)]
     pub full_precision: bool,
 
@@ -69,8 +69,8 @@ pub struct Args {
     #[arg(long)]
     pub settings: Option<PathBuf>,
 
-    /// Jobs that may wait for the worker before submissions are refused with
-    /// 429. Separation is serialised on purpose: see queue.rs.
+    /// Jobs that may wait for the worker before submissions are refused with 429.
+    /// Separation runs one job at a time on purpose; see queue/mod.rs.
     #[arg(long, default_value_t = 16)]
     pub queue_depth: usize,
 
@@ -84,10 +84,10 @@ pub struct Args {
     #[arg(long, default_value_t = 4)]
     pub max_sessions: usize,
 
-    /// Disk the cache may occupy, in gigabytes, and never more than the free
-    /// disk minus 2 GB. Past this, partial tracks go first, oldest first, then
-    /// whole tracks, least recently used first. A six-minute track costs about
-    /// 40 MB as 44.1 kHz FLAC with two parts and the derived one.
+    /// Disk the cache may occupy, in gigabytes, and never more than the free disk minus 2
+    /// GB. Past this, partial tracks are deleted oldest first, then whole tracks by last
+    /// use. A six-minute track takes about 40 MB as 44.1 kHz FLAC with two parts and the
+    /// derived one.
     ///
     /// Overrides the saved setting, 8 by default, for this run.
     #[arg(long, alias = "pieces-max-gb")]
@@ -107,16 +107,16 @@ pub struct Args {
     #[arg(long)]
     pub ephemeral: bool,
 
-    /// Seconds a job's result is kept from deletion after it finished or after
-    /// its last stem fetch, until every stem has been fetched.
+    /// Seconds a finished job's result is kept while some of its stems have not been
+    /// fetched. Each stem fetch restarts the count.
     #[arg(long, default_value_t = 300)]
     pub unfetched_ttl: u64,
 
-    /// Longest track accepted, which is the only size limit there is.
+    /// Longest track accepted, in minutes. This is the only size limit.
     ///
-    /// Peak memory is roughly 1.8 GB plus 155 MB per audio-minute, so length is what
-    /// bounds it. The HTTP body limit is derived from this rather than configured
-    /// separately: the upload is raw PCM, so a second knob could only disagree.
+    /// Peak memory is roughly 1.8 GB plus 155 MB per audio-minute, so the track length
+    /// bounds it. The HTTP body limit is derived from this value, since the upload is raw
+    /// PCM.
     ///
     /// Overrides the saved setting, 10 by default, for this run. Capped at the
     /// longest track that fits in three quarters of the machine's memory; 0 uses
@@ -132,21 +132,19 @@ pub struct Args {
     #[arg(long)]
     pub no_mdns: bool,
 
-    /// Never reach the network for the model. Fails instead of downloading, so
-    /// a machine that is meant to be air-gapped stays that way.
+    /// Never download a model. A missing model fails the start, so an air-gapped machine
+    /// stays offline.
     #[arg(long)]
     pub offline: bool,
 
-    /// Run without a window. The window is the default: this ships as an .app,
-    /// where stdout goes nowhere and the log view is the only way to see
-    /// anything.
+    /// Run without a window. The window is the default because the app ships as a bundle,
+    /// where stdout is not visible and the window's log view shows the log.
     #[arg(long)]
     pub headless: bool,
 
-    /// Download the CUDA runtime beside this executable and exit. Windows only,
-    /// about 1.2 GB, and only worth doing on a machine with an NVIDIA card that
-    /// is currently running on its CPU. The startup log says when that is the
-    /// case. See [`crate::cuda`].
+    /// Download the CUDA runtime, about 1.2 GB, beside this executable and exit. Windows
+    /// only. Use it on a machine with an NVIDIA card that currently runs on its CPU; the
+    /// startup log says when that is the case.
     #[arg(long)]
     pub install_cuda: bool,
 }
@@ -158,12 +156,10 @@ impl Args {
         Self::parse_from(std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_")))
     }
 
-    /// A precision forced for every model, or `None` to let each be asked what suits
-    /// it.
+    /// A precision forced for every model, or `None` to let each model choose.
     ///
-    /// What precision a model wants depends on the model as much as the backend, and a
-    /// chained preset runs two architectures that disagree. See
-    /// [`crate::precision::Precisions`].
+    /// The right precision depends on the model as much as on the backend, and a chained preset
+    /// runs two architectures that need different precisions. See [`crate::precision::Precisions`].
     pub const fn forced_precision(&self) -> Option<Precision> {
         if self.full_precision {
             Some(Precision::F32)

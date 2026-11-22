@@ -18,10 +18,10 @@
 //!
 //! # Storage
 //!
-//! `<dir>/<id>.fir`, kept across restarts. At most [`MAX_FILTERS`]; past that the
-//! least recently used goes, where using means uploading it or a job naming it.
-//! A file's modification time records its last use. A job holds its filter, so
-//! evicting one never breaks a job already accepted.
+//! Filters are stored as `<dir>/<id>.fir` and kept across restarts. The store holds at most
+//! [`MAX_FILTERS`]; past that, the least recently used filter is deleted, where a use is an upload
+//! or a job naming the filter. A file's modification time records its last use. A job holds its
+//! filter, so evicting a filter never breaks a job already accepted.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,14 +35,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use stemd_core::{Audio, DspMode, OutputRate, Polyphase, resample};
 
-/// Filters kept at once.
+/// The most filters kept at once.
 pub const MAX_FILTERS: usize = 64;
 
 const MAGIC: &[u8; 4] = b"SFIR";
 const VERSION: u32 = 1;
 const HEADER: usize = 16;
 
-/// Largest file accepted: the header and [`Polyphase::MAX_TAPS`] taps.
+/// The largest file accepted: the header and [`Polyphase::MAX_TAPS`] taps.
 pub const MAX_FILE_BYTES: usize = HEADER + 4 * Polyphase::MAX_TAPS;
 
 const EXTENSION: &str = "fir";
@@ -109,7 +109,7 @@ impl From<DspMode> for Dsp {
     }
 }
 
-/// The cache key's spelling: the mode number, or `fir:<id>`.
+/// Formats the filter as it appears in cache keys: the mode number, or `fir:<id>`.
 impl fmt::Display for Dsp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -151,7 +151,7 @@ impl Dsp {
                 }
                 anyhow::ensure!(
                     target == fir.poly.out_rate(),
-                    "filter {} converts to {} Hz, not {target}",
+                    "filter {}: expected {target} Hz, got {} Hz",
                     fir.id,
                     fir.poly.out_rate()
                 );
@@ -229,7 +229,7 @@ pub fn encode(in_rate: u32, out_rate: u32, taps: &[f32]) -> Vec<u8> {
 pub enum PutError {
     #[error("{0:?} is not a filter id: expected 64 lowercase hex digits")]
     BadId(String),
-    #[error("the body hashes to {computed}, not {claimed}")]
+    #[error("body hash: expected {claimed}, got {computed}")]
     Mismatch { claimed: String, computed: String },
     #[error("{0}")]
     Invalid(String),
@@ -297,7 +297,7 @@ impl Filters {
         self.stored.lock().get(id).map(|s| Arc::clone(&s.fir))
     }
 
-    /// Store `body` as filter `id`. `true` when it was not stored already.
+    /// Store `body` as filter `id`. The flag is true when the filter was not stored already.
     pub fn put(&self, id: &str, body: &[u8]) -> Result<(Arc<Fir>, bool), PutError> {
         if !is_id(id) {
             return Err(PutError::BadId(id.to_owned()));
@@ -355,7 +355,7 @@ impl Filters {
         }
     }
 
-    /// Remove the least recently used filters past the cap, never `keep`.
+    /// Remove the least recently used filters beyond the cap, except `keep`.
     fn evict(&self, keep: Option<&str>) {
         let gone: Vec<String> = {
             let mut stored = self.stored.lock();
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn the_spellings_name_the_filter() {
+    fn each_dsp_choice_prints_its_wire_name_and_directory_suffix() {
         let body = file(0);
         let id = id_of(&body);
         let fir = Arc::new(Fir {

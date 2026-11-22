@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # bindgen needs libclang 16 or later: clang 14 rejects the _Float16 and __bf16
-# in mlx-c's half.h. Jammy stops at 15.
+# in mlx-c's half.h. Jammy ships up to 15.
 RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/llvm.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \

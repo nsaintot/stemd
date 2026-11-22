@@ -1,4 +1,4 @@
-//! Storing a track's stems whole once every piece is stored, and deleting the pieces.
+//! Rewrites a track's stems as whole files once every piece is stored, and deletes the pieces.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long a track directory that failed to be stored whole waits before another try.
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// A track directory of one output, to store whole stem by stem.
+/// A track directory of one output, whose stems are to be stored whole one by one.
 #[derive(Debug, Clone)]
 pub struct Consolidation {
     pub dir: PathBuf,
@@ -69,7 +69,7 @@ impl Cache {
         self.consolidating.lock().contains(track_dir)
     }
 
-    /// True when every stem of `task` is stored and one is still in pieces.
+    /// True when every stem of `task` is stored and at least one is still in pieces.
     pub fn needs_consolidation(task: &Consolidation) -> bool {
         let extension = task.format.extension();
         let mut whole = 0;
@@ -92,7 +92,7 @@ impl Cache {
         failed.contains_key(track_dir)
     }
 
-    /// Queue every stem of `task` to be stored whole; false when it failed recently.
+    /// Queue every stem of `task` to be stored whole; returns false when the track failed recently.
     pub fn consolidate_later(self: &Arc<Self>, task: Consolidation) -> bool {
         if self.consolidation_failed(&task.dir) {
             return false;
@@ -173,7 +173,7 @@ impl Cache {
                 .with_context(|| format!("decoding {}", path.display()))?;
             ensure!(
                 audio.frames() == len,
-                "{} holds {} samples, not {len}",
+                "{}: expected {len} samples, got {}",
                 path.display(),
                 audio.frames()
             );
@@ -204,12 +204,13 @@ impl Cache {
         let expected = task.info.frames_at(task.rate);
         ensure!(
             frames == expected,
-            "{stem} holds {frames} samples, not the track's {expected}"
+            "{stem}: expected {expected} samples, got {frames}"
         );
         if crate::whole::find(track_dir, stem, extension).is_some() {
             return Ok(());
         }
-        // Described and written to staged files outside the lock, which separation also takes.
+        // Describe the stem and write the staged files outside the lock, since separation also
+        // takes it.
         let meta = crate::whole::describe(bytes, format, frames, clipped)?;
         let meta = serde_json::to_vec(&meta)?;
         crate::disk::ensure_room(&self.root)?;
@@ -231,7 +232,7 @@ impl Cache {
             let _ = std::fs::remove_file(&staged_meta);
             return Ok(());
         }
-        // The description last: a whole file counts once both are in place.
+        // Rename the description last: a whole file counts as stored once both files are in place.
         std::fs::rename(&staged_file, &file_path)
             .with_context(|| format!("publishing {}", file_path.display()))?;
         std::fs::rename(&staged_meta, &meta_path)

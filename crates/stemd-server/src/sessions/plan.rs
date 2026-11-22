@@ -6,7 +6,8 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use stemd_core::Grid;
 
-/// Priorities below this run before whole-track jobs, the rest when no job waits.
+/// Segments with a priority below this run before whole-track jobs; the others run only when no job
+/// is waiting.
 pub const BEFORE_JOBS: u8 = 50;
 
 /// The highest priority a region may ask for.
@@ -18,13 +19,14 @@ pub const MAX_REGIONS: usize = 32;
 /// Which planned segments the worker takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// Priorities below [`BEFORE_JOBS`]: ahead of whole-track jobs.
+    /// Segments with a priority below [`BEFORE_JOBS`], which run ahead of whole-track jobs.
     BeforeJobs,
-    /// The rest: when no job is waiting.
+    /// Segments at priority [`BEFORE_JOBS`] or above, which run only when no job is waiting.
     WhenIdle,
 }
 
-/// Samples around `at` a client wants separated, and how urgently: `0` first.
+/// The samples around `at` that a client wants separated, and how urgently; priority `0` runs
+/// first.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Region {
     /// Track sample the region is centred on, such as the needle or a cue.
@@ -36,7 +38,7 @@ pub struct Region {
     pub priority: u8,
 }
 
-/// What a client wants separated next. Replaces the session's last window.
+/// The regions a client wants separated next. A new window replaces the session's last one.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WindowRequest {
     pub regions: Vec<Region>,
@@ -58,11 +60,12 @@ impl WindowRequest {
     }
 }
 
-/// Where a planned segment stands: the lower runs first.
+/// A planned segment's place in the run order; lower ranks run first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Rank {
     pub priority: u8,
-    /// Samples from `at`: `0` under it, `2d + 1` for `d` samples behind, so ahead wins a tie.
+    /// The distance from `at` in samples: `0` for a segment that covers it, `d` for one `d` samples
+    /// ahead and `2d + 1` for one `d` samples behind, so ahead wins a tie.
     pub distance: usize,
 }
 

@@ -12,7 +12,7 @@ pub fn type_dir(output: &Output, gain: f32) -> String {
     format!("{}{gain}", type_prefix(output))
 }
 
-/// The directory name for one output, up to its gain.
+/// The directory name for one output, without the gain value at its end.
 pub fn type_prefix(output: &Output) -> String {
     let dsp = output.dsp.dir_suffix();
     let parts: Vec<&str> = output.parts.names().collect();
@@ -37,11 +37,11 @@ pub(super) fn file(k: usize, extension: &str) -> String {
 /// Windows  %LOCALAPPDATA%\stemd\cache
 /// ```
 ///
-/// The cache root, not the data root: every byte here is derived. Model artefacts
-/// live under [`crate::models::support_dir`].
+/// Everything under this root is derived data; model artefacts live under
+/// [`crate::models::support_dir`].
 ///
-/// Windows takes an extra component: `FOLDERID_LocalAppData` is what both
-/// `dirs::cache_dir` and `dirs::data_local_dir` return there.
+/// On Windows, `dirs::cache_dir` and `dirs::data_local_dir` both return `FOLDERID_LocalAppData`, so
+/// the path adds a `cache` component.
 pub fn default_dir() -> Result<PathBuf> {
     let dir = dirs::cache_dir()
         .context("no cache directory for this platform")?
@@ -53,8 +53,8 @@ pub fn default_dir() -> Result<PathBuf> {
     })
 }
 
-/// Lock `root` for this process, or fail if another stemd holds it, whatever
-/// port that one serves on. The system releases the lock when the process ends.
+/// Lock `root` for this process, or fail if another stemd process holds it, on any port. The system
+/// releases the lock when the process ends.
 pub fn lock(root: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let path = root.join(LOCK_FILE);

@@ -41,8 +41,8 @@ exe="$bin/stemd-server"
 [[ -f "$exe" ]] || die "no $exe. Run cargo build --release -p stemd-server -p stemd-cli first."
 [[ -f "$bin/stemd-cli" ]] || die "no $bin/stemd-cli."
 
-# A CPU-only MLX links, starts and runs about 190x slower, so the binary is
-# checked rather than the environment that built it.
+# A CPU-only MLX links, starts and runs about 190x slower, so this checks the
+# binary itself, whatever the build environment says.
 needed="$(readelf -d "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
 for lib in libcudart.so.13 libcublasLt.so.13 libnvrtc.so.13 libcudnn.so.9; do
     grep -qx "$lib" <<<"$needed" || die "$exe does not link $lib: MLX was built without CUDA."
@@ -123,7 +123,7 @@ while [[ ${#queue[@]} -gt 0 ]]; do
 done
 [[ ${#missing[@]} -eq 0 ]] || die "not found, so not vendored: $(printf '%s ' "${missing[@]}" | tr ' ' '\n' | sort -u | xargs)"
 
-# The executables carry DT_RPATH rather than DT_RUNPATH: it also covers the
+# The executables carry DT_RPATH, which unlike DT_RUNPATH also covers the
 # libraries that cuDNN and BLAS load. NVIDIA's libraries already look beside
 # themselves ($ORIGIN) and the EULA forbids modifying them; the rest get the
 # same RUNPATH here.

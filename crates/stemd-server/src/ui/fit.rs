@@ -1,13 +1,13 @@
 //! The window's height, following what its lists want.
 
-/// Frames to wait for a resize before taking the height the window has.
+/// The number of frames to wait for a resize before accepting the window's current height.
 const PATIENCE: u32 = 30;
 
 /// A resize asked for and not yet seen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Asked {
     target: f32,
-    /// The window's height when it was asked.
+    /// The window's height when the resize was asked for.
     from: f32,
     frames: u32,
 }
@@ -103,7 +103,7 @@ mod tests {
     fn a_clamped_shrink_is_not_grown_back_twice() {
         let mut fit = started(690.0, 190.0);
         assert_eq!(fit.step(690.0, 100.0).0, Some(600.0));
-        // Clamped at a 650-point minimum.
+        // The window is clamped at a 650-point minimum.
         assert_eq!(fit.step(650.0, 100.0), (None, 0.0));
         assert_eq!(
             fit.step(650.0, 190.0).0,

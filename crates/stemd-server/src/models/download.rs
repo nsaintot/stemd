@@ -1,9 +1,8 @@
-//! Fetching missing artefacts.
+//! Downloads missing artefacts.
 //!
-//! Each file is written to a temporary sibling and renamed into place, so an
-//! interrupted run cannot leave a half-written model that looks complete. The
-//! digest is computed as the bytes are written and checked before the rename, with
-//! no escape hatch for an unpinned digest.
+//! Each file is written to a temporary sibling and renamed into place, so an interrupted run cannot
+//! leave a half-written model that looks complete. The digest is computed while the bytes are
+//! written and checked before the rename; there is no way to skip the check.
 
 use std::io::{BufWriter, Read};
 use std::path::Path;
@@ -14,12 +13,12 @@ use super::READ_CHUNK;
 use super::integrity::Hashing;
 use super::preset::{ModelSource, RemoteFile};
 
-/// Bytes between progress callbacks. Often enough to drive a progress bar,
-/// rarely enough not to spam a log.
+/// The bytes between progress callbacks: often enough to drive a progress bar, and rarely enough
+/// not to flood a log.
 const PROGRESS_STEP: u64 = 8 << 20;
 
-/// Download whatever is missing into `dir`. Files already present are left
-/// alone, this is a first-run path, not a repair one.
+/// Download the missing files into `dir`. Files already present are left alone; this is a first-run
+/// path and repairs nothing.
 ///
 /// `on_progress` is called with `(file_name, bytes_done, bytes_total)`.
 pub fn fetch(
@@ -38,9 +37,8 @@ pub fn fetch(
 
 /// Fetch one file, verify it against its pinned digest, and publish it.
 ///
-/// Public because weights are not the only pinned thing this fetches: the CUDA
-/// runtime arrives the same way. Unlike [`fetch`] this does not skip a file
-/// already present, since its caller may have consumed and deleted the last one.
+/// The CUDA runtime is downloaded through this too. Unlike [`fetch`], this does not skip a file
+/// already present, since its caller may have used and deleted the previous copy.
 pub fn fetch_one(
     dir: &Path,
     file: &RemoteFile,

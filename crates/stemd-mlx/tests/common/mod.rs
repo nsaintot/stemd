@@ -1,7 +1,7 @@
 //! Shared plumbing for the null tests.
 //!
-//! Each test binary compiles this separately, so a helper only one of them uses
-//! reads as dead code in the others. That is what the allow is for.
+//! Each test binary compiles this separately, so a helper that only one binary uses reads as dead
+//! code in the others, so the module allows `dead_code`.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -11,11 +11,10 @@ use mlx_rs::Array;
 use mlx_rs::ops;
 use stemd_mlx::weights::Weights;
 
-/// MLX is not safe to drive from two threads at once: doing so trips
-/// `A command encoder is already encoding to this command buffer` inside Metal.
-/// Taking this keeps `cargo test --workspace` working without anyone having to
-/// remember `--test-threads=1`. The server serialises separation through its
-/// queue already, so this constrains the tests rather than the design.
+/// MLX is not safe to drive from two threads at once: doing so raises `A command encoder is already
+/// encoding to this command buffer` inside Metal. Taking this lock keeps `cargo test --workspace`
+/// working without `--test-threads=1`. The server already serialises separation through its queue,
+/// so this constrains only the tests.
 static GPU: Mutex<()> = Mutex::new(());
 
 pub fn one_at_a_time() -> MutexGuard<'static, ()> {
@@ -48,9 +47,8 @@ pub fn array(name: &str) -> Array {
 
 /// The real artefact, if it is on this machine.
 ///
-/// 168 MB of weights are not something to check into a repository, so the tests
-/// that need them skip when they are absent and say so. `STEMD_MLX_WEIGHTS` points
-/// at an `htdemucs.safetensors`.
+/// The 168 MB of weights stay out of the repository, so the tests that need them skip when they are
+/// absent and say so. `STEMD_MLX_WEIGHTS` points at an `htdemucs.safetensors`.
 pub fn weights() -> Option<Weights> {
     from_env("STEMD_MLX_WEIGHTS", "an htdemucs.safetensors")
 }

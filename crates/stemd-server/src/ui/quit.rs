@@ -1,10 +1,10 @@
-//! Asking before quitting mid-separation.
+//! Asks for confirmation before the window closes during a separation.
 //!
-//! [`crate::shutdown::now`] ends the process correctly on a close; this asks first, since a
-//! quality separation takes minutes.
+//! [`crate::shutdown::now`] ends the process safely on a close; this module asks first, since a
+//! Quality separation takes minutes.
 //!
-//! It covers closing the window only. `Cmd-Q` is `[NSApp terminate:]`, which calls `exit()`
-//! as soon as the delegate returns, so it cancels the job without asking.
+//! This covers closing the window only. `Cmd-Q` calls `[NSApp terminate:]`, which calls `exit()` as
+//! soon as the delegate returns, so `Cmd-Q` cancels the job without asking.
 
 use std::sync::Arc;
 
@@ -14,10 +14,10 @@ use crate::state::AppState;
 use crate::ui::theme::{self, Brushes, Palette, Weight};
 use crate::ui::widgets::{self, Pill};
 
-/// What the person chose, once they choose.
+/// The user's answer to the question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    /// Throw the separation away and go.
+    /// Discard the separation and close.
     Quit,
     /// Keep the window open and let it finish.
     Stay,
@@ -25,9 +25,7 @@ pub enum Choice {
 
 /// Whether a close should be held for a question, and what to say in it.
 ///
-/// Held separately from drawing so the decision can be tested without a
-/// viewport: the interesting cases are "a job is running" and "one is not",
-/// and neither needs a window to check.
+/// Kept apart from drawing so the decision can be tested without a viewport.
 #[derive(Default)]
 pub struct Guard {
     /// The job being asked about, if the question is on screen.
@@ -54,8 +52,7 @@ impl Guard {
                 self.asking = Some(job);
                 false
             }
-            // Nothing to lose, so nothing to ask about. Closing an idle window
-            // should never cost a click.
+            // No job is running, so close without asking.
             None => true,
         }
     }
@@ -72,9 +69,9 @@ impl Guard {
     }
 }
 
-/// The question itself.
+/// Draw the question.
 ///
-/// Takes the track's name rather than any state, so a probe can draw it.
+/// It takes only the track's name, so a probe can draw it without any state.
 pub fn dialog(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -99,9 +96,7 @@ pub fn dialog(
 
     let mut choice = None;
     ui.horizontal(|ui| {
-        // The safe option first, because this dialog appears when someone is
-        // already leaving and the destructive answer is the one muscle memory
-        // will hit.
+        // Put the safe answer first, where a reflexive click lands.
         for (label, kind, answer) in [
             ("Keep separating", Pill::Light, Choice::Stay),
             ("Quit anyway", Pill::Danger, Choice::Quit),
@@ -117,9 +112,7 @@ pub fn dialog(
     choice
 }
 
-/// Hold the close, ask, and act on the answer.
-///
-/// Everything the window does about quitting, in one call.
+/// Hold the close, ask the question, and act on the answer.
 pub fn guard(
     guard: &mut Guard,
     state: &Arc<AppState>,
@@ -174,12 +167,10 @@ mod tests {
         assert_eq!(guard.asking(), Some("track.wav"));
     }
 
-    /// Saying yes lets the close through, and only once asked.
+    /// Answering Quit lets the close through without a second question.
     ///
-    /// The second `intercept` is the part that matters. Answering `Quit` sends
-    /// a fresh close request, which arrives back here on the next frame, and
-    /// without `agreed` it would find the job still running and ask again,
-    /// forever.
+    /// Answering `Quit` sends a new close request, which arrives here on the next frame; without
+    /// `agreed`, it would find the job still running and ask again forever.
     #[test]
     fn agreeing_lets_the_next_close_through() {
         let mut guard = Guard::default();
@@ -199,7 +190,7 @@ mod tests {
         assert!(!guard.intercept(Some("track.wav".into()), true));
         guard.answer(Choice::Stay);
         assert_eq!(guard.asking(), None);
-        // And a later close is a fresh question rather than a remembered yes.
+        // A later close asks again.
         assert!(!guard.intercept(Some("track.wav".into()), true));
         assert_eq!(guard.asking(), Some("track.wav"));
     }

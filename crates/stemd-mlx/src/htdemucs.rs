@@ -1,16 +1,15 @@
 //! htdemucs itself: the two branches, the transformer between them, and the
 //! bookkeeping that joins them back into audio.
 //!
-//! A spectrogram goes down four encoder layers while the waveform goes down four
-//! of its own; the two meet in the transformer; they come back up through four
-//! decoders each, with skip connections; and the two answers are added. The
-//! branches are not independent: each encoder injects into the other, and the last
-//! decoder of the frequency branch feeds the time branch, so the loops are
-//! interleaved rather than sequential.
+//! A spectrogram goes down four encoder layers while the waveform goes down four of its own; the
+//! two meet in the transformer, come back up through four decoders each with skip connections, and
+//! the two outputs are added. The branches depend on each other: each encoder injects into the
+//! other, and the last decoder of the frequency branch feeds the time branch, so the loops are
+//! interleaved.
 //!
-//! Every constant is read from the artefact's configuration in the reference and
-//! repeated here because the model is built rather than traced. They are stated
-//! once, in [`Config`].
+//! Every constant comes from the artefact's configuration in the reference implementation and is
+//! repeated here because the model is built in code, with no traced graph. They are stated once, in
+//! [`Config`].
 
 use anyhow::{Result, bail};
 use mlx_rs::ops::indexing::IndexOp;
@@ -22,11 +21,9 @@ use crate::spectral::Spectral;
 use crate::transformer::CrossTransformer;
 use crate::weights::{Scope, Weights};
 
-/// What the traced artefact says about itself.
+/// The values htdemucs was trained with.
 ///
-/// Not configurable: these are the numbers htdemucs was trained with, and a
-/// different value here does not produce a different model, it produces a
-/// model whose weights no longer fit.
+/// They are fixed: a different value would give a model whose weights no longer fit.
 pub struct Config {
     pub depth: i32,
     pub channels: i32,
@@ -44,19 +41,16 @@ pub struct Config {
     pub freq_emb_weight_scale: f32,
     pub dconv_depth: i32,
     pub dconv_compress: i32,
-    /// Length in seconds the model was trained on. Shorter input is padded up
-    /// to it, because the transformer's position embedding was learned at that
-    /// extent.
+    /// The segment length in seconds the model was trained on. Shorter input is padded to it,
+    /// because the transformer's position embedding was learned at that length.
     pub segment: f32,
     pub sample_rate: i32,
-    /// Precision the encoder, transformer and decoder run at.
-    ///
-    /// Everything outside them stays `f32`: the spectrogram and its inverse, the
-    /// per-branch standardisation, and the overlap-add. Those accumulate over the
-    /// whole track or take variances over hundreds of thousands of samples, which is
-    /// where half precision would hurt.
-    ///
-    /// [`Precision`] rather than a [`Dtype`] so a caller need not link mlx.
+    /// The precision the encoder, transformer and decoder run at.
+    // Everything outside them stays `f32`: the spectrogram and its inverse, the per-branch
+    // standardisation, and the overlap-add. Those accumulate over the whole track or take
+    // variances over hundreds of thousands of samples, where half precision would hurt.
+    //
+    // It is a [`Precision`], so a caller can set it without linking mlx to name a [`Dtype`].
     pub precision: Precision,
 }
 
@@ -87,7 +81,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Samples in one training segment, which is the length the model runs on.
+    /// The number of samples in one training segment, the length the model runs on.
     pub fn training_length(&self) -> i32 {
         (self.segment * self.sample_rate as f32) as i32
     }
@@ -323,9 +317,8 @@ impl HtDemucs {
                 "{length} samples is longer than the {training}-sample segment this model runs on"
             );
         }
-        // Padded up rather than run short: the transformer's position embedding
-        // was learned at the training extent, so a shorter input is a different
-        // model, not a faster one.
+        // Pad up to the training length: the transformer's position embedding was learned at that
+        // length, so a shorter input would behave as a different model.
         let padded = ops::pad(
             mix,
             &[(0, 0), (0, 0), (0, training - length)][..],
@@ -479,7 +472,7 @@ fn channels_as_complex(x: &Array) -> Result<Array> {
     let moved = ops::transpose_axes(&split, &[0, 1, 2, 4, 5, 3][..])?;
     let real = moved.index((.., .., .., .., .., 0));
     let imag = moved.index((.., .., .., .., .., 1));
-    // No `complex(re, im)` in mlx-rs; multiplying by i and adding is the same.
+    // mlx-rs has no `complex(re, im)`; multiplying by i and adding gives the same result.
     let i = Array::from_complex(mlx_rs::complex64::new(0.0, 1.0));
     Ok(ops::add(&real, &ops::multiply(&imag, &i)?)?)
 }

@@ -1,9 +1,9 @@
 //! Protocol 1 under `/v1`, which is deprecated and may stop working in a future release.
 //!
-//! `/v1` keeps the 0.2.0 health and jobs. The handlers translate their requests
-//! and answers onto the protocol 2 ones, so both protocols share every job and
-//! stored stem. Sessions are protocol 2 only: `/v1/sessions` answers `410`.
-//! "Protocol 1 (deprecated)" in `docs/api.md` lists the differences.
+//! `/v1` keeps the 0.2.0 health and jobs routes. The handlers translate requests and answers to and
+//! from protocol 2, so both protocols share every job and stored stem. Sessions are protocol 2
+//! only: `/v1/sessions` answers `410`. "Protocol 1 (deprecated)" in `docs/api.md` lists the
+//! differences.
 //!
 //! Every answer under `/v1` carries `Deprecation: true` and a `Link` to the
 //! API reference. The first request from each client address logs a warning.
@@ -89,7 +89,7 @@ fn first_from(ip: IpAddr) -> bool {
     SEEN.lock().first(ip)
 }
 
-/// The most client addresses remembered; past it they are all forgotten.
+/// The most client addresses remembered; past this count, the set is cleared.
 const SEEN_MAX: usize = 1024;
 
 /// The client addresses already warned about.
@@ -163,7 +163,7 @@ struct JobResult {
 #[derive(Debug, Serialize)]
 struct StemFile {
     name: String,
-    /// Server-local path of the stem file.
+    /// The server-local path of the stem file.
     path: PathBuf,
     url: String,
     bytes: u64,

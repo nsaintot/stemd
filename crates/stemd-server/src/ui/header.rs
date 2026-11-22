@@ -1,8 +1,8 @@
 //! The top row: a segmented control for the model, and a capsule with the parts,
 //! format and rate menus.
 //!
-//! Everything here is saved as it changes, see [`crate::settings`], so this row is
-//! also what the next launch will do.
+//! Every control here is saved when it changes (see [`crate::settings`]), so the row also shows
+//! what the next launch will use.
 
 use std::sync::Arc;
 
@@ -18,10 +18,10 @@ use super::icons;
 use super::theme::{self, Brushes, Glass, Palette, Tween, Weight, white};
 use super::widgets::{self, menu_row, pick_menu};
 
-/// Height of both header controls.
+/// The height of both header controls.
 pub const HEIGHT: f32 = 32.0;
 
-/// Segment widths in the segmented control, Fast, Balanced and Quality.
+/// The widths of the Fast, Balanced and Quality segments.
 const SEGMENTS: [f32; 3] = [54.0, 86.0, 88.0];
 const SEGMENT_HEIGHT: f32 = 24.0;
 /// Space between the control's border and its segments.
@@ -38,7 +38,7 @@ const CHEVRON: f32 = 8.0;
 pub const PINNED_HINT: &str = "Set on the command line for this run. Restart without \
                            the flag to change it here.";
 
-/// Least room between the model control and the capsule.
+/// The smallest gap between the model control and the capsule.
 const ROW_GAP: f32 = 12.0;
 
 /// Draw the row. Returns the width it needs without the two controls touching.
@@ -49,7 +49,7 @@ pub fn row(
     brushes: &Brushes,
     clock: f32,
 ) -> f32 {
-    // The glass's drop shadow reaches past the panel; let it.
+    // Widen the clip so the glass's drop shadow can reach past the panel.
     ui.set_clip_rect(ui.ctx().content_rect());
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEIGHT), Sense::hover());
     let left = models(ui, rect, state, palette, brushes, clock);
@@ -213,7 +213,7 @@ fn capsule(
         (
             Menu::Format,
             match current.format {
-                // The menu says "float"; the capsule has no room for it.
+                // The menu label says "float", which does not fit in the capsule.
                 StemFormat::Pcm32 => "PCM 32-bit".to_owned(),
                 format => format.label().to_owned(),
             },
@@ -440,8 +440,7 @@ fn format_menu(ui: &mut egui::Ui, settings: &SettingsFile, current: StemFormat, 
     }
 }
 
-/// Only the rates the chosen format can carry: 96 kHz beside MP3 would be a
-/// choice that produces a 48 kHz file anyway.
+/// List only the rates the chosen format can carry: 96 kHz MP3 would produce a 48 kHz file anyway.
 fn rate_menu(
     ui: &mut egui::Ui,
     settings: &SettingsFile,
@@ -460,7 +459,8 @@ fn rate_menu(
 }
 
 /// Shown on `bass` and `other` while Balanced is loaded.
-const SPLIT_COST: &str = "On Balanced, bass and other need one more model: about 1.5x the time.";
+const SPLIT_COST: &str =
+    "On Balanced, splitting bass and other runs one more model, which takes about 1.5x as long.";
 
 fn part_hint(part: &str) -> &'static str {
     match part {

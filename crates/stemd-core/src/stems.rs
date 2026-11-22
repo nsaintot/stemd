@@ -1,56 +1,53 @@
-//! Stem topology, and the player-side maths that consumes it.
+//! The stem layout, and the player-side maths that uses it.
 //!
-//! The server produces exactly [`SHIPPED`]. A player drives three faders and
-//! reconstructs the third part itself:
+//! The server produces exactly [`SHIPPED`]. A player drives three faders and rebuilds the third
+//! part itself:
 //!
 //! ```text
 //! drums = mix - harmonics - vocals
 //! ```
 //!
-//! so the parts sum to the mix by construction, for every sample, without relying
-//! on the model's own sources summing to its input. See
-//! [`Stems::model_residual_db`].
+//! so the parts sum to the mix by construction, for every sample, whether or not the model's own
+//! sources sum to its input. See [`Stems::model_residual_db`].
 //!
-//! Evaluating the faders never materialises that third part. Substituting
-//! `S_drums` into `out = sum(g_q * S_q)` collapses to
+//! Evaluating the faders never computes that third part. Substituting `S_drums` into `out = sum(g_q
+//! * S_q)` gives
 //!
 //! ```text
 //! out = g_drums * mix + (g_harmonics - g_drums) * harmonics
 //!                     + (g_vocals    - g_drums) * vocals
 //! ```
 //!
-//! so a player mixes against buffers it already holds. At unity both stem
-//! coefficients are exactly zero and the result is the mix, bit for bit.
+//! so a player mixes buffers it already holds. At unity both stem coefficients are exactly zero and
+//! the result is the mix, bit for bit.
 //!
-//! **Where the residual lands is the preset's business, not the player's.**
-//! `Fast` ships `harmonics` as the model's `bass + other`, so the leftover from
-//! four sources that do not quite sum arrives on the rebuilt drums. `Balanced`
-//! and `Quality` build `harmonics` as `mix - vocals - drums`, so the leftover is
-//! inside `harmonics`.
+//! **The preset decides where the residual lands.** `Fast` ships `harmonics` as the model's `bass +
+//! other`, so the leftover from four sources that do not quite sum arrives on the rebuilt drums.
+//! `Balanced` and `Quality` build `harmonics` as `mix - vocals - drums`, so the leftover is inside
+//! `harmonics`.
 //!
-//! None of that reaches the player. The server's subtraction and the client's are
-//! inverses: `mix - harmonics - vocals` returns whatever the server called drums.
+//! The player is unaffected. The server's subtraction and the client's are inverses: `mix -
+//! harmonics - vocals` returns whatever the server called drums.
 
 use crate::pcm::Audio;
 
 /// The stems the server produces and transfers.
 ///
-/// `harmonics` is the model's `bass` and `other` summed: the split is not one a
-/// DJ reaches for, and merging halves what crosses the wire.
+/// `harmonics` is the model's `bass` and `other` summed: DJs rarely want that split, and merging
+/// halves the transfer.
 pub const SHIPPED: [&str; 2] = ["harmonics", "vocals"];
 
-/// Source order used by the four-stem models (demucs, Open-Unmix).
+/// The source order of the four-stem models (demucs, Open-Unmix).
 pub(crate) const FOUR_STEM_SOURCES: [&str; 4] = ["drums", "bass", "other", "vocals"];
 
-/// Which model sources make up each shipped stem. The model's `drums` is in
-/// neither, which is what makes it the part a player rebuilds for itself.
+/// The model sources that make up each shipped stem. The model's `drums` is in neither, so it is
+/// the part a player rebuilds.
 pub(crate) const STEM_SOURCES: [(&str, &[&str]); 2] =
     [("harmonics", &["bass", "other"]), ("vocals", &["vocals"])];
 
-/// The three things a player puts a fader on.
+/// The three parts a player has faders for.
 ///
-/// Player-side only. The server produces [`SHIPPED`] and has no notion of a
-/// third part.
+/// Player-side only: the server produces [`SHIPPED`] and has no third part.
 pub const PARTS: [&str; 3] = ["drums", "harmonics", "vocals"];
 
 /// Every part a job can ask for, in the order they ship. `harmonics` is `bass` and
@@ -186,7 +183,7 @@ impl Parts {
         self.0.has(part)
     }
 
-    /// Model sources none of the parts cover.
+    /// The model sources that none of the parts cover.
     pub(crate) fn left_out(self) -> Vec<&'static str> {
         FOUR_STEM_SOURCES
             .into_iter()
@@ -241,11 +238,11 @@ impl std::fmt::Display for Parts {
     }
 }
 
-/// The part a player reconstructs rather than receiving. Player-side only, and
-/// fixed. See the module docs for why it is `drums`.
+/// The part a player rebuilds from the others. Player-side only and fixed; the module docs explain
+/// why it is `drums`.
 pub const DERIVED: &str = "drums";
 
-/// Fader positions, one per [`PARTS`] entry. `1.0` is unity.
+/// The fader positions, one per [`PARTS`] entry. `1.0` is unity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PartGains {
     pub drums: f32,
@@ -271,8 +268,8 @@ impl PartGains {
 
     /// True when this is exactly unity, so mixing can return the mix untouched.
     ///
-    /// Exact equality is deliberate: the guarantee is bit-for-bit identity, so
-    /// a UI must snap its faders to a literal `1.0` rather than land near it.
+    /// The comparison is exact on purpose: the guarantee is bit-for-bit identity, so a UI must snap
+    /// its faders to exactly `1.0`.
     pub(crate) fn is_unity(self) -> bool {
         self == Self::UNITY
     }
@@ -288,13 +285,11 @@ impl Default for PartGains {
 pub struct Stems {
     /// The stems in [`SHIPPED`] order. These are all the server produces.
     pub shipped: Vec<(&'static str, Audio)>,
-    /// Level of the model's own reconstruction error `mix - sum(sources)`, relative to
-    /// the mix, in dB.
-    ///
-    /// Diagnostic, not a correctness gate: the three parts still sum exactly. It only
-    /// means anything where the model's sources are supposed to sum to the mix and
-    /// miss. An arrangement that builds one part by subtraction has no such redundancy
-    /// and collapses to float noise.
+    /// The level of the model's own reconstruction error `mix - sum(sources)`, relative to the mix,
+    /// in dB.
+    // A diagnostic only: the three parts still sum exactly. It is meaningful only where the
+    // model's sources should sum to the mix and miss. An arrangement that builds one part by
+    // subtraction has no such redundancy, and the value collapses to float noise.
     pub model_residual_db: f64,
     /// Parts beyond [`SHIPPED`] that this separation estimated.
     pub more: Vec<(&'static str, Audio)>,
@@ -318,8 +313,8 @@ impl Stems {
 
     /// Apply the three faders.
     ///
-    /// Unity short-circuits to a copy of the mix: the bit-exactness guarantee
-    /// made explicit, so a later change to the arithmetic cannot break it.
+    /// Unity returns a copy of the mix directly, which makes the bit-exactness guarantee explicit,
+    /// so a later change to the arithmetic cannot break it.
     pub fn mix(&self, mix: &Audio, gains: PartGains) -> Audio {
         if gains.is_unity() {
             return mix.clone();
@@ -363,7 +358,7 @@ fn at(audio: &Audio, c: usize, i: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Level of `mix - sum(sources)` relative to `mix`, in dB.
+/// The level of `mix - sum(sources)` relative to `mix`, in dB.
 pub(crate) fn unexplained_db<'a>(mix: &Audio, sources: impl IntoIterator<Item = &'a Audio>) -> f64 {
     let sources: Vec<&Audio> = sources.into_iter().collect();
     let (mut num, mut den) = (0.0f64, 0.0f64);
@@ -395,8 +390,8 @@ mod tests {
     /// and lands on [`DERIVED`].
     fn fixture() -> (Audio, Stems) {
         let mix = audio(&[1.0, 0.5, -0.25, 0.125]);
-        // The model's own drums is in `flat` but never shipped: it is what the
-        // residual is measured against, exactly as the backend does it.
+        // The model's own drums are in `flat` but never shipped: the residual is measured against
+        // them, as the backend does.
         let model_drums = audio(&[0.30, 0.10, -0.05, 0.20]);
         let shipped = vec![
             ("harmonics", audio(&[0.25, 0.30, 0.12, -0.09])),
@@ -509,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn near_unity_is_not_unity() {
+    fn a_gain_near_unity_is_not_unity() {
         let gains = PartGains {
             vocals: 0.9997,
             ..PartGains::UNITY
@@ -518,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn unexplained_is_zero_when_sources_sum_to_the_mix() {
+    fn the_unexplained_level_is_zero_when_the_sources_sum_to_the_mix() {
         let mix = audio(&[1.0, 0.5]);
         let half = audio(&[0.5, 0.25]);
         assert!(unexplained_db(&mix, &[half.clone(), half]) < -100.0);

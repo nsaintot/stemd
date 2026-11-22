@@ -1,4 +1,4 @@
-//! Storing a finished job's stems whole in the cache.
+//! Stores a finished job's stems whole in the cache.
 
 use std::sync::Arc;
 
@@ -11,7 +11,8 @@ use crate::ident::track_id;
 use crate::jobs::Entry;
 use crate::output::Output;
 
-/// The parts `output.parts` names and the derived part, `mix` minus them, each at the output rate.
+/// The parts that `output.parts` names, and the derived part (`mix` minus those parts), each at the
+/// output rate.
 pub(super) fn to_output_rate(
     mix: &Audio,
     stems: &Stems,
@@ -34,7 +35,7 @@ pub(super) fn to_output_rate(
         .into_iter()
         .chain(derived.iter().map(|(name, audio)| (*name, audio)))
         .collect();
-    // One thread per part, see `is_converting_three_stems_at_once_worth_it`.
+    // One thread per part; see `is_converting_three_stems_at_once_worth_it`.
     std::thread::scope(|scope| {
         let running: Vec<_> = parts
             .iter()
@@ -57,8 +58,7 @@ fn one_rate(name: &'static str, audio: &Audio, output: &Output) -> Result<(&'sta
         .dsp
         .convert(audio, output.rate.hz())
         .with_context(|| format!("converting {name} to {} Hz", output.rate))?;
-    //  Timed because which of conversion and encode dominates depends on the format
-    //  asked for.
+    // Timed because the format decides whether conversion or encoding dominates.
     tracing::debug!(
         "{name}: {} -> {} Hz in {:.2?}",
         audio.sample_rate,
@@ -99,7 +99,7 @@ pub(super) fn store_whole(
     cache.write_info(&dir, &info)?;
     let task = Consolidation::new(dir.clone(), output, info);
     let expected = info.frames_at(output.rate.hz());
-    // One thread per stem, so storing costs the longest encode.
+    // One thread per stem, so storing takes as long as the slowest encode.
     let encoded: Vec<Result<Encoded>> = std::thread::scope(|scope| {
         let running: Vec<_> = converted
             .iter()
@@ -133,7 +133,8 @@ pub(super) fn store_whole(
     Ok(entry)
 }
 
-/// A stem's name, its encoded bytes, and the samples clipped, absent for `f32le`.
+/// A stem's name, its encoded bytes, and the number of samples clipped, which is absent for
+/// `f32le`.
 type Encoded<'a> = (&'a str, Vec<u8>, Option<usize>);
 
 /// `audio` cut or padded with silence to `frames`.

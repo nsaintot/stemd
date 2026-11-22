@@ -176,7 +176,7 @@ mod separations {
         );
     }
 
-    /// `GET uri`, its status and body bytes.
+    /// Send `GET uri` and return the status, headers and body bytes.
     async fn fetch(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let request = axum::http::Request::builder()
             .uri(uri)
@@ -488,14 +488,14 @@ mod session_api {
 
     const FILE: &str = "3b0c55e19a7d42f08c6e1d2a";
 
-    /// 16-bit stereo noise, `frames` long, unlike [`pcm`].
+    /// 16-bit stereo noise, `frames` long, that differs from [`pcm`].
     fn other_pcm(frames: usize) -> Vec<u8> {
         (0..frames * 2)
             .flat_map(|i| ((((i * 53) % 2000) as i32 - 1000) as i16 * 8).to_le_bytes())
             .collect()
     }
 
-    /// Every file under `dir` but the `.used` marker.
+    /// Every file under `dir` except the `.used` marker.
     fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_owned()];
@@ -513,7 +513,8 @@ mod session_api {
         out
     }
 
-    /// Store the first pieces of [`pcm`] under `FILE`, end the session, and return the track id and its directory.
+    /// Store the first pieces of [`pcm`] under `FILE`, end the session, and return the track id and
+    /// its directory.
     async fn partial_track(
         state: &crate::state::AppState,
         app: &axum::Router,
@@ -548,7 +549,7 @@ mod session_api {
         )
         .await;
         assert_eq!(ended.status, StatusCode::NO_CONTENT);
-        // A segment running at the end may still write its pieces.
+        // A segment that is running when the session ends may still write its pieces.
         let mut seen = files_under(&dir);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1005,7 +1006,8 @@ mod jobs {
             "{}",
             answer.json
         );
-        // A failed job frees its key, so the same track is refused again, not joined.
+        // A failed job frees its key, so a new request for the same track is refused again instead
+        // of joining the failed job.
         let again = call(&app, Method::POST, "/v2/jobs?format=s16le", second()).await;
         assert_eq!(
             again.status,

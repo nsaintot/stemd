@@ -9,17 +9,17 @@ use super::theme::{self, Brushes, Glass, Palette, Weight, white};
 /// Seconds a hover wash takes to come and go.
 pub const HOVER_SECS: f32 = 0.15;
 
-/// Inner margin of every menu panel.
+/// The inner margin of every menu panel.
 const MENU_MARGIN: i8 = 6;
 
-/// 0 to 1 as `on` turns on and off, for hover washes.
+/// A value easing between 0 and 1 as `on` turns on and off, for hover washes.
 pub fn fade(ui: &egui::Ui, id: egui::Id, on: bool) -> f32 {
     ui.ctx()
         .animate_bool_with_time(id.with("fade"), on, HOVER_SECS)
 }
 
-/// The bottom of a list panel where its cut row fades out.
-/// A scrolling glass list `height` tall; `add_rows` draws the rows, and the last one fades when more lie below.
+/// A scrolling glass list `height` tall. `add_rows` draws the rows, and the last row fades out when
+/// more rows lie below.
 pub fn glass_list(
     ui: &mut egui::Ui,
     brushes: &Brushes,
@@ -145,11 +145,11 @@ pub enum Pill {
     Ghost,
     /// The same, with its label in the danger colour.
     Danger,
-    /// The light pill: the one answer that matters.
+    /// The light pill, for the main answer.
     Light,
 }
 
-/// Width of a pill that fits `label` at `height`.
+/// The width of a pill that fits `label` at `height`.
 pub fn pill_width(ui: &egui::Ui, label: &str, height: f32) -> f32 {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -362,12 +362,12 @@ impl Column {
         at
     }
 
-    /// Offset of the next row to be added.
+    /// The offset of the next row to be added.
     pub const fn next(&self) -> f32 {
         self.used
     }
 
-    /// Height of the block, without the gap under its last row.
+    /// The height of the block, without the gap under its last row.
     pub fn height(&self) -> f32 {
         self.used - self.last_gap
     }

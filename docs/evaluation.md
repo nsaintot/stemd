@@ -1,14 +1,14 @@
 # Evaluation
 
-Measurements behind the presets. SDR is global SDR (MDX/multisong convention),
-in dB, higher is better. Each timing names its machine: an M1 Pro (MLX on Metal)
-or an RTX 3090 Ti (MLX on CUDA).
+This page lists the measurements behind the presets. SDR is global SDR
+(MDX/multisong convention), in dB, higher is better. Each timing names its
+machine: an M1 Pro (MLX on Metal) or an RTX 3090 Ti (MLX on CUDA).
 
 ## Every preset, per part
 
-Global SDR over the first 12 MUSDB18-HQ test tracks, full length, through
-`stemd-server` and `stemd-cli` 0.1.4 on the RTX 3090 Ti. The separation code is
-unchanged in 0.2.0.
+These figures are global SDR over the first 12 MUSDB18-HQ test tracks, full
+length, measured through `stemd-server` and `stemd-cli` 0.1.4 on the RTX 3090
+Ti. The separation code is unchanged in 0.2.0.
 
 | preset | drums | bass | other | harmonics | vocals | realtime, 3090 Ti |
 |---|---|---|---|---|---|---|
@@ -32,8 +32,8 @@ unchanged in 0.2.0.
 | 25 MUSDB clips of 6.8 s | model and arrangement choices before `stemd_roformer` | include MUSDB train tracks; one padded segment per clip, so blind to segment boundaries and `--overlap`; differences under about 0.2 dB are noise |
 | 45 s excerpts of electronic tracks | leakage between stems, listening | no ground truth |
 
-MUSDB is mostly rock and pop. The target material is electronic, and the two
-disagree where it matters most: processed vocals and tracks without vocals.
+MUSDB is mostly rock and pop. The target material is electronic, and results on
+the two differ most on processed vocals and on tracks without vocals.
 
 ## Presets
 
@@ -43,11 +43,11 @@ disagree where it matters most: processed vocals and tracks without vocals.
 | Balanced | `htdemucs_ft`'s drums and vocals models, `harmonics` as the remainder | two of the bag's four models: 9.83 mean on the clips against 9.47 for all four, and 14.5 s against 25.8 s on a 120 s track (M1 Pro) |
 | Quality | `stemd_roformer`, one pass, `harmonics` as the remainder | against the BS PolarFormer and `htdemucs_ft` chain it replaced: drums +2.3, harmonics +1.7, vocals -1.2 dB, 1.6x to 1.8x faster, one 251 MB artefact instead of 774 MB |
 
-`stemd_roformer` is a BS-RoFormer trained for stemd: PolarFormer's shape (dim
-256, hop 512, chunk 588,800) with rotary position and four mask estimators,
-125.2M parameters. The MLX port nulls against the PyTorch reference at -117 dB
-on all four stems. Metal runs it at float16 and CUDA at float32; SDR is the same
-to the second decimal.
+`stemd_roformer` is a BS-RoFormer trained for stemd. It has PolarFormer's shape
+(dim 256, hop 512, chunk 588,800), rotary position embeddings, four mask
+estimators and 125.2M parameters. The MLX port nulls against the PyTorch
+reference at -117 dB on all four stems. Metal runs it at float16 and CUDA at
+float32; SDR is the same to the second decimal.
 
 `Balanced` runs a third model, the bag's bass specialist, only when a job asks
 for `bass` or `other`.
@@ -81,19 +81,19 @@ When two models make the stems, `harmonics` ships as the remainder,
 
 - Raw `bass + other` from one model with vocals from another puts the models'
   disagreement about the vocals into the rebuilt drums.
-- Fast stays one raw pass: the remainder changes nothing for a single model
-  whose sources sum to -33.9 dB of the mix.
-- Feeding the drums model `mix - vocals` (chaining) helps only behind a
-  RoFormer: vocal content shared with drums went from -29.6 to -34.2 dB. Behind
-  Balanced's demucs vocals it got worse, -28.2 to -27.3 dB, so Balanced does
-  not chain.
+- Fast stays one raw pass. For a single model whose sources sum to within -33.9
+  dB of the mix, building a part as the remainder changes nothing.
+- Feeding the drums model `mix - vocals` (chaining) helps only when a RoFormer
+  makes the vocals: the vocal content shared with drums drops from -29.6 to
+  -34.2 dB. With Balanced's demucs vocals it gets worse, from -28.2 to -27.3 dB,
+  so Balanced does not chain.
 
 ## Which part to rebuild
 
-The rebuilt part carries the model's whole residual. SDR cannot choose: the
-three choices land within 0.04 dB. On 90 s of real material with `htdemucs`, the
-residual is -29.8 dB of the mix with a crest factor of 14.3, so it sounds
-percussive.
+The rebuilt part carries the model's whole residual. SDR does not tell the
+choices apart: all three land within 0.04 dB. On 90 s of real material with
+`htdemucs`, the residual is -29.8 dB of the mix with a crest factor of 14.3, so
+it sounds percussive.
 
 | rebuilt | its level | residual below it | drums fader down |
 |---|---|---|---|
@@ -107,8 +107,8 @@ percussive.
 
 ## Listening
 
-Electronic material, with the arrangements above. Quality was then the viperx
-chain.
+These tests used electronic material and the arrangements above, with Quality
+set to the viperx chain.
 
 | preset | heard | vocals content shared with drums |
 |---|---|---|
@@ -147,10 +147,11 @@ sits 14 dB or more below it.
 
 ## On-device separation
 
-Why separation runs on a server: an RK3399 client (4x Cortex-A53, 2x
-Cortex-A72) reaches 7.52 GFLOP/s fp32 on its 5 usable cores, against 50.45 on
-one M1 core. Hybrid Demucs v3 needs 2.31 s of compute per second of audio there.
-Removing its LSTM and time-domain branch together buys 1.52x of the 5x needed.
+Separation runs on a server because small clients are too slow. An RK3399 client
+(4x Cortex-A53, 2x Cortex-A72) reaches 7.52 GFLOP/s fp32 on its 5 usable cores,
+against 50.45 GFLOP/s on one M1 core, and Hybrid Demucs v3 needs 2.31 s of
+compute per second of audio there. Removing both its LSTM and its time-domain
+branch gains 1.52x of the 5x needed.
 
 ## Reproduce
 

@@ -1,8 +1,7 @@
-//! Two models, one stem each, and the third derived.
+//! Two models, one stem each, with the third stem derived.
 //!
-//! BS-RoFormer separates vocals better than demucs does, and separates nothing
-//! else. demucs splits the rest. So this runs both and takes each stem from
-//! whichever is better at it:
+//! BS-RoFormer separates vocals better than demucs, and separates nothing else; demucs splits the
+//! rest. This separator runs both and takes each stem from the model that does it better:
 //!
 //! ```text
 //! vocals    = BS-RoFormer(mix)
@@ -10,29 +9,25 @@
 //! harmonics = mix - vocals - drums          (the remainder, and what ships)
 //! ```
 //!
-//! Three things about that arrangement are load-bearing.
+//! Three properties of this arrangement matter.
 //!
-//! **The halves are chained, not parallel.** The drums model is handed what the
-//! vocals model left behind rather than the track. It cannot change the vocals,
-//! which are the same forward pass over the same audio either way, so all it
-//! moves is where the line between drums and harmonics falls. It is worth exactly
-//! what the model at the front of it is worth, which is why
-//! [`Self::demucs_specialists`] does not do it: chaining a demucs vocals
-//! specialist into a demucs drums specialist measured worse on every track tried.
+//! **The halves are chained.** The drums model receives the audio the vocals model left behind.
+//! Chaining cannot change the vocals, which come from the same forward pass over the same audio
+//! either way; it only moves the line between drums and harmonics. Its benefit depends on the
+//! vocals model in front, so [`HybridSeparator::demucs_specialists`] does not chain: feeding a
+//! demucs vocals specialist into a demucs drums specialist measured worse on every track tried.
 //!
-//! **`harmonics` is the remainder, not demucs's `bass + other`.** The player
-//! derives `drums = mix - harmonics - vocals`, which with this arrangement
-//! returns the drums estimate untouched. Shipping `bass + other` instead makes
-//! that subtraction evaluate to demucs's drums plus the two models' disagreement
-//! about the vocals, which is the error RoFormer was brought in to remove,
-//! reappearing on the drums fader.
+//! **`harmonics` is the remainder.** It is never demucs's `bass + other`. The player derives `drums
+//! = mix - harmonics - vocals`, which with this arrangement returns the drums estimate unchanged.
+//! Shipping `bass + other` would make that subtraction give demucs's drums plus the two models'
+//! disagreement about the vocals, so the error that RoFormer is there to remove would reappear on
+//! the drums fader.
 //!
-//! **Each half is one model, not a bag.** `htdemucs_ft` is four fine-tuned
-//! checkpoints combined by an identity matrix, so its drums come from `model_0`
-//! alone and its vocals from `model_3` alone. Only the ones a half needs are
-//! loaded, and only those run. That is why `Balanced` is built this way too: two
-//! models with harmonics as the remainder is half the work and measurably better
-//! than running all four. See docs/evaluation.md.
+//! **Each half is one model.** `htdemucs_ft` is four fine-tuned checkpoints combined by an identity
+//! matrix, so its drums come from `model_0` alone and its vocals from `model_3` alone. Only the
+//! checkpoints a half needs are loaded and run. `Balanced` is built the same way: two models with
+//! harmonics as the remainder do half the work and measure better than all four. See
+//! docs/evaluation.md.
 
 use std::path::Path;
 
@@ -53,16 +48,12 @@ use crate::stems::{Parts, Stems, minus};
 
 pub struct HybridConfig {
     pub overlap: f32,
-    /// Precision of the vocals half. See [`Precision::preferred`](crate::Precision::preferred).
+    /// The precision of the vocals half. See [`Precision::preferred`](crate::Precision::preferred).
     pub vocals_precision: Precision,
-    /// Precision of the drums half.
+    /// The precision of the drums half.
     pub drums_precision: Precision,
-    /// Hand the drums half the instrumental rather than the mixture.
-    ///
-    /// The two halves are independent by default: both see the track, and the only
-    /// thing joining them is the subtraction at the end. Chaining cannot touch the
-    /// vocals, which are the same forward pass either way; all it moves is where the
-    /// line between drums and harmonics falls. Off by default.
+    /// Give the drums half the instrumental, the mix minus the vocals, as input. Off by default.
+    // By default both halves see the track, and only the final subtraction joins them.
     #[cfg(feature = "research")]
     pub cascade: bool,
 }
@@ -101,14 +92,13 @@ mod research;
 /// One model, and which of its outputs this arrangement wants.
 struct Half {
     model: Box<dyn Chunked + Send>,
-    /// The source to take. A fine-tuned demucs checkpoint still produces all
-    /// four and only one of them is the one it was tuned for; BS-RoFormer
-    /// produces one.
+    /// The source to keep. A fine-tuned demucs checkpoint produces all four sources but is tuned
+    /// for only one; BS-RoFormer produces one.
     source: i32,
     /// Whether the model expects the track-level normalisation.
     ///
-    /// demucs does: it normalises by the statistics of the mono mixdown and undoes
-    /// that after. BS-RoFormer does not, having been trained on raw audio.
+    /// demucs does: it normalises by the statistics of the mono mixdown and undoes that afterwards.
+    /// BS-RoFormer, trained on raw audio, does not.
     normalised: bool,
 }
 
@@ -137,7 +127,7 @@ pub struct HybridSeparator {
     config: HybridConfig,
 }
 
-/// Index of a source in demucs's `drums, bass, other, vocals` order.
+/// The index of each source in demucs's `drums, bass, other, vocals` order.
 const DRUMS: i32 = 0;
 const BASS: i32 = 1;
 const VOCALS: i32 = 3;
@@ -145,10 +135,9 @@ const VOCALS: i32 = 3;
 impl HybridSeparator {
     /// Both halves from one demucs bag: its vocals specialist and its drums one.
     pub fn demucs_specialists(dir: &Path, artefact: &str, config: HybridConfig) -> Result<Self> {
-        // Both halves come out of one file, so one cast serves both. They are
-        // the same family and therefore want the same precision anyway; the
-        // caller is trusted to have asked for that, and the vocals value wins
-        // if it somehow did not.
+        // Both halves come from one file, so one cast serves both. They are the same family and
+        // want the same precision; the caller is expected to ask for that, and the vocals precision
+        // wins if it did not.
         let precision = config.vocals_precision;
         let weights = open(dir, artefact, precision)?;
         let mut separator = Self::assemble(
@@ -196,7 +185,7 @@ pub(crate) fn check_geometry(mix: &Audio, channels: usize, sample_rate: u32) -> 
     Ok(())
 }
 
-/// One `[C, T]` slice back to planes, optionally denormalised.
+/// Convert one `[C, T]` slice to planes, optionally denormalised.
 pub(crate) fn to_planes(
     out: &Array,
     channels: usize,
@@ -240,7 +229,7 @@ pub(crate) fn remainder_stems(
         Audio::new(harmonics, rate),
         Audio::new(vocals, rate),
     );
-    // Constructed to sum, so this is float noise rather than a measurement.
+    // The stems sum to the mix by construction, so this is float noise and measures nothing.
     let model_residual_db = crate::stems::unexplained_db(mix, [&drums, &harmonics, &vocals]);
 
     let mut more = Vec::new();
@@ -374,16 +363,14 @@ impl Separate for HybridSeparator {
 
     fn info(&self) -> BackendInfo {
         BackendInfo {
-            // The runtime, not the arrangement: this is the same MLX as the
-            // single-model path, and a client switching on the value should
-            // not have to learn a second name for it. Which models ran is
-            // `model`'s business.
+            // Report the runtime: it is the same MLX as the single-model path, so a client that
+            // checks the value needs no second name for it. `model` says which models ran.
             backend: "mlx".into(),
             model: self.model.clone(),
             sample_rate: self.sample_rate,
             channels: self.channels,
             stems: crate::stems::SHIPPED.iter().map(|s| (*s).into()).collect(),
-            // Asked, for the same reason as the single-model path.
+            // The device is detected, as in the single-model path.
             device: stemd_mlx::Accelerator::detect().as_str().into(),
             parts: if self.bass.is_some() {
                 crate::stems::all_parts()
@@ -401,10 +388,10 @@ mod tests {
 
     /// The two indices name the sources they claim to.
     ///
-    /// [`Half::demucs`] uses one number for which checkpoint to load and which of its
-    /// four outputs to keep, because that is what a fine-tuned set is. Swapping them
-    /// would load the wrong specialist and take the wrong output, and nothing
-    /// downstream could see it: the shapes agree and the parts still sum to the mix.
+    /// [`Half::demucs`] uses one number both for the checkpoint to load and for which of its four
+    /// outputs to keep, since a fine-tuned set pairs them. Swapping the indices would load the
+    /// wrong specialist and keep the wrong output, and nothing downstream would notice: the shapes
+    /// agree and the parts still sum to the mix.
     #[test]
     fn the_specialists_are_the_sources_they_are_named_for() {
         assert_eq!(FOUR_STEM_SOURCES[DRUMS.unsigned_abs() as usize], "drums");

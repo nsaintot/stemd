@@ -4,10 +4,9 @@
 //! naming the key, so a model assembled from the wrong artefact says which tensor
 //! it wanted.
 //!
-//! No transposition happens here. The artefacts are converted for MLX, whose
-//! convolution weights are already `[out, kernel, in]`. Weights converted from
-//! PyTorch directly would need a transpose, which the per-layer shape assertions
-//! would catch.
+//! Nothing is transposed here. The artefacts are converted for MLX, whose convolution weights are
+//! already `[out, kernel, in]`. Weights taken from PyTorch directly would need a transpose, and the
+//! per-layer shape assertions would catch its absence.
 
 use std::collections::HashMap;
 
@@ -36,10 +35,9 @@ impl Weights {
 
     /// The same tensors at another precision.
     ///
-    /// Casting the weights is all it takes to move the network to half: mlx promotes,
-    /// so a half weight meeting a half activation stays half, and the shape checks
-    /// each layer makes are unaffected. Takes a [`Precision`] so callers need not name
-    /// mlx.
+    /// Casting the weights is enough to move the network to half precision: mlx promotes, so a half
+    /// weight meeting a half activation stays half, and the shape checks are unaffected. It takes a
+    /// [`Precision`] so callers need not name mlx.
     pub fn cast(&self, precision: Precision) -> Result<Self> {
         let dtype = precision.dtype();
         let tensors = self
@@ -50,11 +48,10 @@ impl Weights {
         Ok(Self { tensors })
     }
 
-    /// How many models the artefact holds.
+    /// The number of models the artefact holds.
     ///
-    /// `htdemucs` is one, `htdemucs_ft` is four fine-tuned checkpoints in a single file
-    /// under `model_0` to `model_3`. Nothing outside the tensor names says which is
-    /// which.
+    /// `htdemucs` holds one; `htdemucs_ft` holds four fine-tuned checkpoints in a single file,
+    /// under `model_0` to `model_3`. Only the tensor names tell them apart.
     pub fn models(&self) -> usize {
         (0..)
             .take_while(|n| {
@@ -90,9 +87,8 @@ pub struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    /// Borrows the weights, not the parent scope, so scopes can be chained:
-    /// `w.child("layers").child("0")` builds a path without keeping a temporary
-    /// alive to do it.
+    /// It borrows the weights directly, so scopes chain: `w.child("layers").child("0")` builds a
+    /// path without keeping a temporary alive.
     pub fn child(&self, name: &str) -> Scope<'a> {
         Scope {
             weights: self.weights,
@@ -106,9 +102,8 @@ impl<'a> Scope<'a> {
 
     /// A tensor, checked against the shape the layer expects.
     ///
-    /// The check earns its place on the convolutions: a weight in the wrong
-    /// layout has the right number of elements and the wrong meaning, and
-    /// without this the model would run and quietly separate nothing.
+    /// The check matters most for convolutions: a weight in the wrong layout has the right number
+    /// of elements and the wrong meaning, and the model would run and silently separate nothing.
     pub fn get_shaped(&self, name: &str, shape: &[i32]) -> Result<Array> {
         let array = self.get(name)?;
         if array.shape() != shape {

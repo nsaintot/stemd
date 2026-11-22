@@ -1,31 +1,27 @@
-//! Fetching the CUDA runtime, for a machine that has a card but not the libraries.
+//! Downloads the CUDA runtime, for a machine that has an NVIDIA GPU but not the libraries.
 //!
-//! The binary delay-loads its CUDA imports and decides at startup whether they can
-//! be resolved, so it runs anywhere and uses a GPU only where one is usable. This
-//! is the way across for a machine with a card running on its CPU: about 1.2 GB,
-//! once, from NVIDIA's own redistributable archives.
+//! The binary delay-loads its CUDA imports and decides at startup whether they can be resolved, so
+//! it runs anywhere and uses a GPU only where one is usable. A machine with a GPU that runs on its
+//! CPU gets the libraries here: about 1.2 GB, once, from NVIDIA's redistributable archives.
 //!
-//! Windows only. Elsewhere CUDA is linked the ordinary way and a missing library
-//! is a process that does not start.
+//! Windows only. On other platforms CUDA is linked the ordinary way, and a missing library stops
+//! the process from starting.
 //!
-//! Not automatic: `startup` says the runtime is missing and names the flag, and
-//! the flag is the whole of the consent.
+//! The download never starts on its own: `startup` reports that the runtime is missing and names
+//! the flag, and passing the flag is the user's consent.
 //!
-//! ## The versions here
+//! ## Versions
 //!
-//! Pinned to CUDA 13.3.1 and cuDNN 9.14.0, with digests taken from the manifests
-//! NVIDIA publishes them under:
+//! Pinned to CUDA 13.3.1 and cuDNN 9.14.0, with digests taken from NVIDIA's manifests:
 //!
 //! ```text
 //! developer.download.nvidia.com/compute/cuda/redist/redistrib_13.3.1.json
 //! developer.download.nvidia.com/compute/cudnn/redist/redistrib_9.14.0.json
 //! ```
 //!
-//! 13.3 because that is the toolkit `mlx-sys` builds against, so the DLL names
-//! here are the ones in the import table. They carry only a major version
-//! (`cublasLt64_13`, `cufft64_12`, `nvrtc64_130_0`, `cudnn64_9`), which is what
-//! makes a redist build usable against a binary linked elsewhere in the same major
-//! series.
+//! 13.3 is the toolkit `mlx-sys` builds against, so the DLL names here match the import table. The
+//! names carry only a major version (`cublasLt64_13`, `cufft64_12`, `nvrtc64_130_0`, `cudnn64_9`),
+//! so a redist build works with a binary linked against another release of the same major series.
 
 use std::path::{Path, PathBuf};
 
@@ -33,12 +29,12 @@ use anyhow::{Context, Result, bail};
 
 use crate::models::RemoteFile;
 
-/// What to fetch, and nothing else.
+/// The components to download.
 ///
-/// stemd does matmul, transforms and convolution; the archives for the rest of the
-/// toolkit hold nothing this binary can call, 2404 MB of which 1090 MB is
-/// reachable. `cuda_cudart` is here despite not being imported: it is 2.6 MB and
-/// several of the others load it themselves.
+/// stemd uses matmul, transforms and convolution, and the rest of the toolkit holds nothing this
+/// binary can call: the full archives total 2404 MB, of which these components are 1090 MB.
+/// `cuda_cudart` is listed although the binary does not import it, because it is 2.6 MB and several
+/// other components load it.
 pub const COMPONENTS: &[RemoteFile] = &[
     RemoteFile {
         name: "libcublas.zip",
@@ -87,14 +83,8 @@ pub const COMPONENTS: &[RemoteFile] = &[
     },
 ];
 
-/// Where the libraries have to end up: beside the executable.
-///
-/// The ordinary search order looks there first, which is where the probe looks and
-/// where the delay-load helper falls back to. MLX's own helper also knows a
-/// `../nvidia/<component>/bin` layout, which would work for MLX and not for the
-/// probe.
-/// Point MLX's run-time kernel compiler at the CUDA headers shipped beside
-/// the executable, so a machine without the toolkit can compile them.
+/// Point MLX's run-time kernel compiler at the CUDA headers shipped next to the executable, so a
+/// machine without the toolkit can compile kernels.
 pub fn point_at_bundled_headers() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -115,7 +105,8 @@ pub fn beside_the_executable() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// Fetch every component and put its libraries beside the executable.
+/// Fetch every component and put its libraries next to the executable. The ordinary DLL search
+/// order checks that directory first, and the probe and the delay-load helper look there.
 ///
 /// `on_progress` is called with `(component, bytes_done, bytes_total)`, the same
 /// shape the model download reports, so one progress bar serves both.
@@ -141,9 +132,8 @@ pub fn install(into: &Path, mut on_progress: impl FnMut(&str, u64, u64)) -> Resu
         let archive = staging.join(component.name);
         placed += unpack_libraries(&archive, into)
             .with_context(|| format!("unpacking {}", component.name))?;
-        // The archive is a third of a gigabyte and its contents are now where
-        // they are wanted. Keeping it would double the cost of the install for
-        // the sake of a re-run that a re-download does just as well.
+        // Delete the archive, a third of a gigabyte, now that its libraries are in place; a re-run
+        // downloads it again.
         std::fs::remove_file(&archive).ok();
     }
     std::fs::remove_dir(&staging).ok();
@@ -153,10 +143,9 @@ pub fn install(into: &Path, mut on_progress: impl FnMut(&str, u64, u64)) -> Resu
 }
 
 /// Copy every DLL out of a redistributable archive, flattening the paths.
-///
-/// NVIDIA lays these out as `<component>-archive/bin/<name>.dll`. Only the DLLs
-/// are wanted, and only in one directory, since a nested one would be outside the
-/// search order. Matched on the extension: nothing else here ends in `.dll`.
+// NVIDIA lays them out as `<component>-archive/bin/<name>.dll`. All DLLs go into one directory,
+// since a nested directory would be outside the search order. Entries are matched by the `.dll`
+// extension, which no other file in these archives has.
 fn unpack_libraries(archive: &Path, into: &Path) -> Result<usize> {
     let file =
         std::fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
@@ -187,8 +176,8 @@ fn unpack_libraries(archive: &Path, into: &Path) -> Result<usize> {
         std::io::copy(&mut entry, &mut out)
             .with_context(|| format!("writing {}", partial.display()))?;
         drop(out);
-        // Renamed into place only once whole, so an interrupted install cannot
-        // leave a truncated library for the probe to load successfully.
+        // Rename into place only once the file is whole, so an interrupted install cannot leave a
+        // truncated library that the probe loads.
         std::fs::rename(&partial, into.join(name)).with_context(|| format!("publishing {name}"))?;
         tracing::debug!("installed {name}");
         placed += 1;
@@ -211,11 +200,10 @@ fn wanted(name: &str) -> bool {
     name.ends_with(".dll") && !UNUSED.contains(&name.as_str())
 }
 
-/// Fail on a read-only install directory before spending a gigabyte finding out.
+/// Fail on a read-only install directory before downloading a gigabyte.
 ///
-/// Under `Program Files` this is the ordinary case rather than a strange one,
-/// and the useful thing to say is which directory and that it needs elevation,
-/// not a permission error a gigabyte later with a component name attached.
+/// Under `Program Files` this is the normal case, so the error names the directory and says it
+/// needs elevation.
 fn writable(dir: &Path) -> Result<()> {
     let probe = dir.join(".stemd-write-probe");
     match std::fs::write(&probe, b"") {
@@ -236,15 +224,14 @@ fn writable(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The two hosts a component may come from. Here rather than beside
-    /// [`COMPONENTS`] because the URLs are written out in full: `concat!` takes
-    /// literals, not constants, and a prefix that only the assertion below uses
-    /// is dead code in every real build.
+    /// The two hosts a component may come from. They are defined here because the URLs in
+    /// [`COMPONENTS`] are written out in full: `concat!` takes only literals, and a prefix used
+    /// only by the assertion below would be dead code in every real build.
     const CUDA: &str = "https://developer.download.nvidia.com/compute/cuda/redist/";
     const CUDNN: &str = "https://developer.download.nvidia.com/compute/cudnn/redist/";
 
-    /// Every pinned digest is a sha256 and every URL is NVIDIA's own. A typo in
-    /// either is a download that fails late, after the bytes have been paid for.
+    /// Every pinned digest is a SHA-256 and every URL is NVIDIA's own; a typo in either would fail
+    /// only after the download.
     #[test]
     fn the_pinned_components_are_well_formed() {
         assert!(!COMPONENTS.is_empty());
@@ -271,8 +258,8 @@ mod tests {
         }
     }
 
-    /// The four libraries the binary delay-imports have to be covered by
-    /// something here, or the install completes and changes nothing.
+    /// The components cover the four libraries the binary delay-imports; otherwise the install
+    /// would complete and change nothing.
     #[test]
     fn every_delay_imported_library_has_a_component() {
         for (library, component) in [

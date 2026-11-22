@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 const SERVICE_TYPE: &str = "_stemd._tcp.local.";
 
-/// How long to block on each receive before re-checking the deadline.
+/// How long each receive blocks before the deadline is checked again.
 const TICK: Duration = Duration::from_millis(250);
 
 /// Browse for a server, returning the first one that resolves to an IPv4

@@ -16,10 +16,9 @@ use super::{Claimed, Inner, Next, QueuedWork, Staged, store};
 
 /// Take work until asked to stop.
 ///
-/// Nothing a separator does may end this loop. Both callees are caught, so a track
-/// that panics fails that track and a build that panics leaves the model already
-/// loaded in place. Whether the separator is still sound cannot be known from
-/// here, so it is reported at `error`.
+/// A separator cannot end this loop: panics in both callees are caught, so a track that panics
+/// fails only that track, and a build that panics leaves the loaded model in place. The separator
+/// may be unsound after a panic, so the panic is logged at `error`.
 pub(super) fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>) {
     // Each open track's partial output, on the device, by track uid. Held here
     // because MLX arrays belong to the thread that made them.
@@ -27,10 +26,8 @@ pub(super) fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>) 
     while let Some(next) = inner.next() {
         match next {
             Next::Install(staged) => {
-                // The reply is destructured out and kept clear of the caught
-                // closure, so a panicking build can still be answered on it.
-                // Letting it drop instead would tell `install` the worker had
-                // died, which is exactly the thing that is no longer true.
+                // Destructure the reply out of the caught closure, so a panicking build can still
+                // be answered on it. Dropping the reply would tell `install` that the worker died.
                 let Staged { build, reply } = staged;
                 match catch_unwind(AssertUnwindSafe(|| inner.build_here(build, &reply))) {
                     Ok(Some(built)) => {
@@ -71,8 +68,7 @@ pub(super) fn worker_loop(inner: &Arc<Inner>, mut separator: Box<dyn Separate>) 
                 if let Err(payload) = separating {
                     let what = crate::panics::message(&*payload);
                     tracing::error!(job = %claimed.work.job.id, "the separation panicked: {what}");
-                    // Terminal, so a client polling this job stops waiting for
-                    // something that is never going to arrive.
+                    // Mark the job failed, so a client polling it stops waiting.
                     claimed
                         .work
                         .job
@@ -154,9 +150,8 @@ fn run_segment(
     passes.remove(&track.uid);
 }
 
-/// Hand back MLX's allocator cache after a job if keeping it is a risk: when
-/// memory or disk is short, or it holds over half the machine's memory. Kept
-/// otherwise, so the next track in a queue starts warm.
+/// Release MLX's allocator cache after a job when memory or disk is short, or when the cache holds
+/// over half the machine's memory. Otherwise keep it, so the next track in the queue starts warm.
 fn trim_after_job(cache: &Cache) {
     let held = stemd_core::memory::cached();
     let ceiling = crate::disk::physical_memory().map_or(8 << 30, |ram| ram / 2);
@@ -206,8 +201,8 @@ impl stemd_core::ProgressSink for JobSink {
     }
 
     fn cancelled(&self) -> bool {
-        // Relaxed is enough: the flag orders no other data, and a segment of
-        // slack either way is invisible against the segment it guards.
+        // Relaxed is enough: the flag orders no other data, and noticing it one segment late is
+        // harmless.
         self.cancel.load(Ordering::Relaxed)
     }
 }
@@ -226,8 +221,8 @@ fn separate_one(
         cancel: Arc::clone(&claimed.cancel),
     };
 
-    // Segment by segment where the separator can, so high-priority session work
-    // waits at most one segment.
+    // Run segment by segment where the separator can, so high-priority session work waits at most
+    // one segment.
     let segmenting = separator.segmenting();
     let separated = if segmenting.is_some() {
         whole_track(separator, &work.mix, work.output.parts, &sink, |sep| {
@@ -252,9 +247,8 @@ fn separate_one(
                 started.elapsed().as_secs_f64(),
             );
         }
-        // Routine, not a failure: the client said so. Logged at info with what
-        // it cost, so a client skipping repeatedly is visible in the log without
-        // looking like the model is breaking.
+        // The client cancelled the job. Logged at info with its cost, so repeated cancels show in
+        // the log.
         Err(err) if Cancelled::caused(&err) => {
             tracing::info!(
                 job = %job.id,
@@ -277,8 +271,8 @@ pub(super) fn publish(
     elapsed: f64,
 ) {
     job.set_progress(Progress::new(Stage::Writing));
-    //  Timed and reported separately: `elapsed` stops before this runs, and
-    //  `separation_secs` is the model's cost by definition.
+    // Timed separately, because `elapsed` stops before this runs and `separation_secs` reports only
+    // the model's cost.
     let writing = std::time::Instant::now();
     let separation = Separation {
         model_residual_db: stems.model_residual_db,

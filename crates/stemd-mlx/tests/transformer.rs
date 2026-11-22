@@ -1,9 +1,8 @@
 //! Null the cross-domain transformer against the reference.
 //!
-//! The position embeddings are checked on their own first. They are pure
-//! functions of the shape, so a mistake in one: the sine/cosine interleaving
-//! is the likely candidate: shows up here as a clear failure rather than as a
-//! transformer that is inexplicably twenty decibels off.
+//! The position embeddings are checked on their own first. They are pure functions of the shape, so
+//! a mistake in one, most likely in the sine and cosine interleaving, shows up here as a clear
+//! failure. Inside the transformer it would only leave the output twenty decibels off.
 
 mod common;
 

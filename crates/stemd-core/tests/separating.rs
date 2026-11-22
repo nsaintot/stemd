@@ -1,7 +1,6 @@
 //! The backend on a real track, at both precisions.
 //!
-//! Ignored by default: it needs the weights and a track to run on, neither of
-//! which belongs in a repository.
+//! Ignored by default: it needs the weights and a track, and neither belongs in a repository.
 //!
 //! ```text
 //! STEMD_AB_PCM=track.pcm STEMD_AB_MLX=/path/holding/htdemucs.safetensors \
@@ -46,8 +45,8 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
         return;
     };
 
-    // Which artefact, so a locally converted single-model one can go through
-    // the same harness rather than being measured by multiplying and hoping.
+    // The artefact to test, so a locally converted single-model artefact can go through the same
+    // harness.
     let artefact = std::env::var("STEMD_AB_MODEL").unwrap_or_else(|_| "htdemucs".into());
 
     let mix = read_pcm(&pcm);
@@ -68,8 +67,7 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
         )
         .expect("loading the MLX artefact");
 
-        //  Every distinct fraction a polling client would have seen, watched on the run
-        //  that is happening anyway rather than in a separation of its own.
+        // Record every distinct fraction a polling client would see, on the run already happening.
         let seen = std::sync::Mutex::new(Vec::<f32>::new());
         let watch = |p: stemd_core::Progress| {
             let mut seen = seen.lock().expect("not poisoned");
@@ -115,10 +113,9 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
     let null = 10.0 * (error / signal).log10();
     println!("f16 against f32: {null:.1} dB");
 
-    // htdemucs measured -33.9 dB against TorchScript and against this, at both
-    // precisions. A drift of several dB would mean the weights or the
-    // arithmetic around them moved, not that the track is different: this is
-    // the model's own error, which is a property of the model.
+    // htdemucs's own residual measures -33.9 dB in TorchScript and in this runtime, at both
+    // precisions. A drift of several dB would mean that the weights or the arithmetic around them
+    // changed, since the model's own error depends on the model alone.
     if artefact == "htdemucs" {
         assert!(
             stems.model_residual_db < -25.0,
@@ -127,9 +124,8 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
         );
     }
 
-    // Half precision has to stay well under the model's own error, or it is not
-    // a precision change, it is a different model. Measured at -53.9 dB on the
-    // stems that ship, which is where the TorchScript swap landed too.
+    // Half precision must stay well under the model's own error; otherwise it would amount to a
+    // different model. It measures -53.9 dB on the shipped stems.
     assert!(
         null < stems.model_residual_db - 5.0,
         "half precision differs by {null:.1} dB, too close to the model's own \
@@ -137,10 +133,9 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
         stems.model_residual_db
     );
 
-    // 13.9x realtime measured in full precision, with plenty of margin here:
-    // this is a floor against a regression like the frame-by-frame inverse
-    // transform that once cost forty per cent of the forward pass, not a
-    // benchmark to defend.
+    // Full precision measures 13.9x realtime, so this floor leaves plenty of margin. It catches a
+    // regression such as a frame-by-frame inverse transform, which costs forty per cent of the
+    // forward pass.
     let floor = if artefact == "htdemucs" { 4.0 } else { 1.0 };
     assert!(
         realtime > floor,
@@ -148,9 +143,8 @@ fn a_real_track_separates_at_the_measured_quality_and_speed() {
     );
 }
 
-/// The hybrid: BS-RoFormer for vocals, htdemucs_ft's drums specialist for the
-/// rest, on a real track. This measures what it costs, not how good it is: see
-/// docs/evaluation.md for the latter.
+/// The hybrid, BS-RoFormer for vocals and htdemucs_ft's drums specialist for the rest, on a real
+/// track. This measures its cost; docs/evaluation.md covers its quality.
 ///
 /// ```text
 /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
@@ -193,8 +187,8 @@ fn the_hybrid_separates_a_real_track() {
     .expect("loading both halves");
     println!("precision: {precision}");
 
-    // Every distinct fraction the bar would have shown, so "it sat at 10% and
-    // jumped" is a thing this test can see.
+    // Record every distinct fraction the bar would show, so the test can see the bar stall at 10%
+    // and jump.
     let seen = std::sync::Mutex::new(Vec::<f32>::new());
     let watch = |p: stemd_core::Progress| {
         let mut seen = seen.lock().expect("not poisoned");
@@ -226,10 +220,9 @@ fn the_hybrid_separates_a_real_track() {
         seen.len()
     );
 
-    // The parts are built to sum, so the residual is float noise rather than a
-    // measurement. Asserting it is tiny is asserting the arithmetic, which is
-    // still worth doing: a sign error in the remainder would show up here and
-    // nowhere else until someone listened.
+    // The parts are built to sum, so the residual is float noise and measures nothing. Asserting
+    // that it is tiny still checks the arithmetic: a sign error in the remainder would show up here
+    // first.
     println!("sum residual: {:.1} dB", stems.model_residual_db);
     assert!(
         stems.model_residual_db < -100.0,
@@ -237,11 +230,9 @@ fn the_hybrid_separates_a_real_track() {
         stems.model_residual_db
     );
 
-    // Peaks are reported and only the weakest claim is asserted: that
-    // *something* came back. A silent stem is not a bug -- an instrumental
-    // track has no vocals, and the reference agrees to within 7e-6 on the one
-    // this is usually run against, which cost an hour of looking for a fault
-    // that was not there.
+    // Peaks are reported, and only the weakest claim is asserted: that some audio came back. A
+    // silent stem is not a bug: an instrumental track has no vocals, and the reference agrees to
+    // within 7e-6 on the track this usually runs against.
     let mut loudest = 0.0f32;
     for (name, audio) in &stems.shipped {
         assert_eq!(audio.frames(), mix.frames(), "{name} is the wrong length");
@@ -256,12 +247,12 @@ fn the_hybrid_separates_a_real_track() {
     assert!(loudest > 1e-3, "every shipped stem came back silent");
 }
 
-/// What half precision costs BS-RoFormer, which is not what it costs htdemucs.
+/// What half precision costs BS-RoFormer, which differs from what it costs htdemucs.
 ///
-/// Every RoFormer null test runs at float32 and the hybrid ships float16. This
-/// model is 24 attention layers deep against htdemucs's 5, and half-precision
-/// error accumulates with depth, so the same track goes through the same
-/// arrangement at both precisions with the vocals nulled against each other.
+/// Every RoFormer null test runs at float32, and the hybrid ships float16. This model has 24
+/// attention layers against htdemucs's 5, and half-precision error accumulates with depth, so the
+/// same track goes through the same arrangement at both precisions and the vocals are nulled
+/// against each other.
 ///
 /// ```text
 /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
@@ -320,9 +311,8 @@ fn what_half_precision_costs_the_roformer() {
         let null = 10.0 * (error / signal).log10();
         println!("  {name:<10} f16 against f32: {null:.1} dB");
 
-        // The tier exists for a 1.86 dB gain on vocals over Balanced. Half
-        // precision has to sit well under that or it is spending the gain to
-        // buy back the time, which would make the whole tier pointless.
+        // The tier exists for a 1.86 dB vocals gain over Balanced. Half precision must cost well
+        // under that, or Quality would lose the vocals gain it exists for.
         if *name == "vocals" {
             assert!(
                 null < -30.0,
@@ -333,24 +323,17 @@ fn what_half_precision_costs_the_roformer() {
     }
 }
 
-/// Chaining the halves: does handing the drums model the instrumental beat
-/// handing it the mixture?
-///
-/// What chaining can move is narrow. Vocals are the identical forward pass in
-/// both pipelines, and harmonics is `mix - vocals - drums` either way, so the
-/// only thing that changes is the drums estimate, and therefore where the line
-/// between drums and harmonics falls.
-///
-/// There is no ground truth on a real track, so this measures the artefact rather
-/// than the score: how much of the vocals stem sits inside the drums stem, as a
-/// least-squares projection. Whatever bleeds into drums appears inverted in
-/// harmonics, which is the same subtraction.
-///
-/// ```text
-/// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
-/// cargo test --release -p stemd-core --test separating -- --ignored \
-///     chaining --nocapture
-/// ```
+/// Whether feeding the drums model the instrumental, in place of the mix, reduces the vocals that
+/// bleed into the drums. A real track has no ground truth, so this measures how much of the vocals
+/// stem sits inside the drums stem, as a least-squares projection.
+// Chaining changes little. The vocals come from the identical forward pass in both pipelines, and
+// harmonics is `mix - vocals - drums` either way, so only the drums estimate changes, and with it
+// the line between drums and harmonics. Whatever bleeds into drums appears inverted in harmonics,
+// by the same subtraction.
+//
+//     STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
+//     cargo test --release -p stemd-core --test separating -- --ignored \
+//         chaining --nocapture
 #[cfg(feature = "research")]
 #[test]
 #[ignore]
@@ -361,11 +344,10 @@ fn chaining_the_halves_against_running_them_side_by_side() {
 
     let mix = read_pcm(&pcm);
 
-    // Both tiers are two halves and both can chain, but they are not the same
-    // question. Quality's vocals half is the better model, so what it hands on
-    // is a cleaner instrumental than demucs would make; Balanced's vocals half
-    // is demucs's own specialist, and chaining there feeds one demucs model's
-    // mistakes to another. `STEMD_AB_VOCALS=htdemucs_ft` asks the second.
+    // Both tiers have two halves and both can chain, but the question differs. Quality's vocals
+    // half is the better model, so it passes on a cleaner instrumental than demucs would;
+    // Balanced's vocals half is demucs's own specialist, and chaining there passes one demucs
+    // model's mistakes to another. `STEMD_AB_VOCALS=htdemucs_ft` selects the second case.
     let vocals_from = std::env::var("STEMD_AB_VOCALS").unwrap_or_else(|_| "roformer".into());
     println!("vocals half: {vocals_from}");
 
@@ -395,8 +377,8 @@ fn chaining_the_halves_against_running_them_side_by_side() {
             .map(|(_, audio)| audio.clone())
             .unwrap_or_else(|| panic!("no {want} stem"))
     };
-    // Drums is not shipped -- the player rebuilds it -- so rebuild it the same
-    // way the player does, which is also the only way to see it from here.
+    // Drums is not shipped, since the player rebuilds it, so rebuild it the way the player does;
+    // that is also the only way to see it here.
     let derived_drums = |stems: &stemd_core::Stems| {
         let (h, v) = (stem(stems, "harmonics"), stem(stems, "vocals"));
         Audio::new(
@@ -411,8 +393,8 @@ fn chaining_the_halves_against_running_them_side_by_side() {
         )
     };
 
-    // Vocals first, because if these differ at all the rest of the comparison
-    // is measuring something other than what it claims to.
+    // Compare vocals first: if they differ, the drums comparison below no longer isolates the
+    // effect of chaining.
     let (a, b) = (stem(&side_by_side, "vocals"), stem(&chained, "vocals"));
     let (mut error, mut signal) = (0.0f64, 0.0f64);
     for (ca, cb) in a.data.iter().zip(&b.data) {
@@ -431,9 +413,9 @@ fn chaining_the_halves_against_running_them_side_by_side() {
          forward pass over the same audio"
     );
 
-    // How much of the vocal is inside the drums, as the scalar multiple of the
-    // vocals stem that best explains it. Reported against the drums' own
-    // energy, so it is "the drums stem is N dB of vocal".
+    // How much of the vocal is inside the drums, as the scalar multiple of the vocals stem that
+    // best explains it, relative to the drums' own energy, so it reads as "the drums stem is N dB
+    // of vocal".
     let bleed = |drums: &Audio, vocals: &Audio| {
         let (mut dot, mut vv, mut dd) = (0.0f64, 0.0f64, 0.0f64);
         for (cd, cv) in drums.data.iter().zip(&vocals.data) {
@@ -453,8 +435,8 @@ fn chaining_the_halves_against_running_them_side_by_side() {
         println!("  {label:<13} vocal in drums: alpha {alpha:+.4}  ({db:.1} dB of the drums)");
     }
 
-    // And whether it moved the drums at all. If the two drums estimates null
-    // deeply, the whole idea is moot regardless of which is better.
+    // Also check whether chaining moved the drums at all. If the two drums estimates null deeply,
+    // chaining makes no measurable difference.
     let (a, b) = (derived_drums(&side_by_side), derived_drums(&chained));
     let (mut error, mut signal) = (0.0f64, 0.0f64);
     for (ca, cb) in a.data.iter().zip(&b.data) {
@@ -472,10 +454,10 @@ fn chaining_the_halves_against_running_them_side_by_side() {
 /// BS PolarFormer against the viperx BS-RoFormer as the Quality tier's vocals
 /// half, on a real track.
 ///
-/// MUSDB scores the two the same and torch times PolarFormer faster, and neither
-/// of those is this: MUSDB is pop and rock, and torch is not the runtime that
-/// ships. Transient-heavy material is the case worth choosing, because that is
-/// where a vocals model that is slightly wrong puts ticks on the vocals fader.
+/// MUSDB scores the two the same, and torch times PolarFormer faster, but neither settles which
+/// model Quality should use: MUSDB is pop and rock, and torch is not the runtime that ships.
+/// Transient-heavy material decides the choice, because that is where a slightly wrong vocals model
+/// puts ticks on the vocals fader.
 ///
 /// ```text
 /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both roformers and htdemucs_ft> \
@@ -519,9 +501,9 @@ fn polarformer_against_the_viperx_roformer() {
             .map(|(_, a)| a.clone())
             .expect("a shipped stem")
     };
-    // Shared content, as squared cosine similarity -- symmetric, see
-    // `what_each_preset_leaves_in_the_vocals`. Against the drums a player
-    // rebuilds, so this is the tick residue as it is actually met.
+    // Shared content as squared cosine similarity, which is symmetric; see
+    // `what_each_preset_leaves_in_the_vocals`. It is measured against the drums a player rebuilds,
+    // so it shows the tick residue as a player hears it.
     let shared = |a: &Audio, b: &Audio| {
         let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
         for (ca, cb) in a.data.iter().zip(&b.data) {
@@ -569,10 +551,9 @@ fn polarformer_against_the_viperx_roformer() {
     let (agreement, _) = shared(&vocals[0], &vocals[1]);
     println!("  the two vocals share {agreement:.1} dB of content");
 
-    //  What each model left behind. There is no ground-truth vocal on a real track,
-    //  but each model's vocals stem is a template for what the other one missed: how
-    //  much of each model's vocals shows up in the other's harmonics. The
-    //  vocals-against-drums figure above asks a different question.
+    // What each model left behind. A real track has no ground-truth vocal, but each model's vocals
+    // stem is a template for what the other missed: how much of each model's vocals shows up in the
+    // other's harmonics. The vocals-against-drums figure above answers a different question.
     println!();
     for (label, stems, probe) in [
         ("viperx", &viperx, &vocals[1]),
@@ -582,10 +563,8 @@ fn polarformer_against_the_viperx_roformer() {
         println!("  {label:<12} harmonics holds {leak:.1} dB of the other's vocals");
     }
 
-    // Two vocals models cannot agree perfectly, and if they did it would mean
-    // one of them was not running. The useful bound is the other way: they are
-    // both meant to be separating the same thing, so a *low* agreement would
-    // say one of them is wrong rather than merely different.
+    // Two different vocals models never agree perfectly. The useful bound is the lower one: both
+    // separate the same thing, so low agreement means one of them is wrong.
     assert!(
         agreement > -6.0,
         "the two vocals models agree on only {agreement:.1} dB of content, \
@@ -593,20 +572,15 @@ fn polarformer_against_the_viperx_roformer() {
     );
 }
 
-/// Quality's vocals must actually be BS-RoFormer's, not Balanced's under a
-/// different name.
-///
-/// Everything upstream of the audio agrees that they are, and none of it would
-/// notice if the two tiers returned the same thing: a wrong vocals stem has the
-/// right length, sums with the others to the mix, and sounds like vocals. So this
-/// asks the audio, nulling the two vocals stems against each other. Two different
-/// architectures are wrong differently and cannot agree closely.
-///
-/// ```text
-/// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
-/// cargo test --release -p stemd-core --test separating -- --ignored \
-///     the_quality_tier --nocapture
-/// ```
+/// Quality's vocals come from BS-RoFormer and differ from Balanced's. Two architectures make
+/// different errors, so their vocals stems must not null.
+// A wrong vocals stem has the right length, sums with the others to the mix and sounds like vocals,
+// so nothing upstream of the audio would notice if the two tiers returned the same stems. This
+// nulls the two vocals stems against each other.
+//
+//     STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with both artefacts> \
+//     cargo test --release -p stemd-core --test separating -- --ignored \
+//         the_quality_tier --nocapture
 #[cfg(feature = "research")]
 #[test]
 #[ignore]
@@ -671,10 +645,9 @@ fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
         );
 
         if *name == "vocals" {
-            //  Only if both came back silent is there nothing to tell apart. One silent and
-            //  the other not is the loudest possible answer, and it is what an instrumental
-            //  gives. The null goes positive there: the difference has more energy than the
-            //  stem it is measured against, which the comparison below reads correctly.
+            // On an instrumental, one tier may return silence and the other not, the largest
+            // possible difference; the null then goes positive, and the comparison below reads that
+            // correctly. Only if both came back silent is there nothing to tell apart.
             assert!(
                 peak.max(other_peak) > 1e-2,
                 "neither tier returned any vocals ({peak:.4} and {other_peak:.4} peak), \
@@ -688,10 +661,10 @@ fn the_quality_tier_does_not_quietly_ship_balanced_vocals() {
         }
     }
 
-    //  What the player actually holds. `drums` is not shipped, so measuring it means
-    //  doing what the client does. Both tiers take drums from the same htdemucs_ft
-    //  specialist and ship harmonics as the remainder, so this comes back identical:
-    //  the vocals estimate appears once in `vocals` and once negated in `harmonics`.
+    // Measure what the player holds. `drums` is not shipped, so measuring it means doing what the
+    // client does. Both tiers take drums from the same htdemucs_ft specialist and ship harmonics as
+    // the remainder, so this comes back identical: the vocals estimate appears once in `vocals` and
+    // once negated in `harmonics`.
     let rebuild = |stems: &stemd_core::Stems| -> Vec<Vec<f32>> {
         let of = |name: &str| {
             stems

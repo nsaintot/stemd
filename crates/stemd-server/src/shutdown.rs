@@ -1,18 +1,17 @@
-//! The one way this process ends.
+//! Ends the process.
 //!
-//! Every exit, Cmd-Q, closing the window, SIGINT, SIGTERM, goes through [`now`].
-//! Two things have to happen in order, and neither is the default.
+//! Every exit goes through [`now`]: Cmd-Q, closing the window, SIGINT and SIGTERM. It does two
+//! things in order.
 //!
-//! First the separation worker has to be out of the model. A statically linked C++
-//! runtime holding a GPU device and an allocator in globals runs their destructors
-//! on the way out, and doing that while a forward pass is still allocating aborts
-//! the process from a destructor, where nothing catches it.
+//! First, it stops the separation worker. MLX is a statically linked C++ runtime that holds a GPU
+//! device and an allocator in globals; their destructors run at exit, and running them while a
+//! forward pass is still allocating aborts the process from a destructor, where nothing can catch
+//! it.
 //!
-//! Then the process leaves without running that teardown at all. Nothing here
-//! needs it: stems and the settings file are both installed by rename, so what is
-//! on disk is already complete, and the only thing that has to be told is the
-//! network, which [`now`] does itself. Those destructors free memory the kernel
-//! is about to reclaim anyway. With `--ephemeral` it also empties the cache.
+//! Then it exits without running those destructors. Stems and the settings file are installed by
+//! rename, so the files on disk are already complete; the network is the only party to notify, and
+//! [`now`] withdraws the advertisement itself. The destructors only free memory that the kernel
+//! reclaims anyway. With `--ephemeral`, [`now`] also empties the cache.
 
 use std::io::Write;
 
@@ -21,16 +20,15 @@ use crate::queue::STOP_GRACE;
 use crate::state::AppState;
 
 unsafe extern "C" {
-    /// `_exit(2)`: end the process immediately, without atexit handlers or C++
-    /// static destructors. [`std::process::exit`] runs both, which is the whole
-    /// problem this module exists to avoid.
+    /// `_exit(2)`: end the process at once, without atexit handlers or C++ static destructors.
+    /// [`std::process::exit`] runs both, which this module must avoid.
     safe fn _exit(status: i32) -> !;
 }
 
 /// End the process, whether or not startup has finished.
 ///
-/// Before it has, there is no worker or advertisement to stop yet. A download in
-/// flight leaves only its `.part` file, which the next run replaces.
+/// During startup there is no worker or advertisement to stop. A download in progress leaves only
+/// its `.part` file, which the next run replaces.
 pub fn quit(launch: &Launch, reason: &str) -> ! {
     match launch.ready() {
         Some(state) => now(state, reason),
@@ -45,20 +43,19 @@ pub fn quit(launch: &Launch, reason: &str) -> ! {
 
 /// Stop the worker, withdraw the advertisement, and end the process.
 ///
-/// Never returns, and is safe to reach from any thread.
+/// It never returns and is safe to call from any thread.
 pub fn now(state: &AppState, reason: &str) -> ! {
     tracing::info!("{reason}, shutting down");
     let began = std::time::Instant::now();
 
-    // Before anything else: nothing below is safe while the model is running.
+    // Stop the worker first: nothing below is safe while the model runs.
     if !state.queue.stop(STOP_GRACE) {
         tracing::warn!("quitting with the worker still in the model");
     }
     let worker_stopped = began.elapsed();
 
-    // A withdrawal a client can act on, rather than one it waits out. Costs a
-    // few milliseconds and saves every client on the network a TTL of chasing a
-    // server that is gone.
+    // Withdraw the advertisement so clients learn at once that the server is gone; this costs a few
+    // milliseconds and spares every client a TTL of retries.
     state.serving.withdraw();
     let withdrawn = began.elapsed();
 
@@ -66,29 +63,23 @@ pub fn now(state: &AppState, reason: &str) -> ! {
         state.cache.wipe();
     }
 
-    // Quitting is meant to look instant. It is the last thing anyone sees the
-    // program do, and a window that vanishes while the process lingers reads as
-    // a crash. Both steps have timeouts measured in seconds, so when one of them
-    // is actually used the difference is visible and the log should say which,
-    // rather than leaving someone to guess between the model and the network.
+    // Quitting should look instant; a window that vanishes while the process lingers looks like a
+    // crash. Both steps have timeouts measured in seconds, so when one of them is slow, the log
+    // says which one.
     report(worker_stopped, withdrawn - worker_stopped);
 
-    // `_exit` flushes nothing, and a piped stdout is block-buffered, so the last
-    // lines of the log would otherwise be lost: including the two above.
+    // `_exit` flushes nothing and a piped stdout is block-buffered, so flush here, or the last log
+    // lines, including the two above, are lost.
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
     _exit(0)
 }
 
-/// Below this nobody perceives a delay, so nothing is said about it.
+/// Quits faster than this are not logged, since nobody notices the delay.
 const NOTICEABLE: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Anything a person would notice, and nothing they would not.
-///
-/// A quit that takes a few milliseconds is not worth a line; one that takes
-/// seconds is the difference between a program that closes and a program that
-/// hangs, and the only useful thing to say about it is which half was slow.
+/// Log a quit slow enough for a person to notice, and which of the two steps was slow.
 fn report(worker: std::time::Duration, advertisement: std::time::Duration) {
     let total = worker + advertisement;
     if total < NOTICEABLE {
@@ -106,17 +97,15 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// The threshold measures human patience, not machinery. If it ever drifts
-    /// up to the size of the timeouts it is meant to catch, it stops catching
-    /// them: a three second withdrawal has to be above it, by a lot.
+    /// The threshold stays far below the timeouts it is meant to catch: a three-second withdrawal
+    /// must be well above it.
     #[test]
     fn the_threshold_stays_smaller_than_what_it_is_watching_for() {
         assert!(NOTICEABLE < Duration::from_secs(1));
         assert!(NOTICEABLE * 4 < crate::queue::STOP_GRACE);
     }
 
-    /// `report` is about what gets said, and both branches have to be reachable
-    /// without a real shutdown behind them.
+    /// Both branches of `report` are reachable without a real shutdown.
     #[test]
     fn reporting_either_way_does_not_panic() {
         report(Duration::from_millis(1), Duration::from_millis(2));

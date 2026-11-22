@@ -1,9 +1,8 @@
-//! Checking what is on disk against the pinned digests.
+//! Checks the artefacts on disk against the pinned digests.
 //!
-//! A truncated or replaced artefact is otherwise discovered at load, as a failure
-//! naming a tensor whose shape disagreed, which says nothing about the file being
-//! wrong. Hashing the larger artefact costs about a second, against a process that
-//! then spends most of a minute on one track.
+//! Without this check, a truncated or replaced artefact shows up at load as a tensor shape
+//! mismatch, which does not say that the file is wrong. Hashing the largest artefact takes about a
+//! second, against most of a minute for one track.
 
 use std::io::{BufReader, Write};
 use std::path::Path;
@@ -13,10 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::{READ_CHUNK, download, preset::Preset};
 
-/// A writer that hashes everything on its way to `inner`.
-///
-/// Lets the download be verified as it is written, rather than by reading the
-/// file back afterwards.
+/// A writer that hashes everything it passes to `inner`, so a download is verified as it is
+/// written.
 pub(super) struct Hashing<W> {
     inner: W,
     hasher: Sha256,
@@ -73,7 +70,7 @@ pub fn mismatched(dir: &Path, preset: Preset) -> Vec<&'static str> {
             let path = dir.join(f.name);
             match digest_of(&path) {
                 Ok(actual) => actual != f.sha256,
-                // Unreadable counts as wrong: either way it cannot be loaded.
+                // An unreadable file counts as wrong, since it cannot be loaded either.
                 Err(err) => {
                     tracing::warn!("could not hash {}: {err:#}", path.display());
                     true
@@ -86,10 +83,9 @@ pub fn mismatched(dir: &Path, preset: Preset) -> Vec<&'static str> {
 
 /// Check `dir` against the pinned digests, repairing the cache if it can.
 ///
-/// A file we downloaded ourselves that no longer hashes correctly is corrupt,
-/// so it is deleted and refetched. Outside the cache the mismatch is only
-/// reported: a developer's own re-trace legitimately differs from the published
-/// artefact, and failing on that would make local work impossible.
+/// A downloaded file in the cache that no longer matches its digest is corrupt, so it is deleted
+/// and downloaded again. Outside the cache a mismatch is only reported, because a locally converted
+/// artefact is expected to differ from the published one.
 pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result<()> {
     let bad = mismatched(dir, preset);
     if bad.is_empty() {
@@ -98,8 +94,7 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
     let what = describe(dir, &bad);
 
     if dir != cache {
-        // Not a warning: outside the cache a mismatch is the expected state,
-        // and a warning about the normal case is one nobody reads.
+        // Logged at info: outside the cache a mismatch is expected.
         tracing::info!(
             "in {}, {what} — using it anyway, since a local trace is expected \
              to differ from the published artefact",
@@ -108,10 +103,10 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
         return Ok(());
     }
 
-    // Refuse before touching anything: with no way to replace the file,
-    // deleting it only destroys what someone might want to look at.
+    // Refuse before changing anything: with no way to replace the file, deleting it would only
+    // destroy what someone may want to inspect.
     if offline {
-        bail!("in the model cache, {what} — and --offline forbids refetching");
+        bail!("in the model cache, {what}; --offline set");
     }
 
     tracing::warn!("in the model cache, {what}; refetching");
@@ -131,8 +126,8 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
     Ok(())
 }
 
-/// Absent and corrupt both need replacing, but they send you looking in very
-/// different places, so say which.
+/// Describe which files are missing and which are corrupt; both need replacing, but the causes
+/// differ.
 fn describe(dir: &Path, bad: &[&'static str]) -> String {
     let (absent, corrupt): (Vec<&str>, Vec<&str>) =
         bad.iter().copied().partition(|n| !dir.join(n).exists());
@@ -173,16 +168,16 @@ mod tests {
         for f in Preset::Balanced.source().files {
             std::fs::write(dir.join(f.name), b"not the model").unwrap();
         }
-        // is_complete only looks at filenames, so it is happy.
+        // `is_complete` only checks file names, so it passes.
         assert!(super::super::is_complete(&dir, Preset::Balanced.source()));
-        // Hashing is what actually catches it.
+        // Only hashing catches the corruption.
         let files = Preset::Balanced.source().files.len();
         assert_eq!(mismatched(&dir, Preset::Balanced).len(), files);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_missing_file_counts_as_mismatched_rather_than_panicking() {
+    fn a_missing_file_counts_as_mismatched() {
         let dir = scratch("gone");
         let files = Preset::Fast.source().files.len();
         assert_eq!(mismatched(&dir, Preset::Fast).len(), files);

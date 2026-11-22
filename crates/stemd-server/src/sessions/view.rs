@@ -12,7 +12,7 @@ pub struct View {
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Changes whenever another field does.
+    /// Changes whenever any other field changes.
     pub rev: u64,
     pub track: TrackView,
     pub output: crate::output::OutputView,
@@ -21,9 +21,9 @@ pub struct View {
     /// Samples separated in memory.
     pub ready: Vec<[usize; 2]>,
     pub stems: Vec<StemView>,
-    /// True when every sample is ready or stored, so any range reads.
+    /// True when every sample is ready or stored, so any range can be read.
     pub complete: bool,
-    /// Segments asked for and not run yet.
+    /// The number of segments asked for that have not run yet.
     pub planned: usize,
     /// Set while segments wait on something other than the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,7 +46,8 @@ pub struct GridView {
     pub segment_frames: i32,
     pub stride_frames: i32,
     pub segments: usize,
-    /// Median seconds of the last [`crate::queue::SPEED_KEPT`] segments, `null` until one ran.
+    /// The median run time in seconds of the last [`crate::queue::SPEED_KEPT`] segments; `null`
+    /// until a segment has run.
     pub segment_run_seconds: Option<f64>,
 }
 
@@ -56,7 +57,7 @@ pub struct StemView {
     /// See [`crate::output::sources`].
     pub sources: u16,
     pub stored: crate::output::Storage,
-    /// The whole file's size, when stored whole.
+    /// The size of the whole file, when the stem is stored whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     /// Stored pieces as half-open spans of piece indices, when stored as pieces.
@@ -79,21 +80,22 @@ pub(super) fn spans_of(pieces: &[usize]) -> Vec<[usize; 2]> {
 /// What the window shows of a session. It carries no track id or name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Activity {
-    /// Counts sessions from 1 since the server started.
+    /// The session's number, counting from 1 since the server started.
     pub number: u64,
     pub frames: usize,
     pub sample_rate: u32,
-    /// Pieces in the track.
+    /// The number of pieces in the track.
     pub pieces: usize,
-    /// Pieces ready in memory or in the cache.
+    /// The number of pieces ready in memory or in the cache.
     pub ready: usize,
-    /// Samples uploaded.
+    /// The number of samples uploaded.
     pub arrived: usize,
-    /// Samples ready in memory or in a stored piece.
+    /// The number of samples ready in memory or in a stored piece.
     pub covered: usize,
-    /// Planned segments not run yet that run before jobs: priority below [`BEFORE_JOBS`].
+    /// The number of planned segments not run yet with a priority below [`BEFORE_JOBS`], which run
+    /// before jobs.
     pub high: usize,
-    /// Planned segments not run yet that wait for jobs.
+    /// The number of planned segments not run yet that wait for jobs.
     pub normal: usize,
     /// True when a planned segment can run now.
     pub runnable: bool,

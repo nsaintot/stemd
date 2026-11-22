@@ -38,7 +38,7 @@ fn a_file_key_seen_with_two_tracks_names_neither() {
 }
 
 #[test]
-fn type_dir_names_every_setting_that_changes_the_bytes() {
+fn the_type_directory_names_every_setting_that_changes_the_bytes() {
     let mut output = Output {
         format: StemFormat::Flac,
         rate: OutputRate::default(),
@@ -157,7 +157,7 @@ fn fill(cache: &Cache, tracks: &[&str]) {
                 .write_verified(&dir, stem, 0, "flac", &[0; 300])
                 .expect("write");
         }
-        // Distinct modification times.
+        // Give each track a distinct modification time.
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -258,7 +258,7 @@ fn over_the_budget_partial_tracks_go_before_whole_ones() {
     store_whole(&cache, "old-whole");
     fill(&cache, &["new-partial"]);
     store_whole(&cache, "newest-whole");
-    // Just over: deleting the partial track is enough.
+    // The cache is just over the budget, so deleting the partial track is enough.
     let budget = cache.bytes() - 100;
     let cache = Cache::open(cache.root().to_owned(), budget).expect("reopen");
     assert!(!exists(&cache, "new-partial"), "partial goes first");

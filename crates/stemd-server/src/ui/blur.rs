@@ -3,7 +3,7 @@
 //! A paint callback copies what is already drawn under a rect, blurs it with a
 //! dual Kawase filter at half, quarter and eighth resolution, and draws it back
 //! clipped to a rounded rect. The popup's translucent fill goes on top of it.
-//! Costs a handful of small draws, and only while a popup is open.
+//! This costs a handful of small draws, and only while a popup is open.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,11 +11,11 @@ use eframe::egui::{self, Rect};
 use eframe::egui_glow;
 use eframe::glow::{self, HasContext as _};
 
-/// Points sampled around the rect, so its edges blur with what is beside them.
+/// The margin in points sampled around the rect, so its edges blend with their surroundings.
 const MARGIN: f32 = 24.0;
-/// Downsampling steps. Each one doubles the blur radius.
+/// The number of downsampling steps. Each step doubles the blur radius.
 const LEVELS: usize = 3;
-/// Tap spread, in texels of the level being read.
+/// The tap spread, in texels of the level being read.
 const SPREAD: f32 = 1.5;
 
 /// The blurred backdrop of `rect` with corner `radius`, as a shape to paint
@@ -42,7 +42,7 @@ pub fn shape(rect: Rect, radius: f32) -> egui::Shape {
     })
 }
 
-/// `None` inside once setting up failed, so it is not retried every frame.
+/// Holds `Some(None)` once setup has failed, so setup is not retried every frame.
 static STATE: Mutex<Option<Option<Resources>>> = Mutex::new(None);
 
 struct Level {
@@ -182,7 +182,7 @@ impl Resources {
             }
             for i in 0..=LEVELS {
                 let size = [(size[0] >> i).max(1), (size[1] >> i).max(1)];
-                // A level set left short by a failure is rebuilt next frame.
+                // A level set left incomplete by a failure is rebuilt on the next frame.
                 let texture = gl.create_texture()?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 for (key, value) in [
@@ -239,7 +239,7 @@ impl Resources {
         let gl = painter.gl().clone();
         let ppp = info.pixels_per_point;
         let [width, height] = info.screen_size_px.map(|v| v as f32);
-        // Pixel rect, origin bottom left as GL counts it.
+        // The rect in pixels, with the origin at the bottom left as GL counts it.
         let region = rect.expand(MARGIN);
         let left = (region.left() * ppp).floor().max(0.0);
         let right = (region.right() * ppp).ceil().min(width);
@@ -378,7 +378,8 @@ impl Program {
     }
 }
 
-/// Look of a frosted panel: blurred backdrop, tinted fill, hairline, drop shadow.
+/// The look of a frosted panel: a blurred backdrop, a tinted fill, a hairline border and a drop
+/// shadow.
 pub struct Frosted {
     pub radius: f32,
     pub margin: i8,

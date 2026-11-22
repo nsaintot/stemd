@@ -14,9 +14,8 @@ fn stem(secs: f64) -> Audio {
     )
 }
 
-/// Is converting three stems at once faster than one at a time? Not obviously:
-/// the conversion can be memory-bound, and the 44.1 to 48 kHz path threads
-/// internally already.
+/// Compares converting three stems at once with converting them one at a time. The conversion can
+/// be memory-bound, and the 44.1 to 48 kHz path already uses threads internally.
 #[test]
 #[ignore]
 fn is_converting_three_stems_at_once_worth_it() {

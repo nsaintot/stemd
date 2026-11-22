@@ -1,7 +1,7 @@
-//! Binding the listener and the two ways the process ends.
+//! Runs the server headless or behind the window, and handles the signals that end the process.
 //!
-//! The GUI must own the main thread on macOS, so the HTTP server always runs on
-//! a runtime we drive ourselves rather than via `#[tokio::main]`.
+//! The GUI must own the main thread on macOS, so the HTTP server always runs on a runtime built
+//! here; `#[tokio::main]` would take the main thread.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,18 +49,15 @@ pub fn windowed(
     listener: std::net::TcpListener,
     taken: Option<u16>,
 ) -> Result<()> {
-    // The address the socket actually got, which is the one to show and to
-    // advertise. It answers `--bind :0`, where the requested address names no
-    // port anyone could connect to.
+    // Show and advertise the address the socket got. With `--bind :0`, the requested address names
+    // no usable port.
     let bind = listener.local_addr().context("reading the bound address")?;
     let (endpoint, moves) = Endpoint::new(bind, taken);
     let runtime = runtime()?;
     let launch = Arc::new(Launch::windowed());
 
-    // Both ways out, not just the headless one: a windowed server started from a
-    // terminal is still Ctrl-C'd from that terminal, and without this it would
-    // die on the default action with the worker still in the model and the mDNS
-    // advertisement still standing.
+    // A windowed server started from a terminal can still get Ctrl-C there; without this, it would
+    // die by the default action with the worker in the model and the mDNS advertisement still up.
     watch_for_signals(&runtime, &launch);
 
     let handle = runtime.handle().clone();
@@ -105,8 +102,8 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("building the tokio runtime")
 }
 
-/// Serve on a listener that is already bound, then on each one `moves` hands
-/// over. The first binding is [`crate::endpoint::bind`]'s, done before the model was loaded.
+/// Serve on a listener that is already bound, then on each one that `moves` hands over.
+/// [`crate::endpoint::bind`] made the first binding, before the model was loaded.
 async fn listen(
     state: Arc<AppState>,
     listener: std::net::TcpListener,
@@ -175,9 +172,8 @@ async fn limit_body(
 
 /// Shut down cleanly when the system asks the process to stop.
 ///
-/// A signal does not unwind the stack, so no `Drop` runs: without this the
-/// worker would still be in the model when the process tore itself down, and
-/// clients would chase a dead server until its TTL expired.
+/// A signal does not unwind the stack, so no `Drop` runs. Without this, the worker would still be
+/// in the model during teardown, and clients would chase a dead server until its record expired.
 fn watch_for_signals(runtime: &tokio::runtime::Runtime, launch: &Arc<Launch>) {
     let launch = Arc::clone(launch);
     runtime.spawn(async move {
@@ -189,9 +185,8 @@ fn watch_for_signals(runtime: &tokio::runtime::Runtime, launch: &Arc<Launch>) {
 
 /// Resolve once the system asks this process to stop.
 ///
-/// `false` means no handler could be installed, so nothing will ever arrive to
-/// wait for and the default action stands. The caller must not shut down on
-/// that: it is the absence of a request, not one.
+/// `false` means no handler could be installed, so no request will arrive and the default action
+/// stays in place. The caller must not shut down on `false`.
 #[cfg(unix)]
 async fn asked_to_stop() -> bool {
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -210,10 +205,9 @@ async fn asked_to_stop() -> bool {
 
 /// Windows has no signals; the console control handlers are the equivalent.
 ///
-/// Three of them, because SIGINT and SIGTERM do not divide the same way here.
-/// `ctrl_c` is Ctrl-C and Ctrl-Break, `ctrl_close` is the console's close box, and
-/// `ctrl_shutdown` is the machine going down. All three run on a thread the system
-/// spawns and give it a few seconds before killing the process.
+/// There are three, because SIGINT and SIGTERM do not map one to one: `ctrl_c` covers Ctrl-C and
+/// Ctrl-Break, `ctrl_close` the console's close box, and `ctrl_shutdown` a system shutdown. Each
+/// runs on a thread the system spawns, which gets a few seconds before the process is killed.
 #[cfg(windows)]
 async fn asked_to_stop() -> bool {
     let (mut close, mut shutdown) = match (
@@ -235,11 +229,9 @@ async fn asked_to_stop() -> bool {
 }
 
 /// Run the window. Closing it ends the process.
-///
-/// On macOS `ui::Window::on_exit` is what shuts down, because AppKit calls
-/// `exit()` the moment its delegate returns, so the only path reaching the line
-/// below is `run_native` failing before the window is up. Windows and Linux return
-/// normally when the event loop ends.
+// On macOS, `ui::Window::on_exit` shuts down, because AppKit calls `exit()` as soon as its
+// delegate returns; the line below runs only when `run_native` fails before the window is up. On
+// Windows and Linux, the event loop ends and the function returns normally.
 fn window(launch: &Arc<Launch>) -> Result<()> {
     crate::ui::run(Arc::clone(launch)).map_err(|e| anyhow::anyhow!("{e}"))?;
     crate::shutdown::quit(launch, "window closed")

@@ -216,7 +216,7 @@ fn with_the_clients_statistics_a_segment_runs_once_its_own_input_is_in() {
             }],
         })
         .expect("open");
-    // Only the region around the cue.
+    // Upload only the region around the cue.
     upload(&queue, &session, 190_000, &mix.excerpt(190_000, 220_000));
     queue.wake();
     assert!(ready_within(
@@ -501,7 +501,7 @@ fn whole_file(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>
     ))
 }
 
-/// The same, sent from the stored whole file.
+/// The same as [`whole_file`], sent from the stored whole file.
 fn sent_whole(queue: &Queue, session: &Session, name: &str) -> (u16, Vec<String>, Vec<u8>) {
     let whole = queue.sessions().whole(session, name).expect("a whole file");
     let response = tokio::runtime::Builder::new_current_thread()
@@ -581,8 +581,8 @@ fn restore_pieces(dir: &std::path::Path, backup: &std::path::Path, format: StemF
     }
 }
 
-/// The whole-track file of a fresh session, one with every piece stored, one
-/// with half of them stored, and one with the stem stored whole.
+/// The whole-track file read four ways: from a fresh session, from one with every piece stored,
+/// from one with half of them stored, and from one with the stem stored whole.
 fn four_ways(format: StemFormat, rate: OutputRate, seed: u32) -> [(u16, Vec<String>, Vec<u8>); 4] {
     let frames = 40_000;
     let mix = track(frames, seed);
@@ -1367,7 +1367,7 @@ fn a_stored_read_comes_from_pieces_and_refuses_a_short_or_missing_one() {
         .read_stored(&second, "vocals", 0, 10)
         .err()
         .expect("a short piece is refused");
-    assert!(short.to_string().contains("samples, not"), "{short:#}");
+    assert!(short.to_string().contains("samples, got"), "{short:#}");
 
     std::fs::remove_file(&piece).unwrap();
     let missing = queue

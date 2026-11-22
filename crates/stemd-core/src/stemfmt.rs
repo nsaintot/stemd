@@ -1,14 +1,13 @@
 //! How a separated stem is written for transfer.
 //!
-//! Distinct from [`PcmFormat`], which describes raw samples and is what an upload
-//! is parsed as. `flac` is a container rather than a sample encoding and is never
-//! a legal upload format.
+//! It differs from [`PcmFormat`], which describes raw samples and is what an upload is parsed as.
+//! `flac` is a container, so it is never a valid upload format.
 //!
-//! Four of the five are lossless. `mp3` is not: a perceptual codec hides its noise
-//! under a masking threshold computed for the signal as encoded, and a stem's gain
-//! gets changed afterwards, so that noise stops being masked. Lossy parts also do
-//! not sum, which the client's rebuild of the third part needs. Nothing enforces
-//! this; the format list offers the choice.
+//! Four of the five formats are lossless; `mp3` is lossy. A perceptual codec hides its noise under
+//! a masking threshold computed for the signal as encoded, and a stem's gain is changed afterwards,
+//! which unmasks that noise. Lossy parts also do not sum, and the client's rebuild of the third
+//! part needs them to. Nothing stops a client from choosing `mp3`; the choice is left to the
+//! caller.
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,44 +17,39 @@ use serde::{Deserialize, Serialize};
 use crate::pcm::{Audio, PcmError, PcmFormat};
 use crate::resample::OutputRate;
 
-/// Bits per sample in a WAV stem. The same 16 as [`stemd_audio::wire::FLAC_BITS`], for the same reason, and
-/// because a 16-bit WAV opens everywhere without a conversation about it.
+/// The bits per sample in a WAV stem: 16, the same as [`stemd_audio::wire::FLAC_BITS`] and for the
+/// same reason. A 16-bit WAV also opens everywhere.
 const WAV_BITS: u16 = 16;
 
-/// How hard LAME searches when quantising. Its own recommended setting.
+/// How hard LAME searches when quantising: its own recommended setting.
 ///
-/// At 320 kbps constant there are enough bits that a slower search finds nothing:
-/// `q=0` costs 18x realtime against this one's 47x and differs by -47 dB, below
-/// the coding noise both add. Benchmarks are in the tests below, marked
-/// `#[ignore]`.
+/// At a constant 320 kbps there are enough bits that a slower search gains nothing: `q=0` runs at
+/// 18x realtime against 47x here and differs by -47 dB, below the coding noise both add. The
+/// benchmarks are the `#[ignore]` tests below.
 const MP3_QUALITY: mp3lame_encoder::Quality = mp3lame_encoder::Quality::NearBest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StemFormat {
-    /// FLAC carrying 16-bit samples. Lossless, so it decodes to exactly what
-    /// `pcm16` would have carried, in roughly half the bytes.
+    /// FLAC with 16-bit samples. It is lossless, so it decodes to exactly what `pcm16` would carry,
+    /// in roughly half the bytes.
     Flac,
-    /// A 16-bit WAV. The same samples as FLAC with a RIFF header instead of
-    /// compression: what to pick when whatever opens it next is fussy.
+    /// A 16-bit WAV: the same samples as FLAC, with a RIFF header and no compression. Use it when
+    /// the next program to open the file is fussy.
     Wav,
-    /// MP3 at 320 kbps. The only lossy option; see the module docs for when
-    /// that matters.
+    /// MP3 at 320 kbps, the only lossy option; the module docs say when that matters.
     Mp3,
-    /// Raw interleaved 16-bit LE. The same samples with no container and no
-    /// decode step.
+    /// Raw interleaved 16-bit LE: the same samples with no container and no decode step.
     Pcm16,
-    /// Raw interleaved 32-bit float LE. Twice the bytes, no ceiling at full
-    /// scale, and the only way to an exact reconstruction null with no
-    /// quantisation anywhere.
+    /// Raw interleaved 32-bit float LE: twice the bytes, no ceiling at full scale, and the only
+    /// format that gives an exact reconstruction null with no quantisation anywhere.
     Pcm32,
 }
 
 impl StemFormat {
     pub const ALL: [Self; 5] = [Self::Flac, Self::Wav, Self::Mp3, Self::Pcm16, Self::Pcm32];
 
-    /// The raw sample encoding, when the payload is samples rather than a
-    /// container a client has to decode.
+    /// The raw sample encoding, when the payload is samples and needs no decoding.
     #[cfg(test)]
     pub const fn as_pcm(self) -> Option<PcmFormat> {
         match self {
@@ -65,10 +59,9 @@ impl StemFormat {
         }
     }
 
-    /// Whether what comes back out is exactly what went in.
+    /// Whether the decoded output is exactly the input.
     ///
-    /// The property the derived part depends on: parts that are not lossless do
-    /// not sum back to the mix.
+    /// The derived part depends on this: parts that are not lossless do not sum back to the mix.
     #[cfg(test)]
     pub const fn is_lossless(self) -> bool {
         !matches!(self, Self::Mp3)
@@ -89,7 +82,7 @@ impl StemFormat {
         }
     }
 
-    /// Extension used for the file inside a cache entry.
+    /// The file extension used inside a cache entry.
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Pcm16 | Self::Pcm32 => "pcm",
@@ -99,11 +92,10 @@ impl StemFormat {
         }
     }
 
-    /// Whether this format can carry `rate` at all.
-    ///
-    /// Only MP3 says no. MPEG-1 Layer III has three sample rates, 32, 44.1 and 48 kHz,
-    /// and 96 is not among them at any bitrate. LAME does not refuse it, it turns on
-    /// its own resampler and encodes 48 kHz instead.
+    /// Whether this format can carry `rate`.
+    // Only MP3 cannot carry every rate. MPEG-1 Layer III has three sample rates, 32, 44.1 and 48
+    // kHz, and 96 kHz is not among them at any bitrate. LAME does not refuse it: it turns on its
+    // own resampler and encodes 48 kHz.
     pub const fn carries(self, rate: OutputRate) -> bool {
         match self {
             Self::Mp3 => matches!(
@@ -121,8 +113,8 @@ impl StemFormat {
             .filter(move |r| self.carries(*r))
     }
 
-    /// What the window shows. `Display` is what the API takes, which is not
-    /// always what reads best in a menu.
+    /// The label the window shows. `Display` gives the name the API takes, which does not always
+    /// read best in a menu.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Flac => "FLAC",
@@ -149,8 +141,7 @@ impl fmt::Display for StemFormat {
 impl FromStr for StemFormat {
     type Err = PcmError;
 
-    /// The `le` spellings are the names these two had before the window listed
-    /// them, and cost nothing to keep accepting.
+    /// The `s16le` and `f32le` spellings are accepted as aliases.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "flac" => Ok(Self::Flac),
@@ -177,7 +168,7 @@ pub fn encode(audio: &Audio, format: StemFormat, gain: f32) -> anyhow::Result<Ve
 /// A 16-bit WAV: a 44-byte canonical RIFF header, then the same interleaved
 /// samples `pcm16` would have carried.
 ///
-/// Written by hand because that is all a WAV is, and the samples have to be
+/// Written by hand because a WAV is only a header and samples, and the samples must be
 /// bit-identical to the other 16-bit formats.
 fn to_wav(audio: &Audio, gain: f32) -> Vec<u8> {
     let samples = audio.to_interleaved_scaled(PcmFormat::S16le, gain);
@@ -202,11 +193,11 @@ fn to_wav(audio: &Audio, gain: f32) -> Vec<u8> {
     out
 }
 
-/// MP3 at 320 kbps constant, the top of the format: a stem gets gain-shifted
-/// against its siblings afterwards.
+/// MP3 at a constant 320 kbps, the format's highest bitrate, since a stem's gain is changed against
+/// the other stems afterwards.
 ///
-/// LAME is fed the float samples directly. It works in float internally, so
-/// handing it 16-bit integers would quantise twice.
+/// LAME receives the float samples directly: it works in float internally, so 16-bit input would
+/// quantise twice.
 fn to_mp3(audio: &Audio, gain: f32) -> anyhow::Result<Vec<u8>> {
     to_mp3_at(audio, gain, MP3_QUALITY)
 }
@@ -216,9 +207,8 @@ fn to_mp3_at(
     gain: f32,
     quality: mp3lame_encoder::Quality,
 ) -> anyhow::Result<Vec<u8>> {
-    // Each stage of the encoder reports a different error type, so this is a
-    // function rather than a closure: a closure would bind to whichever one it
-    // saw first.
+    // Each encoder stage reports a different error type, so this is a generic function: a closure
+    // would bind to the first type it saw.
     fn fail<E: std::fmt::Debug>(what: &'static str) -> impl Fn(E) -> anyhow::Error {
         move |e| anyhow::anyhow!("mp3 {what}: {e:?}")
     }
@@ -229,13 +219,12 @@ fn to_mp3_at(
     anyhow::ensure!(channels > 0, "cannot encode zero channels to mp3");
     anyhow::ensure!(
         channels <= 2,
-        "mp3 carries at most two channels, not {channels}"
+        "mp3: expected at most two channels, got {channels}"
     );
 
-    // Checked here and not only where the pair is chosen, because this is where
-    // the cost lands: LAME accepts a rate it has no mode for and resamples to
-    // one it does, taking eighteen seconds over a stem to produce a file at a
-    // rate nobody asked for.
+    // Check here as well as where the pair is chosen, because the cost lands here: LAME accepts a
+    // rate it has no mode for and resamples to one it has, taking eighteen seconds per stem to
+    // produce a file at a rate nobody asked for.
     anyhow::ensure!(
         OutputRate::from_hz(audio.sample_rate).is_none_or(|r| StemFormat::Mp3.carries(r)),
         "mp3 has no {} Hz mode; 44100 and 48000 are the ones above 24000",
@@ -288,10 +277,9 @@ fn to_mp3_at(
 /// Samples are quantised by exactly the routine `s16le` uses, so a client rebuilds
 /// the derived part identically whichever format it asked for.
 fn to_flac(audio: &Audio, gain: f32) -> anyhow::Result<Vec<u8>> {
-    //  One below the crate's default of 10: 13% off the encode for 0.7% more bytes,
-    //  measured by `encode_cost`. Order 4 costs 9.5% more size and no LPC costs 25%.
-    //  Encoding dominates the writing stage and is already multithreaded, so this is
-    //  the only lever.
+    // One below the crate's default of 10: 13% faster encoding for 0.7% more bytes, measured by
+    // `encode_cost`. Order 4 costs 9.5% more size, and no LPC costs 25%. Encoding dominates the
+    // writing stage and is already multithreaded, so this is the only setting left to tune.
     let config = stemd_audio::wire::flac_config(Some(8))?;
     to_flac_with(audio, gain, &config)
 }
@@ -307,9 +295,8 @@ fn to_flac_with(
 
 #[cfg(test)]
 mod tests {
-    /// MPEG-1 Layer III has three sample rates and 96 kHz is not one of them.
-    /// Every other format here is a container over samples and carries whatever
-    /// it is handed.
+    /// MPEG-1 Layer III has three sample rates, and 96 kHz is not one of them. Every other format
+    /// here is a container over samples and carries any rate.
     #[test]
     fn only_mp3_turns_a_rate_down() {
         use super::{OutputRate, StemFormat};
@@ -323,9 +310,8 @@ mod tests {
         assert_eq!(StemFormat::Flac.rates().count(), OutputRate::ALL.len());
     }
 
-    /// The encoder is the last line rather than the only one, and has to refuse
-    /// on its own: LAME accepts 96 kHz and resamples instead of failing, which
-    /// is how this got shipped.
+    /// The encoder refuses 96 kHz on its own, as a last check behind the rate selection: LAME would
+    /// accept the rate and resample.
     #[test]
     fn the_mp3_encoder_refuses_a_rate_it_has_no_mode_for() {
         use super::{StemFormat, encode};
@@ -336,7 +322,7 @@ mod tests {
             format!("{err:#}").contains("96000"),
             "unhelpful error: {err:#}"
         );
-        // The same samples at a rate it does have a mode for still encode.
+        // The same samples at a rate LAME has a mode for still encode.
         let audio = Audio::new(vec![vec![0.0; 4800], vec![0.0; 4800]], 48_000);
         assert!(!encode(&audio, StemFormat::Mp3, 1.0).unwrap().is_empty());
     }
@@ -404,9 +390,8 @@ mod tests {
 
     #[test]
     fn flac_carries_exactly_the_s16_samples() {
-        // The container is the only difference. If these ever diverge, a client
-        // rebuilding the third part gets a different answer depending on which
-        // format it happened to ask for.
+        // Only the container differs. If these diverged, a client rebuilding the third part would
+        // get a different answer depending on the format it asked for.
         let audio = tone(4096);
         let pcm = encode(&audio, StemFormat::Pcm16, 1.0).unwrap();
         let expected: Vec<i16> = pcm
@@ -434,10 +419,9 @@ mod tests {
 
     #[test]
     fn a_partial_final_block_still_declares_a_fixed_block_size() {
-        // A length that is not a whole number of blocks: the case that makes
-        // the encoder's own minimum disagree with the frames it wrote. A
-        // decoder that believes `min != max` locates frames by sample number
-        // and gives up partway through.
+        // Use a length that is not a whole number of blocks: that makes the encoder's declared
+        // minimum disagree with the frames it wrote. A decoder that sees `min != max` locates
+        // frames by sample number and gives up partway through.
         let flac = encode(&tone(4096 * 3 + 777), StemFormat::Flac, 1.0).unwrap();
         let (min, max) = declared_block_sizes(&flac);
         assert_eq!(min, max, "declared variable block size: {min} != {max}");
@@ -458,9 +442,9 @@ mod tests {
         );
     }
 
-    /// The 16-bit formats have to agree sample for sample. A client rebuilding
-    /// the derived part by subtraction must get the same answer whichever one it
-    /// asked for, and "wav" is only "flac without the compression" if that holds.
+    /// The 16-bit formats agree sample for sample. A client rebuilding the derived part by
+    /// subtraction must get the same answer whichever format it asked for, and "wav" equals "flac
+    /// without the compression" only if this holds.
     #[test]
     fn every_sixteen_bit_format_carries_the_same_samples() {
         let audio = tone(4096);
@@ -483,8 +467,8 @@ mod tests {
         assert_eq!(from_wav, expected);
     }
 
-    /// A WAV header anything will open: the canonical 44 bytes, with the sizes
-    /// and the geometry actually filled in.
+    /// A WAV header that every reader opens: the canonical 44 bytes, with the sizes and the
+    /// geometry filled in.
     #[test]
     fn the_wav_header_describes_the_samples_that_follow() {
         let audio = tone(1000);
@@ -523,7 +507,7 @@ mod tests {
         assert!(starts_framed, "not an mp3 stream: {:02X?}", &mp3[..4]);
     }
 
-    /// The property the module docs turn on, asserted rather than asserted about.
+    /// The lossless property that the module docs rely on, checked directly.
     #[test]
     fn only_mp3_is_lossy_and_only_the_float_format_has_headroom() {
         for format in StemFormat::ALL {
@@ -540,8 +524,6 @@ mod tests {
         }
     }
 
-    /// Every name the API takes has to survive the round trip, including the
-    /// spellings kept for the clients that already use them.
     /// FNV-1a over `bytes`, to pin encoder output in a test.
     fn fnv(bytes: &[u8]) -> u64 {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
@@ -601,26 +583,26 @@ mod encode_cost {
     use super::*;
     use crate::pcm::Audio;
 
-    /// What the encoder configuration costs, measured on a real stem.
-    ///
-    /// Kept because the trade is not stable: encode time depends on the material, and
-    /// the answer moves with the machine and the crate version.
-    ///
-    ///     STEM_BENCH=/path/to/a/96k/stem.flac cargo test --release -p stemd-core encode_cost -- --nocapture
-    ///
-    /// An 8:06 stem at 96 kHz, flacenc 0.5.1:
-    ///
-    /// | lpc_order      | encode  | size    |
-    /// |----------------|---------|---------|
-    /// | 10 (crate)     | 1.02 s  | 41.0 MB |
-    /// | 8 (shipped)    | 0.94 s  | 41.3 MB |
-    /// | 4              | 0.92 s  | 44.9 MB |
-    /// | 2              | 0.77 s  | 51.2 MB |
-    /// | none           | 0.47 s  | 51.3 MB |
-    ///
-    /// Order 2 is strictly worse than turning LPC off. The encoder is already
-    /// multithreaded: the same stem takes 5.08 s single-threaded, and two stems
-    /// concurrently take 2.20 s against 2.38 s in sequence.
+    /// What the encoder configuration costs, on a real stem.
+    // Re-run it after changing the encoder: the result depends on the material, the machine and the
+    // crate version.
+    //
+    //     STEM_BENCH=/path/to/a/96k/stem.flac \
+    //     cargo test --release -p stemd-core encode_cost -- --nocapture
+    //
+    // An 8:06 stem at 96 kHz, flacenc 0.5.1:
+    //
+    // | lpc_order      | encode  | size    |
+    // |----------------|---------|---------|
+    // | 10 (crate)     | 1.02 s  | 41.0 MB |
+    // | 8 (shipped)    | 0.94 s  | 41.3 MB |
+    // | 4              | 0.92 s  | 44.9 MB |
+    // | 2              | 0.77 s  | 51.2 MB |
+    // | none           | 0.47 s  | 51.3 MB |
+    //
+    // Order 2 is worse than turning LPC off on both counts. The encoder is already multithreaded:
+    // the same stem takes 5.08 s single-threaded, and two stems take 2.20 s concurrently against
+    // 2.38 s in sequence.
     #[test]
     fn encode_cost() {
         use flacenc::error::Verify;
@@ -643,13 +625,13 @@ mod encode_cost {
         let audio = Audio::new(vec![left, right], rate);
         eprintln!("source: {} frames @{rate} Hz", audio.frames());
 
-        // Discarded: the first encode pays for faulting in a ~300 MB interleave
-        // buffer and spinning up the encoder's threads, which is worth about
-        // 25% and would be charged to whichever row happened to run first.
+        // Discard the first encode: it pays for faulting in a ~300 MB interleave buffer and
+        // starting the encoder's threads, about 25%, which would be charged to the row that ran
+        // first.
         let _ = encode(&audio, StemFormat::Flac, 1.0).unwrap();
 
-        // The shipping path first, so this reports what stemd actually costs
-        // rather than only what the alternatives would.
+        // Time the shipping configuration first, so the report shows what stemd costs as well as
+        // what the alternatives would.
         let began = std::time::Instant::now();
         let shipped = encode(&audio, StemFormat::Flac, 1.0).unwrap();
         eprintln!(
@@ -691,9 +673,9 @@ mod mp3_bench {
     use crate::pcm::Audio;
     use crate::stemfmt::{StemFormat, encode};
 
-    /// Something closer to music than a tone or noise: a harmonic stack that moves,
-    /// transients on a beat, and a little noise for air. Pure tones flatter every
-    /// encoder and white noise punishes every encoder.
+    /// A signal closer to music than a tone or noise: a moving harmonic stack, transients on a
+    /// beat, and a little noise for air. Pure tones flatter every encoder, and white noise punishes
+    /// every encoder.
     fn musical(secs: f64, rate: u32) -> Audio {
         let n = (secs * f64::from(rate)) as usize;
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -734,8 +716,7 @@ mod mp3_bench {
 
     use mp3lame_encoder::Quality;
 
-    /// The levels worth sweeping, named as LAME names them. `MP3_QUALITY` is
-    /// `NearBest`.
+    /// The levels to sweep, named as LAME names them. `MP3_QUALITY` is `NearBest`.
     fn quality_levels() -> [(&'static str, Quality); 6] {
         [
             ("Best", Quality::Best),
@@ -796,9 +777,9 @@ mod mp3_bench {
         20.0 * (sum / samples.len() as f64).sqrt().log10()
     }
 
-    /// What turning the quality knob down costs. Two numbers per setting: how far its
-    /// output sits from `q=0`'s, and the coding noise both add against the input. The
-    /// second is the scale the first has to be read against.
+    /// What lowering the quality setting costs. Each setting gets two numbers: how far its output
+    /// sits from `q=0`'s, and the coding noise both add against the input. A distance well below
+    /// that coding noise is inaudible.
     #[test]
     #[ignore]
     fn what_does_the_quality_knob_cost() {
@@ -808,8 +789,8 @@ mod mp3_bench {
             .collect();
 
         let reference = decode_mp3(&super::to_mp3_at(&audio, 1.0, Quality::Best).unwrap());
-        // LAME's encoder delay, found rather than assumed: the offset at which
-        // the decoded output best matches what went in.
+        // LAME's encoder delay, found by search: the offset at which the decoded output best
+        // matches the input.
         let lag = (0..3000)
             .min_by(|a, b| {
                 let err = |off: usize| -> f64 {
@@ -863,7 +844,7 @@ mod mp3_bench {
                 60.0 / took.as_secs_f64()
             );
         }
-        // For comparison, the format that is not the problem.
+        // For comparison, time FLAC.
         let began = std::time::Instant::now();
         let bytes = encode(&audio, StemFormat::Flac, 1.0).unwrap();
         println!(

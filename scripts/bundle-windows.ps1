@@ -1,21 +1,20 @@
 # Assemble the Windows build.
 #
-# About 165 MB and no CUDA library in it. The executable delay-loads its CUDA
-# imports and decides at startup whether they resolve, so this same directory
-# runs on a machine with no NVIDIA anything and uses a card where there is a
-# usable one. `install-cuda.cmd` beside it fetches the runtime for whoever
-# wants it. What does travel is headers: MLX compiles some kernels at run time
-# with NVRTC, and they include CCCL and the CUDA runtime headers, which a
-# machine that never compiles anything still has to have on disk.
+# It is about 165 MB and holds no CUDA library. The executable delay-loads its
+# CUDA imports and decides at startup whether they resolve, so the same
+# directory runs on a machine with no NVIDIA hardware and uses a usable card
+# where there is one. `install-cuda.cmd` beside it downloads the runtime on
+# request. Headers do ship: MLX compiles some kernels at run time with NVRTC,
+# and those include CCCL and the CUDA runtime headers, which must be on disk
+# # on every machine, because any GPU separation can trigger a run-time compile.
 #
-# That replaces staging CUDA's bin\x64 wholesale, which is where the 2.4 GB
-# directory came from: half of it was libraries nothing in the program can call,
-# and the rest is now a download rather than a precondition.
+# Do not retry copying CUDA's bin\x64 whole: it makes a 2.4 GB directory, half
+# of it libraries the program cannot call, and the rest is an optional download.
 #
-# What has to be carried is the MSVC runtime, because a machine without Visual
-# Studio has no reason to have it, and libopenblas, which MLX builds as a DLL
-# and cargo has no install rule for. Both are hard imports: leave either out and
-# the process dies at 0xC0000135 before `main`, with no message.
+# Two things must ship: the MSVC runtime, which a machine without Visual Studio
+# may lack, and libopenblas, which MLX builds as a DLL and cargo has no install
+# rule for. Both are hard imports: without either, the process dies with
+# 0xC0000135 before `main`, with no message.
 [CmdletBinding()]
 param(
     [string]$Out,
@@ -24,38 +23,36 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-# Not a param default: $PSScriptRoot is not reliably populated while those are
-# being bound, and Join-Path on an empty path fails before the body runs.
+# Set here, outside the param defaults: $PSScriptRoot is not reliably populated
+# while those are bound, and Join-Path on an empty path fails before the body
+# runs.
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 if (-not $Out) { $Out = Join-Path $root 'dist\stemd-windows' }
 
-# CUDA is opt-in in mlx-sys, and silent when it is off. `build.rs` turns it on
-# for the `cuda` feature or for MLX_BUILD_CUDA; without either it builds a
-# CPU-only MLX, links a 21 MB executable instead of an 84 MB one, and produces a
-# server that starts, says `device: cpu`, separates correctly and takes 610
-# seconds over a 64 second clip that the card does in two. Nothing in the build
-# says anything is wrong, because from cargo's point of view nothing is.
+# CUDA is opt-in in mlx-sys, and silent when off. `build.rs` turns it on for the
+# `cuda` feature or for MLX_BUILD_CUDA; without either it builds a CPU-only MLX,
+# links a 21 MB executable where the CUDA build is 84 MB, and produces a server
+# that starts, reports `device: cpu`, separates correctly and takes 610 seconds
+# over a 64-second clip that the card separates in a few seconds. Cargo reports
+# no error, because the CPU-only build is valid.
 #
-# Set here rather than expected from the environment. An interactive shell that
-# happens to have it and an ssh session that does not are the same command
-# producing two different products, which is exactly how a CPU-only binary got
-# built on this machine and staged for testing.
+# It is set here, without relying on the environment: an interactive shell that
+# has it and an ssh session that does not would build two different products
+# from the same command.
 $env:MLX_BUILD_CUDA = '1'
 if (-not $env:MLX_CUDA_ARCHITECTURES) { $env:MLX_CUDA_ARCHITECTURES = '86' }
 
-# cuDNN is the other thing the build needs from the environment and the other
-# thing nobody has persistently: on the machine this was developed on,
-# CUDNN_PATH was set in a shell and in neither the Machine nor the User scope,
-# so the build worked in that window and nowhere else. Unset, it gets sixty
-# lines into a CMake trace before saying
+# cuDNN is the other input the build takes from the environment, and it is often
+# set in only one shell, in neither the Machine nor the User scope. Unset, the
+# build gets sixty lines into a CMake trace before saying
 #
 #   FindCUDNN.cmake:56: Unable to find cudnn.h, please make sure cuDNN is
 #   installed and pass CUDNN_INCLUDE_PATH to cmake
 #
-# which is true and does not mention the variable that would fix it.
+# which does not mention the variable that would fix it.
 #
-# The installer's own location is probed because that is where most machines
-# have it. Anywhere else has to be said, and saying it is one line.
+# The installer's default location is probed because most machines have cuDNN
+# there. Any other location must be given, in one line.
 if (-not $env:CUDNN_PATH) {
     $found = Get-ChildItem 'C:\Program Files\NVIDIA\CUDNN' -Directory -ErrorAction SilentlyContinue |
         Sort-Object Name -Descending |
@@ -71,11 +68,11 @@ if (-not $env:CUDNN_PATH -or -not (Test-Path (Join-Path $env:CUDNN_PATH 'include
 }
 Write-Host "  cuDNN: $($env:CUDNN_PATH)"
 
-# cargo writes its progress to stderr, and under `Stop` a *redirected* native
-# stderr becomes a terminating error. So this script ran fine by hand and died
-# on cargo's first "Compiling" line the moment anyone piped it to a log, which
-# is what a build kicked off over ssh has to do. Exit codes are what actually
-# say whether a native command failed, and they are checked either way.
+# cargo writes its progress to stderr, and under `Stop` a redirected native
+# stderr becomes a terminating error, so the script would die on cargo's first
+# "Compiling" line whenever its output is piped to a log, as a build over ssh
+# must be. Exit codes say whether a native command failed, and they are checked
+# either way.
 function Invoke-Native {
     param([string]$What, [scriptblock]$Command)
     $previous = $ErrorActionPreference
@@ -84,12 +81,12 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
-# Source paths go into the binary, in every panic message and in the debug
-# info, as the absolute paths of this machine. Rewritten to names that say
-# what the file is and nothing about whose disk it was on.
+# Source paths go into the binary, in every panic message and in the debug info,
+# as this machine's absolute paths. They are rewritten to names that say what
+# each file is and nothing about the disk it was built on.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-# The source trees rather than the checkout: a prefix covering target\ makes
-# rustc unable to find the proc-macro crates it has just built there.
+# The source trees are remapped, never the whole checkout: a prefix covering
+# target\ stops rustc from finding the proc-macro crates it just built there.
 $sysroot = (& rustc --print sysroot).Trim()
 $env:RUSTFLAGS = ("$($env:RUSTFLAGS) --remap-path-prefix=$root\crates=stemd\crates " +
     "--remap-path-prefix=$root\vendor=stemd\vendor --remap-path-prefix=$cargoHome=cargo " +
@@ -105,20 +102,19 @@ if ($WithCli) {
     }
 }
 
-# And check it took, rather than trusting the variable. The delay-loaded CUDA
-# imports are the difference between the two builds, so ask the executable
-# instead of asking the environment that made it.
+# Check that CUDA was built in, without trusting the variable. The delay-loaded
+# CUDA imports are the difference between the two builds, so this reads the
+# executable itself.
 #
-# By reading the bytes rather than by running dumpbin. Delay-load descriptors
-# hold their DLL names as plain ASCII in the PE, so this needs no tooling at
-# all, and dumpbin needs a Visual Studio developer prompt: it was absent over
-# ssh, which is precisely the environment this check exists for. A guard that
-# excuses itself in the case it was written for is not a guard.
-# The names are the ones MLX imports, minus their version suffixes, and
-# deliberately not nvcuda.dll: that is the driver, `stemd_mlx::device` names it
-# to ask whether a card is present, and it is therefore in the CPU-only build
-# too. Picking it would have been a check that passes on exactly the binary it
-# exists to reject.
+# It reads the bytes and does not run dumpbin. Delay-load descriptors hold their
+# DLL names as plain ASCII in the PE, so this needs no tooling, while dumpbin
+# needs a Visual Studio developer prompt, which an ssh session lacks, and ssh
+# builds are what this check is for.
+#
+# The names are the ones MLX imports, without their version suffixes. nvcuda.dll
+# is left out on purpose: it is the driver, and `stemd_mlx::device` names it to
+# ask whether a card is present, so it is in the CPU-only build too, and
+# checking for it would pass on the binary this check exists to reject.
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
 $release = Join-Path $target 'release'
 $exe = Join-Path $release 'stemd-server.exe'
@@ -154,8 +150,9 @@ if (-not $blas) { throw 'no libopenblas.dll in the prebuilt MLX or under target\
 Copy-Item $blas $Out
 
 # The MSVC runtime, from the redistributable directory the toolchain ships.
-# Named rather than globbed: the redist folder also holds the debug CRT, which
-# must never be shipped and will not load on a machine without Visual Studio.
+# The files are named, never globbed: the redist folder also holds the debug
+# CRT, which must never ship and does not load on a machine without Visual
+# Studio.
 $needed = @(
     'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
     'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll',
@@ -172,9 +169,9 @@ foreach ($dll in $needed) {
 }
 if ($missing) { Write-Warning "not in $($redist.FullName): $($missing -join ', ')" }
 
-# Double-clickable, because the log line that asks for this is read by someone
-# looking at a window, and telling them to pass a flag is telling them to open a
-# terminal first.
+# A double-clickable script, because the log line that asks for it is read by
+# someone looking at a window, who should not have to open a terminal to pass a
+# flag.
 @'
 @echo off
 rem Fetch the CUDA runtime beside stemd-server.exe. About 1.2 GB, once, and
@@ -184,13 +181,11 @@ rem card already works or if there is no driver at all.
 pause
 '@ | Set-Content (Join-Path $Out 'install-cuda.cmd') -Encoding ascii
 
-# A CUDA library in here means the delay-load flags stopped working and the
-# directory has quietly become the 2.4 GB one again.
-# The headers NVRTC needs at run time. MLX looks for CCCL at include\cccl
-# beside the executable, and for the runtime headers under CUDA_HOME, which
-# the server points at cuda\ beside itself. Without these, every separation
-# on the GPU fails on its first kernel with "cannot open source file
-# cuda/std/tuple", on a machine that started fine and said device: gpu.
+# The headers NVRTC needs at run time. MLX looks for CCCL at include\cccl beside
+# the executable, and for the runtime headers under CUDA_HOME, which the server
+# points at cuda\ beside itself. Without them, every GPU separation fails on its
+# first kernel with "cannot open source file cuda/std/tuple", on a machine that
+# started fine and reported device: gpu.
 $toolkit = $env:CUDA_PATH
 if (-not $toolkit) {
     $toolkit = Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
@@ -214,6 +209,8 @@ Get-ChildItem (Join-Path $toolkit 'include') | Where-Object { $_.Name -ne 'cccl'
 $hdrs = (Get-ChildItem (Join-Path $Out 'include'), (Join-Path $Out 'cuda') -Recurse -File | Measure-Object).Count
 Write-Host "  headers: $hdrs files for the run-time kernel compiler"
 
+# A CUDA library here means the delay-load flags stopped working and the
+# directory has grown back to 2.4 GB.
 $cuda = Get-ChildItem $Out -Filter '*.dll' |
     Where-Object { $_.Name -match '^(cu|nv|npp)' }
 if ($cuda) { throw "CUDA libraries in the base bundle: $($cuda.Name -join ', ')" }

@@ -1,9 +1,9 @@
 //! The list of tracks this window has separated.
 //!
-//! One glass panel, a hairline between rows. A finished row opens its folder;
-//! hovering it swaps the detail for "Open folder" and a cross that removes the row
-//! and deletes its stems. On a running row the cross stops the drop. A row whose
-//! folder has been deleted removes itself when asked to open it.
+//! The list is one glass panel with a hairline between rows. Clicking a finished row opens its
+//! folder; hovering it replaces the detail with "Open folder" and a cross that removes the row and
+//! deletes its stems. On a running row, the cross stops the drop. A row whose folder has been
+//! deleted removes itself when clicked.
 
 use std::sync::Arc;
 
@@ -18,10 +18,10 @@ pub const ROW_HEIGHT: f32 = 40.0;
 
 const RADIUS: f32 = 16.0;
 
-/// Rows shown before the list scrolls; the cut row fades out.
+/// The number of rows shown before the list scrolls; the partly visible row fades out.
 pub const MAX_VISIBLE: f32 = 5.75;
 
-/// Hit target and drawn box of the remove control.
+/// The size of the remove control's hit target and drawn box.
 const CROSS_BOX: f32 = 26.0;
 
 /// The list's height for `rows` rows in `max_height`, never under one row.
@@ -129,9 +129,8 @@ fn row(
     let state = item.state();
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
 
-    // Keyed on the source path: an automatic id is a counter that shifts as the
-    // list changes, and an id that moves between frames cannot pair a press with
-    // its release. Two files can share a title, so not the title either.
+    // Key the row on its source path. An automatic id is a counter that shifts as the list changes,
+    // so it cannot pair a press with its release, and two files can share a title.
     let id = ui.id().with(("recent", &item.source));
     let response = ui.interact(rect, id.with("row"), Sense::click());
 
@@ -151,8 +150,8 @@ fn row(
         .animate_bool_with_time(id.with("hover"), touched, 0.12);
     row_backdrop(painter, rect, palette, hover, first, last);
 
-    //  Painted: a `ui.label` registers its own interaction rect on top of the
-    //  row's and takes the pointer from it.
+    // Paint the icon: a `ui.label` would register its own interaction rect on top of the row's and
+    // take the pointer from it.
     let icon = icons::square(pos2(rect.left() + 14.0 + 6.0, rect.center().y), 12.0);
     status_icon(painter, icon, &state, palette, now);
 
@@ -210,8 +209,8 @@ fn row(
             .clicked()
         && let State::Done(finished) = &state
     {
-        // Deleted behind the window's back. Opening nothing and saying nothing
-        // reads as broken, so the row goes instead.
+        // The folder was deleted outside the app. Remove the row, since opening nothing would look
+        // broken.
         if finished.dir.is_dir() {
             reveal(&finished.dir);
         } else {
@@ -264,7 +263,8 @@ fn status_icon(painter: &egui::Painter, icon: Rect, state: &State, palette: &Pal
     }
 }
 
-/// The detail at the row's right end, or "Open folder" on a hovered finished row. Returns its left edge.
+/// The detail at the row's right end, or "Open folder" on a hovered finished row. Returns its left
+/// edge.
 fn meta(
     painter: &egui::Painter,
     rect: Rect,
@@ -327,10 +327,8 @@ fn detail(state: &State) -> String {
     }
 }
 
-/// Open the stems folder in the system's file manager.
-///
-/// A failure is worth a log line and nothing more: the stems are written either
-/// way.
+/// Open the stems folder in the system's file manager. A failure is only logged, since the stems
+/// are written either way.
 fn reveal(dir: &std::path::Path) {
     // The absolute path on macOS: a bundle launched from Finder inherits a minimal
     // PATH.

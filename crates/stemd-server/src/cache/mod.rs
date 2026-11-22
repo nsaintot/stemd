@@ -1,9 +1,9 @@
-//! Separated pieces on disk, each one encoded and ready to send as it is.
+//! The cache of separated stems on disk, each piece encoded and ready to send as it is.
 //!
 //! ```text
 //! <root>/<model_id>/<type>/<track>/<stem>/<k>.<ext>
 //! <root>/<model_id>/<type>/<track>/<stem>.<ext>       the whole stem, see [`crate::whole`]
-//! <root>/<model_id>/<type>/<track>/track.json         length and grid, see [`TrackInfo`]
+//! <root>/<model_id>/<type>/<track>/track.json         the length and piece grid, see [`TrackInfo`]
 //! ```
 //!
 //! | Level   | Example                                        |
@@ -13,28 +13,28 @@
 //! | `track` | the 24-hex track id, see [`crate::ident::track_id`] |
 //! | `k`     | piece index, four digits                       |
 //!
-//! The one cache of separated stems, for sessions, jobs and drops alike. A
-//! piece is written once its track's whole upload has been hashed, so the track
-//! id in the path is always the server's own. The root survives restarts, since
-//! a path names everything its bytes depend on. Once a stem is stored whole,
-//! its pieces are deleted, and ranges are read from the whole file. Once
-//! every piece of a track directory is stored, a background thread stores each
-//! stem whole. A job stores its stems whole at once.
+//! Sessions, jobs and drops share this one cache. A piece is written only after the track's whole
+//! upload has been hashed, so the track id in the path is always the server's own. The root
+//! survives restarts, since each path names everything its bytes depend on.
 //!
-//! A track directory is whole when every stem in it is stored whole, else
-//! partial. A `.used` file in it records its last use. [`Rules`] decide what
-//! goes, skipping a track in use: one an open session plays, or a job result
-//! not fully fetched within [`Rules::unfetched_ttl`].
+//! Once every piece of a track directory is stored, a background thread stores each stem as one
+//! whole file and deletes its pieces; ranges are then read from the whole file. A job stores its
+//! stems whole at once.
+//!
+//! A track directory is whole when every stem in it is stored whole, and partial otherwise. A
+//! `.used` file in it records its last use. [`Rules`] decide which tracks are deleted, and skip a
+//! track in use: one that an open session plays, or a job result that was not fully fetched within
+//! [`Rules::unfetched_ttl`].
 //!
 //! | Rule | |
 //! | --- | --- |
 //! | partial, unused for `partial_max_age` | deleted |
 //! | whole, unused for `whole_max_age` | deleted |
-//! | over the budget | partial tracks, oldest first; then whole tracks, least recently used |
+//! | over the budget | partial tracks deleted oldest first, then whole tracks by last use |
 //!
-//! The budget is `max_bytes`, or less when the disk is short of
-//! [`crate::disk::FLOOR`]. The age rules run at start and every
-//! [`CLEAN_EVERY`]; the budget also after each write.
+//! The budget is `max_bytes`, or less when free disk space would drop below [`crate::disk::FLOOR`].
+//! The age rules run at start and every [`CLEAN_EVERY`]; the budget is also applied after each
+//! write.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -50,11 +50,11 @@ use crate::output::{Output, output_index, output_span, piece_span};
 
 /// The file whose modification time is a track directory's last use.
 const USED: &str = ".used";
-/// Directory under the root holding one file per file key, naming its track id.
+/// The directory under the root that holds one file per file key, containing its track id.
 const FILES: &str = ".files";
-/// The file in a track directory a job writes its [`Separation`] to.
+/// The file in a track directory that a job writes its [`Separation`] to.
 const SEPARATION: &str = ".separation.json";
-/// The lock file in the root, which emptying the cache keeps.
+/// The lock file in the root, which emptying the cache leaves in place.
 pub const LOCK_FILE: &str = "stemd.lock";
 
 /// How often the age rules run.
@@ -107,7 +107,7 @@ pub struct Stats {
     pub max_bytes: u64,
 }
 
-/// The track ids open sessions play, which eviction skips.
+/// Returns the track ids that open sessions play, which eviction skips.
 pub type InUse = Box<dyn Fn() -> HashSet<String> + Send + Sync>;
 
 /// True when background consolidation may use the CPU now.
@@ -128,12 +128,13 @@ pub struct TrackInfo {
 }
 
 impl TrackInfo {
-    /// Samples piece `k` covers.
+    /// The samples that piece `k` covers.
     pub fn piece(&self, k: usize) -> std::ops::Range<usize> {
         piece_span(k, self.stride, self.frames)
     }
 
-    /// The whole file of `stem` in the track directory `dir` of `output`, when it holds the whole track.
+    /// The whole file of `stem` in the track directory `dir` of `output`, when that file covers the
+    /// whole track.
     pub fn find_whole(
         &self,
         dir: &Path,
@@ -168,7 +169,7 @@ pub struct Cache {
     bytes: AtomicU64,
     /// Job results, in use until fetched; see [`Hold::held`].
     holds: Mutex<Vec<Weak<dyn Hold>>>,
-    /// Track directories a job is storing its stems in.
+    /// Track directories that a job is storing its stems in.
     writing: Mutex<HashSet<PathBuf>>,
     /// The last track count, and when it was taken.
     counted: Mutex<Option<(Instant, usize)>>,
@@ -181,11 +182,11 @@ pub struct Cache {
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Track directories queued or being stored whole.
     consolidating: Mutex<HashSet<PathBuf>>,
-    /// Tasks for the one consolidation thread, and whether it runs.
+    /// Tasks for the single consolidation thread, and whether that thread is running.
     tasks: Mutex<(VecDeque<Consolidation>, bool)>,
     /// Track directories that failed to be stored whole, and when.
     failed: Mutex<HashMap<PathBuf, Instant>>,
-    /// One lock per track directory a conversion is writing.
+    /// One lock per track directory that a conversion is writing.
     converting: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Numbers staged files so two writers never share one.
     staged: AtomicU64,
@@ -265,7 +266,7 @@ impl Cache {
         holds.push(weak);
     }
 
-    /// Keep `track_dir` while the guard lives, as a job stores its stems there.
+    /// Keep `track_dir` from deletion while the guard lives, as a job stores its stems there.
     pub fn writing(&self, track_dir: &Path) -> Writing<'_> {
         let _held = self.lock.lock();
         self.writing.lock().insert(track_dir.to_owned());
@@ -281,7 +282,7 @@ impl Cache {
         self.publish_counted(&track_dir.join(SEPARATION), &bytes)
     }
 
-    /// What the job that stored `track_dir` recorded, if a job did.
+    /// The [`Separation`] recorded by the job that stored `track_dir`, if a job stored it.
     pub fn separation(track_dir: &Path) -> Option<Separation> {
         let bytes = std::fs::read(track_dir.join(SEPARATION)).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -292,7 +293,8 @@ impl Cache {
         *self.in_use.lock() = Some(in_use);
     }
 
-    /// Set when background consolidation may run. Without one it runs at once.
+    /// Set the gate that decides when background consolidation may run. Without a gate, it runs at
+    /// once.
     pub fn set_gate(&self, gate: Gate) {
         *self.gate.lock() = Some(gate);
     }
@@ -350,7 +352,7 @@ impl Cache {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// Where a verified track's pieces of one type live.
+    /// The directory of a verified track's pieces of one type.
     pub fn verified_dir(&self, model_id: &str, type_dir: &str, track: &str) -> PathBuf {
         self.root.join(model_id).join(type_dir).join(track)
     }
@@ -408,7 +410,7 @@ impl Cache {
         Ok(())
     }
 
-    /// The directory the pieces live in.
+    /// The cache root.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -422,7 +424,7 @@ impl Cache {
 }
 
 impl Cache {
-    /// Write `bytes` to a `.part` file of its own beside `path`, and return it.
+    /// Write `bytes` to a new `.part` file next to `path`, and return the `.part` file's path.
     fn stage(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         let n = self.staged.fetch_add(1, Ordering::Relaxed);
         let mut staged = path.as_os_str().to_owned();

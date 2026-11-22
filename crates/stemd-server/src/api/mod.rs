@@ -1,4 +1,4 @@
-//! HTTP surface.
+//! The HTTP routes for health, jobs, logs and filters.
 //!
 //! ```text
 //! GET    /v2/health                     runtime, model, queue and cache state
@@ -13,10 +13,10 @@
 //! GET    /v2/filters/{id}               a stored filter's summary
 //! ```
 //!
-//! Upload is raw PCM, no decode/encode
+//! Uploads are raw PCM, so the server decodes no files.
 //!
-//! Nothing here deletes stems: `DELETE` drops a handle, and the two rules in
-//! [`crate::cache`] are the only things that free disk.
+//! No handler deletes stems: `DELETE` drops a handle, and only the rules in [`crate::cache`] free
+//! disk space.
 
 use std::sync::Arc;
 
@@ -61,7 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// 503 for every request while the server is turned off in the window.
+/// Answer 503 to every request while the server is turned off in the window.
 async fn refuse_when_off(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,

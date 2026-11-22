@@ -1,4 +1,4 @@
-//! Building a separator from a model artefact on disk.
+//! Builds a separator from a model artefact on disk.
 
 use std::path::Path;
 
@@ -10,19 +10,15 @@ use stemd_core::{
 use super::Preset;
 use crate::precision::Precisions;
 
-/// How a separator reaches the worker: as a recipe, never as a finished model.
-///
-/// MLX weights must be allocated on the thread that will evaluate them. The CUDA
-/// backend keeps its stream registry in thread-local storage, so a model built on
-/// one thread cannot be evaluated on another. Handing over a closure rather than
-/// a built model makes that unrepresentable. See [`stemd_core::mlx`].
+/// How a separator reaches the worker: as a closure that builds it, never as a built model.
+// MLX weights must be allocated on the thread that evaluates them: the CUDA backend keeps its
+// stream registry in thread-local storage, so a model built on one thread cannot run on another.
+// Passing a closure makes that mistake impossible to write. See [`stemd_core::mlx`].
 pub type BuildSeparator = Box<dyn FnOnce() -> Result<Box<dyn Separate>> + Send>;
 
-/// [`build`] as a recipe, for whichever thread is going to run the model.
-///
-/// The arguments are copied rather than borrowed because the closure crosses a
-/// thread boundary. Both callers that install a model, the launch and the switch,
-/// go through here. See [`BuildSeparator`].
+/// [`build`] wrapped in a closure, for the thread that will run the model.
+// The arguments are copied because the closure crosses a thread boundary. Both callers that
+// install a model, the launch and the switch, go through here. See [`BuildSeparator`].
 pub fn builder(
     dir: &Path,
     artefact: &str,
@@ -37,12 +33,10 @@ pub fn builder(
     })
 }
 
-/// Turn a directory and an artefact name into a loaded model.
+/// Load the model for an artefact name in a directory. Reached only through [`builder`].
 ///
-/// Private, and reached only through [`builder`].
-///
-/// Which architecture is decided by the preset rather than by sniffing the file,
-/// because only a preset can say that two artefacts belong together.
+/// The preset decides the architecture, because only a preset can say that two artefacts belong
+/// together.
 fn build(
     dir: &Path,
     artefact: &str,
@@ -59,8 +53,8 @@ fn build(
             precisions.of(families[0]),
             overlap,
         )?)),
-        // Two of the artefact's four models, unchained: chaining the demucs
-        // vocals specialist into the drums half separates worse.
+        // Run two of the artefact's four models side by side: feeding the demucs vocals
+        // specialist's output into the drums half separates worse.
         Some(Preset::Balanced) => Ok(Box::new(HybridSeparator::demucs_specialists(
             dir,
             artefact,

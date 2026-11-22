@@ -26,11 +26,11 @@ or CUDA on NVIDIA.
 
 Stemd is two things in one program:
 
-- **A desktop app.** Drop a file on the window and the stems appear in a
-folder beside it.
+- **A desktop app.** Drop a file on the window and the stems appear in a folder
+  beside it.
 - **A separation server.** Other machines on the network find it by mDNS and
-send it audio over HTTP. A DJ player or a script on a small board can use
-the GPU of the Mac or PC next to it.
+  send it audio over HTTP. A DJ player or a script on a small board can use the
+  GPU of the Mac or PC next to it.
 
 <div align="center">
 
@@ -42,31 +42,33 @@ the GPU of the Mac or PC next to it.
 
 **In the window**
 
-- Drop a track, or click to choose one. Stems land besides the track in `<track>-stems/`.
+- Drop a track, or click to choose one. Stems land beside the track in
+  `<track>-stems/`.
 - Choose the parts: `harmonics`, `vocals` and `drums` by default, or split
-`harmonics` into `bass` and `other`.
-- FLAC, WAV, MP3 or raw PCM output, at 24, 44.1, 48 or 96 kHz.
+  `harmonics` into `bass` and `other`.
+- Stems are written as FLAC, WAV, MP3 or raw PCM, at 24, 44.1, 48 or 96 kHz.
 - In any lossless format the stems sum back to the original track bit for bit.
-- Three presets: Fast, Balanced and Quality. See [Presets](#presets).
+- Three presets trade speed for quality: Fast, Balanced and Quality. See
+  [Presets](#presets).
 - A running or queued drop can be stopped from its row.
-- Built-in updates: Sparkle on macOS, a silent Setup on Windows, a notice on
-Linux.
+- Stemd updates itself through Sparkle on macOS and a silent Setup on Windows,
+  and shows a notice on Linux.
 
 **As a server**
 
-- Plain HTTP on port `8420`: raw PCM in, stems out. The contract is in
-[docs/api.md](docs/api.md).
-- Announces itself over mDNS as `_stemd._tcp`, so a client needs no address.
+- The server speaks plain HTTP on port `8420`: clients send raw PCM and get
+  stems back. The contract is in [docs/api.md](docs/api.md).
+- It announces itself over mDNS as `_stemd._tcp`, so a client needs no address.
 - `--headless` runs it without a window, on a desktop or a server.
-- Sessions separate a track piece by piece around a playhead. A player can
-start on the part under the needle before the whole track is done.
-- One job queue and one cache for drops and clients. A track separated once is
-a cache hit the next time, from a drop or a client.
+- Sessions separate a track piece by piece around a playhead. A player can start
+  on the part under the needle before the whole track is done.
+- Drops and clients share one job queue and one cache. A track separated once is
+  a cache hit the next time, from a drop or a client.
 - `model_id` in `/v2/health` names the exact weights and settings behind the
-stems, so a client can key its own stem cache on it.
-- The server switch in the status bar turns the API off without closing the
-app. The gear beside it opens the settings: the longest track, the port, and
-the cache.
+  stems, so a client can key its own stem cache on it.
+- The server switch in the status bar turns the API off without closing the app.
+  The gear beside it opens the settings: the longest track, the port, and the
+  cache.
 - `stemd-cli` is the reference client:
   ```bash
   stemd-cli path/to/track.wav
@@ -95,7 +97,7 @@ is for running without an installer.
 
 For GPU separation, tick the CUDA box on the last page of the installer, or
 run `install-cuda.cmd` later. It fetches about 1.2 GB of NVIDIA's runtime,
-pinned by digest. Without it Stemd runs on the CPU, much slower.
+pinned by digest. Without it, Stemd runs on the CPU, which is much slower.
 
 **Linux.** Each package carries the CUDA runtime and cuDNN; the NVIDIA driver
 is the only other requirement.
@@ -108,9 +110,9 @@ is the only other requirement.
 | anything else   | `chmod +x stemd-*.AppImage && ./stemd-*.AppImage` |
 
 
-Supported: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 10 and later. The aarch64
-build targets NVIDIA Arm machines such as DGX Spark and Grace Hopper, and
-needs an NVIDIA GPU.
+Supported distributions: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 10 and later.
+The aarch64 build targets NVIDIA Arm machines such as DGX Spark and Grace
+Hopper, and needs an NVIDIA GPU.
 
 ## Presets
 
@@ -122,15 +124,17 @@ needs an NVIDIA GPU.
 | Quality  | stemd RoFormer | 251 MB   | **11.07** | 7.97     | **6.52** | **11.54** | **11.34** | 18x         | 3.6x   |
 
 
-- Parts: SDR in dB, higher is better. Global SDR over the first 12 MUSDB18-HQ
-test tracks, full length, from the shipped server. `drums` is rebuilt from the
-mix, as the window writes it.
-- Speed: times realtime on a warm 64 s clip. The first separation after launch
-takes about twice as long while the GPU kernels compile.
+- The part columns give global SDR in dB, higher is better, over the first 12
+  MUSDB18-HQ test tracks at full length, measured on the shipped server. `drums`
+  is scored as rebuilt from the mix, the way the window writes it.
+- The speed columns give multiples of realtime on a warm 64 s clip. The first
+  separation after launch takes about twice as long while the GPU kernels
+  compile.
 - Fast is the default. It won a listening test on real material against the
-other two.
+  other two.
 
-Method and notes: [docs/evaluation.md](docs/evaluation.md#every-preset-per-part).
+The method and notes are in
+[docs/evaluation.md](docs/evaluation.md#every-preset-per-part).
 
 ## Where things go
 
@@ -142,15 +146,14 @@ Method and notes: [docs/evaluation.md](docs/evaluation.md#every-preset-per-part)
 | cache  | every separation, 8 GB and 30 days by default, set in Settings |
 
 
-Repeating a track already separated returns the cached result: stems are kept
-by track, model and output, and dropped after 30 days unused or when the cache
-is full.
+Separating a track again returns the cached result. Stems are kept by track,
+model and output, and deleted after 30 days unused or when the cache is full.
 
 ## Build from source
 
-Needs `cmake`, Rust 1.89 or later, and a recursive clone. Per-platform
-toolchains, packaging and every flag are in
-[docs/building.md](docs/building.md).
+Building needs `cmake`, Rust 1.89 or later, and a recursive clone.
+[docs/building.md](docs/building.md) covers the per-platform toolchains,
+packaging and every flag.
 
 ```bash
 git clone --recurse-submodules https://github.com/nsaintot/stemd
@@ -180,11 +183,10 @@ The model weights are not covered by either and state their own terms; see the
 `stemd_roformer`, which Quality runs, is CC BY-NC 4.0.
 
 The MP3 encoder is LAME 3.100, which is under the GNU Library General Public
-License version 2 and links statically, so redistributing a built binary carries
-that obligation.
+License version 2 and is linked statically, so redistributing a built binary
+carries the obligations of that license.
 
-`crates/stemd-core/data/mode1_*.bin` are measurements of third-party hardware
-rather than authored code, so the grant above does not purport to cover them.
-They are used for one conversion, 44.1 to 96 kHz, and only when a request asks
-for it, so that a client subtracting stems from its own mix gets the same filter
-on both sides.
+`crates/stemd-core/data/mode1_*.bin` are measurements of third-party hardware.
+The grant above does not purport to cover them. They are used for one
+conversion, 44.1 to 96 kHz, and only when a request asks for it, so that a
+client subtracting stems from its own mix gets the same filter on both sides.

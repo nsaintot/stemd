@@ -1,8 +1,8 @@
-//! mDNS advertisement, via whatever responder the system already runs.
+//! mDNS advertisement through the responder the system already runs.
 //!
-//! A client finds the host by browsing `_stemd._tcp`. This registers with the
-//! system responder rather than running a second one: a system responder answers
-//! indefinitely and handles interface changes, sleep and wake, and name conflicts.
+//! A client finds the host by browsing `_stemd._tcp`. The server registers with the system
+//! responder, which keeps answering and handles interface changes, sleep and wake, and name
+//! conflicts, so stemd runs no responder of its own.
 //!
 //! [`backend`] is chosen at compile time:
 //!
@@ -29,8 +29,8 @@ pub const SERVICE_TYPE: &str = "_stemd._tcp";
 /// destructors never run. `Drop` is the backstop.
 pub struct Advertiser {
     registration: backend::Registration,
-    /// The fully qualified name this is on the network as, which is what the
-    /// system granted rather than what was asked for. See [`Advertiser::start`].
+    /// The fully qualified name the system granted on the network, which can differ from the name
+    /// asked for. See [`Advertiser::start`].
     name: String,
     withdrawn: AtomicBool,
 }
@@ -45,10 +45,8 @@ impl Advertiser {
         props.insert("path", "/v2".to_owned());
         props.insert("features", crate::api::health::FEATURES.join(","));
 
-        // Logged so a discovery failure on a multi-homed host is a one-line
-        // diagnosis rather than a packet capture. Kept out of the ordinary
-        // record because it only means anything once discovery has gone wrong,
-        // and the buffer holds it either way.
+        // Log the interfaces at debug, so a discovery failure on a multi-homed host can be
+        // diagnosed from one line; the log buffer keeps debug lines.
         let addrs = local_addrs();
         if addrs.is_empty() {
             bail!("no non-loopback IPv4 interface to advertise on");
@@ -63,11 +61,8 @@ impl Advertiser {
         );
 
         let registration = backend::register(instance, port, &props, &addrs)?;
-        // The name the system granted, which is not always the one asked for:
-        // mDNS settles a collision by renaming. Logging the request instead of
-        // the grant is how a server that is actually on the network as
-        // `stemd(5)` can report itself as `stemd` for its whole life, and it is
-        // the name a client has to search for.
+        // Log the granted name, which mDNS changes on a collision, such as `stemd(5)` for `stemd`.
+        // Clients search for the granted name.
         let name = registration
             .granted_name()
             .unwrap_or_else(|| full_name(instance));
@@ -81,8 +76,8 @@ impl Advertiser {
 
     /// Withdraw the registration. Idempotent.
     ///
-    /// The responder sends the goodbye packet on our behalf. The backend is asked what
-    /// happened rather than assumed to have succeeded.
+    /// The responder sends the goodbye packet. The backend returns a [`Withdrawal`], which is
+    /// logged.
     pub fn withdraw(&self) {
         if self.withdrawn.swap(true, Ordering::SeqCst) {
             return;
@@ -95,7 +90,7 @@ impl Advertiser {
                  until the record expires"
             ),
             Withdrawal::Pending => {
-                tracing::info!("asked the system to withdraw {full}, not waiting for it")
+                tracing::info!("asked the system to withdraw {full}; not waiting")
             }
         }
     }
@@ -107,11 +102,10 @@ impl Drop for Advertiser {
     }
 }
 
-/// What a withdrawal is known to have done, which is not always what it did.
+/// What is known about a withdrawal's outcome.
 ///
-/// Windows hands the work to the DNS Client service and does not wait for the
-/// answer, so on the way out the honest report is neither success nor failure. On
-/// the Bonjour platforms the other two states are unreachable.
+/// Windows hands the work to the DNS Client service and does not wait for the answer, so the
+/// outcome on exit can be unknown. On the Bonjour platforms, only `Done` occurs.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Withdrawal {
@@ -119,8 +113,7 @@ pub enum Withdrawal {
     Done,
     /// The system refused it, and the reason is in the log above.
     Refused,
-    /// Handed over and not waited for. It will probably happen; nothing here
-    /// will find out.
+    /// Handed to the system without waiting for the result.
     Pending,
 }
 
@@ -133,11 +126,10 @@ fn full_name(instance: &str) -> String {
     format!("{instance}.{SERVICE_TYPE}.local")
 }
 
-/// Do two instance names refer to the same service?
+/// True when two instance names refer to the same service.
 ///
-/// Used on Windows to tell "you got the name you asked for" from "you were
-/// renamed around a collision". DNS names are case-insensitive and the root dot is
-/// optional, so neither difference is a rename.
+/// On Windows, this tells a granted name apart from a rename after a collision. DNS names are
+/// case-insensitive and the root dot is optional, so neither difference counts as a rename.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn same_name(a: &str, b: &str) -> bool {
     a.trim_end_matches('.')
@@ -167,10 +159,9 @@ fn first_ipv4(addrs: &[(String, IpAddr)]) -> Option<Ipv4Addr> {
     })
 }
 
-/// DNS-SD TXT encoding: each entry is a length byte then `key=value`.
+/// Encode TXT entries for DNS-SD: each entry is a length byte followed by `key=value`.
 ///
-/// The wire form, which is what Bonjour takes. Windows takes the pairs
-/// unencoded and does this itself.
+/// Bonjour takes this wire form; Windows takes the pairs unencoded and encodes them itself.
 #[cfg_attr(windows, allow(dead_code))]
 fn encode_txt(props: &HashMap<&str, String>) -> Vec<u8> {
     let mut out = Vec::new();
@@ -179,8 +170,8 @@ fn encode_txt(props: &HashMap<&str, String>) -> Vec<u8> {
     keys.sort_unstable();
     for key in keys {
         let entry = format!("{key}={}", props[key]);
-        // A single entry cannot exceed 255 bytes; ours are far shorter, but
-        // truncating silently would be worse than skipping loudly.
+        // A single entry cannot exceed 255 bytes. Ours are far shorter; an entry that is too long
+        // is skipped with a warning.
         match u8::try_from(entry.len()) {
             Ok(len) => {
                 out.push(len);
@@ -193,11 +184,9 @@ fn encode_txt(props: &HashMap<&str, String>) -> Vec<u8> {
 }
 
 /// Bonjour, on macOS and on Linux through avahi-compat.
-///
-/// `DNSServiceRegister` is in libSystem on macOS. On Linux it comes from
-/// `libdns_sd`, `libavahi-compat-libdnssd-dev`, a shim over avahi rather than a
-/// second responder, and neither call used here is among the ones it stubs. The
-/// registration lasts as long as the `DNSServiceRef`.
+// `DNSServiceRegister` is in libSystem on macOS. On Linux it comes from `libdns_sd` (package
+// `libavahi-compat-libdnssd-dev`), a shim over avahi that runs no responder of its own and
+// implements both calls used here. The registration lasts as long as the `DNSServiceRef`.
 #[cfg(unix)]
 mod backend {
     use std::collections::HashMap;
@@ -278,10 +267,9 @@ mod backend {
     }
 
     impl Registration {
-        /// Always `None`: the name Bonjour settled on arrives at the registration
-        /// callback, and this passes a null one, because wanting the callback would mean
-        /// pumping a loop for the life of the process. The caller falls back to the name
-        /// it asked for.
+        /// Always `None`: Bonjour reports the granted name to the registration callback, and this
+        /// passes a null callback to avoid pumping a run loop for the life of the process. The
+        /// caller falls back to the name it asked for.
         pub fn granted_name(&self) -> Option<String> {
             None
         }
@@ -289,7 +277,7 @@ mod backend {
         /// Deallocating the ref closes the connection to the responder, which sends the
         /// goodbye packet.
         ///
-        /// Always [`Withdrawal::Done`]: the call returns nothing and cannot fail. The
+        /// Always [`super::Withdrawal::Done`]: the call returns nothing and cannot fail. The
         /// three-way answer is for Windows.
         pub fn withdraw(&self) -> super::Withdrawal {
             // SAFETY: called at most once, guarded by `Advertiser::withdrawn`.
@@ -301,14 +289,13 @@ mod backend {
 
 /// Windows, through the DNS Client service.
 ///
-/// A different shape from Bonjour in three ways, which is why this is not a few
-/// `cfg` lines inside the module above. It is asynchronous: `DnsServiceRegister`
-/// returns `DNS_REQUEST_PENDING` and the outcome arrives on a callback the system
-/// runs on its own thread. It takes the service instance as an object built by
-/// `DnsServiceConstructInstance`, TXT pairs unencoded, rather than as separate
-/// arguments and a wire-format blob. And the registration is owned by the request
-/// structure rather than by a handle, so that structure has to outlive it and is
-/// boxed for exactly that.
+/// This API differs from Bonjour in three ways, so it has its own module:
+///
+/// - It is asynchronous: `DnsServiceRegister` returns `DNS_REQUEST_PENDING`, and the outcome
+///   arrives on a callback that the system runs on its own thread.
+/// - It takes the service instance as an object built by `DnsServiceConstructInstance`, with TXT
+///   pairs unencoded.
+/// - The request structure owns the registration, so the structure must outlive it and is boxed.
 #[cfg(windows)]
 mod backend {
     use std::collections::HashMap;
@@ -327,24 +314,21 @@ mod backend {
 
     /// How long to wait for the system to confirm a registration.
     ///
-    /// Local IPC to a service on the same machine, so an upper bound on a fast path
-    /// rather than a budget. It happens once, at startup.
+    /// The call is local IPC to a service on the same machine, so this only bounds a fast path. It
+    /// runs once, at startup.
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
 
-    /// How long to wait on the way out, which is a different question.
+    /// How long to wait for a withdrawal on the way out.
     ///
-    /// The work belongs to the DNS Client service, in another process, which our exit
-    /// does not interrupt, so the wait buys only a truthful log line.
-    /// `DnsServiceDeRegister` can take seconds and then report a failure nothing here
-    /// can act on.
+    /// The DNS Client service does the work in another process, which our exit does not interrupt,
+    /// so the wait only makes the log line accurate. `DnsServiceDeRegister` can take seconds and
+    /// then report a failure that nothing here can act on.
     const WITHDRAW_TIMEOUT: Duration = Duration::from_millis(250);
 
-    /// `DNS_SERVICE_REGISTER_REQUEST`. Must outlive the registration: the API keeps
-    /// the pointer, and `DnsServiceDeRegister` is handed one of these again rather
-    /// than a handle.
+    /// `DNS_SERVICE_REGISTER_REQUEST`. It must outlive the registration: the API keeps the pointer,
+    /// and `DnsServiceDeRegister` takes this structure again in place of a handle.
     ///
-    /// Most fields are written for the ABI and never read back, which is what
-    /// `dead_code` sees; the layout is the point.
+    /// Most fields are written for the ABI and never read back, which `dead_code` flags.
     #[repr(C)]
     #[allow(dead_code)]
     struct RegisterRequest {
@@ -357,10 +341,9 @@ mod backend {
         unicast_enabled: i32,
     }
 
-    /// `DNS_SERVICE_CANCEL`. Only ever passed as null here: nothing cancels a
-    /// registration mid-flight; it is withdrawn once it exists. Named rather
-    /// than erased to `c_void` so the two calls below read as their documented
-    /// signatures.
+    /// `DNS_SERVICE_CANCEL`, always passed as null here: a registration is withdrawn once it exists
+    /// and is never cancelled while pending. The type is named so the two calls below match their
+    /// documented signatures.
     #[repr(C)]
     #[allow(dead_code)]
     struct ServiceCancel {
@@ -370,9 +353,8 @@ mod backend {
     type CompletionFn =
         unsafe extern "system" fn(status: u32, context: *mut c_void, instance: *mut c_void);
 
-    // `DNS_SERVICE_INSTANCE` is deliberately opaque. It is constructed and freed
-    // by the library and nothing here reads a field of it, so declaring its
-    // layout would buy nothing and risk getting it wrong.
+    // `DNS_SERVICE_INSTANCE` stays opaque: the library constructs and frees it, and nothing here
+    // reads its fields except the first, so declaring its layout would only risk an error.
     #[link(name = "dnsapi")]
     unsafe extern "system" {
         fn DnsServiceConstructInstance(
@@ -395,11 +377,10 @@ mod backend {
         fn DnsServiceDeRegister(request: *mut RegisterRequest, cancel: *mut ServiceCancel) -> i32;
     }
 
-    /// What the system reported, once it reported it.
+    /// What the system reported.
     ///
-    /// The instance travels as an integer rather than a pointer because it crosses
-    /// from a thread the system owns and `*mut c_void` is not `Send`. Zero when the
-    /// API handed over nothing.
+    /// The instance is stored as an integer, since it crosses from a system thread and a raw
+    /// pointer is not `Send`. It is zero when the API passed no instance.
     #[derive(Clone, Copy)]
     struct Outcome {
         status: u32,
@@ -454,14 +435,12 @@ mod backend {
     }
 
     /// The completion callback for both register and deregister.
-    ///
-    /// Runs on a thread the system owns: record the status, wake the caller, return.
-    /// Nothing in it may panic, because unwinding out of an `extern "system"` frame
-    /// aborts the process.
-    ///
-    /// The instance it is handed describes the service that was registered, which
-    /// after a collision is not the one asked for, so it is passed along rather than
-    /// dropped. It is the caller's to free and deliberately is not: one per process.
+    // It runs on a system thread: it records the status, wakes the caller and returns. Nothing in
+    // it may panic, because unwinding out of an `extern "system"` frame aborts the process.
+    //
+    // The instance it receives describes the registered service, which after a collision has a
+    // different name, so it is passed to the caller. The caller does not free it, since there is
+    // one per process.
     unsafe extern "system" fn on_complete(
         status: u32,
         context: *mut c_void,
@@ -512,8 +491,7 @@ mod backend {
         props: &HashMap<&str, String>,
         addrs: &[(String, IpAddr)],
     ) -> Result<Registration> {
-        // Sorted, for the same reason `encode_txt` sorts: a record that is
-        // byte-stable across runs is one fewer thing to explain in a capture.
+        // Sorted, as in `encode_txt`, so the record is byte-stable across runs.
         let mut keys: Vec<&&str> = props.keys().collect();
         keys.sort_unstable();
         let key_bufs: Vec<Vec<u16>> = keys.iter().map(|k| wide(k)).collect();
@@ -523,17 +501,16 @@ mod backend {
 
         let name = wide(&super::full_name(instance));
 
-        // Bonjour defaults the host to the machine's own name; here it has to be
-        // said, and said as a `.local` name, because that is the name the A
-        // record below is being published under.
+        // Bonjour defaults the host to the machine's own name. Here it must be given, as a `.local`
+        // name, because the A record below is published under that name.
         let host = wide(&format!("{}.local", hostname()));
 
-        //  And the address itself. `IP4_ADDRESS` is an `in_addr`, so network byte order,
-        //  which is what `from_ne_bytes` of the octets leaves in memory.
+        // The address itself. `IP4_ADDRESS` is an `in_addr`, in network byte order, which is what
+        // `from_ne_bytes` of the octets leaves in memory.
         //
-        //  One A record, on whichever interface `if_addrs` enumerates first: a host with a
-        //  Hyper-V switch, a WSL adapter or a Docker bridge can publish one no client on
-        //  the real network can reach.
+        // This publishes one A record, on whichever interface `if_addrs` lists first; on a host
+        // with a Hyper-V switch, a WSL adapter or a Docker bridge, that address may be unreachable
+        // from the real network.
         let chosen = super::first_ipv4(addrs);
         if let Some(v4) = chosen {
             tracing::info!(
@@ -593,13 +570,13 @@ mod backend {
             Some(outcome) if outcome.status == 0 => {
                 let registered = outcome.instance as *mut c_void;
                 let asked = super::full_name(instance);
-                //  The name asked for is not always the name granted: mDNS settles a collision by
-                //  renaming, and the callback's instance is the only place the new name appears.
-                //  Deregistering by the name we asked for fails with 9701 and the entry stays up
-                //  for the next run to collide with.
+                // The granted name can differ from the requested one, because mDNS settles a
+                // collision by renaming, and the callback's instance is the only place the new name
+                // appears. Deregistering by the requested name fails with 9701 and leaves the entry
+                // up for the next run to collide with.
                 match unsafe { instance_name(registered) } {
                     Some(granted) if !super::same_name(&granted, &asked) => tracing::warn!(
-                        "registered as {granted}, not {asked}: something already \
+                        "mDNS name: expected {asked}, got {granted}; something already \
                          holds that name, most likely a previous run that did not \
                          withdraw. Stale entries belong to the DNS Client service \
                          and last until it restarts"
@@ -631,9 +608,8 @@ mod backend {
             unsafe { instance_name(self.registered) }
         }
 
-        /// The instance a withdrawal has to name: the one the system said it registered,
-        /// not the one we asked it to. Falling back to the constructed instance covers a
-        /// success reported with no instance attached.
+        /// The instance a withdrawal must name: the one the system reported registering. The
+        /// constructed instance is the fallback when a success arrives with no instance attached.
         fn withdrawable(&self) -> *mut c_void {
             if self.registered.is_null() {
                 self.constructed
@@ -642,11 +618,9 @@ mod backend {
             }
         }
 
-        /// Deregistering is as asynchronous as registering, and takes a request
-        /// structure describing the instance rather than a handle to it, so
-        /// this builds a second one around the registered instance, with its own
-        /// rendezvous, rather than mutating the one the registration is still
-        /// using.
+        /// Deregistering is asynchronous too, and takes a request structure that describes the
+        /// instance, so this builds a second request around the registered instance, with its own
+        /// rendezvous, and leaves the registration's request untouched.
         pub fn withdraw(&self) -> super::Withdrawal {
             let completion = Arc::new(Completion::default());
             let request = Box::into_raw(Box::new(RegisterRequest {
@@ -684,10 +658,9 @@ mod backend {
                     tracing::warn!("DnsServiceDeRegister completed with {}", outcome.status);
                     super::Withdrawal::Refused
                 }
-                // Still in the service's hands. The request and its context are
-                // leaked deliberately: the callback may yet fire, and there is
-                // no later at which this process could free them, since the next
-                // thing it does is `_exit`.
+                // The service still holds the request. The request and its context are leaked on
+                // purpose: the callback may still fire, and the process has no later point to free
+                // them, since it calls `_exit` next.
                 None => {
                     let _ = Box::leak(unsafe { Box::from_raw(request) });
                     tracing::debug!(
@@ -711,7 +684,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn txt_entries_are_length_prefixed_and_sorted() {
+    fn the_txt_entries_are_length_prefixed_and_sorted() {
         let mut props = HashMap::new();
         props.insert("b", "2".to_owned());
         props.insert("a", "1".to_owned());
@@ -736,8 +709,8 @@ mod tests {
         ));
     }
 
-    /// The case the Windows backend warns about, and the reason it can: the
-    /// suffix mDNS adds to settle a collision has to read as a different name.
+    /// The rename that the Windows backend warns about: the suffix mDNS adds to settle a collision
+    /// must count as a different name.
     #[test]
     fn the_name_mdns_grants_after_a_collision_is_a_rename() {
         assert!(!same_name(

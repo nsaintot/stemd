@@ -32,7 +32,7 @@ fn spans_merge_what_touches_and_cover_only_within_one_span() {
 }
 
 fn grid() -> Grid {
-    // Segments of 1000 every 750 samples.
+    // Segments of 1000 samples, starting every 750 samples.
     Grid::new(100_000, 1000, 0.25).expect("a grid")
 }
 
@@ -367,7 +367,7 @@ fn a_read_at_another_rate_takes_nothing_from_before_the_ready_span() {
     let track = session.track();
     let mix = audio(frames, 0.01);
     track.upload(0, &mix).expect("upload");
-    // From `ready` on the parts sum to the mix, so the derived part is silent there.
+    // From `ready` onward, the parts sum to the mix, so the derived part is silent there.
     let half = Audio::new(
         mix.data
             .iter()

@@ -1,12 +1,11 @@
 # Model artefacts
 
-This is what the hosting repository's README said before the source moved into
-it. It describes the `models-v1` tag, which is superseded: the shipping
-artefacts are safetensors under `models-v2` and `models-v3`, and their digests are pinned in
+This page keeps the README of the former model-hosting repository. It describes
+the `models-v1` tag, which is superseded: the shipping artefacts are safetensors
+under `models-v2` and `models-v3`, and their digests are pinned in
 `crates/stemd-server/src/models/preset.rs`.
 
-It is kept because the provenance and licence position below apply to every
-release, not only to the tag it was written for.
+The provenance and licence position below apply to every release.
 
 ---
 
@@ -25,15 +24,16 @@ Two TorchScript artefacts traced for Apple MPS, each with its manifest:
 | `hdemucs_mmi_mps.json` | | 296 B | `00b131cc07b352f977c005485b991502d13f8c05a44813c3b3fe6169e2a18688` |
 
 stemd pins these digests and verifies them before putting a download in place,
-so replacing an asset here will make existing installs fail loudly rather than
-quietly load something else. Publish a new tag instead of editing this one.
+so replacing an asset here makes existing installs fail with a digest error.
+Publish a new tag instead of editing this one.
 
-The artefacts are traced for MPS and will not load on CPU.
+The artefacts are traced for MPS and do not load on the CPU.
 
 ## Provenance
 
-Traced from [facebookresearch/demucs](https://github.com/facebookresearch/demucs)
-pretrained models: `htdemucs` (v4) and `hdemucs_mmi`.
+The artefacts are traced from the
+[facebookresearch/demucs](https://github.com/facebookresearch/demucs) pretrained
+models `htdemucs` (v4) and `hdemucs_mmi`.
 
 The demucs **code** is MIT. The pretrained **weights** are distributed
 separately from that repository and carry no explicit licence: the question was

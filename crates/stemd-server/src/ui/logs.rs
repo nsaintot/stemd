@@ -1,7 +1,7 @@
 //! The log section.
 //!
-//! The lines of the [`LogBuffer`](crate::logbuf::LogBuffer) that `GET /v2/logs`
-//! serves. Collapsed by default.
+//! It shows the lines of the [`LogBuffer`](crate::logbuf::LogBuffer) that `GET /v2/logs` serves,
+//! and is collapsed by default.
 
 use eframe::egui::{self, Color32, Sense, Stroke, pos2, vec2};
 
@@ -14,12 +14,11 @@ use super::widgets::{self, Pill};
 /// How tall the log area gets before it scrolls.
 pub const VISIBLE_HEIGHT: f32 = 168.0;
 
-/// Log rows are set tight: this is a tail you scan, and the useful thing is how
-/// many lines fit at once.
+/// The log row height, set tight so that many lines fit at once.
 const ROW: f32 = 8.0;
 const CONTROL_TEXT: f32 = 12.0;
 const CONTROL_HEIGHT: f32 = 26.0;
-/// Most recent matching lines drawn. Older ones stay in the buffer and the API.
+/// The number of most recent matching lines drawn. Older lines stay in the buffer and in the API.
 const SHOWN: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +52,7 @@ impl LevelFilter {
 pub struct View {
     pub min_level: LevelFilter,
     pub filter: String,
-    /// Layout pass the pane was last drawn in, to tell when it has just opened.
+    /// The layout pass the pane was last drawn in, which tells when the pane has just opened.
     drawn_at: u64,
 }
 
@@ -67,8 +66,8 @@ impl Default for View {
     }
 }
 
-/// Draw the log section. Returns true if the buffer should be emptied: the
-/// caller owns it, so the button reports rather than acts.
+/// Draw the log section. Returns true when the buffer should be emptied; the caller owns the
+/// buffer, so the button only reports the click.
 #[must_use]
 pub fn show(
     ui: &mut egui::Ui,
@@ -202,7 +201,7 @@ fn level_menu(ui: &mut egui::Ui, palette: &Palette, view: &mut View) {
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
-/// Buffered lines passing the level and text filters.
+/// The buffered lines that pass the level and text filters.
 fn visible_lines(view: &View, lines: &[LogLine]) -> Vec<LogLine> {
     let needle = view.filter.to_lowercase();
     lines
@@ -231,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_level_filter_is_a_floor_not_an_exact_match() {
+    fn the_level_filter_shows_that_level_and_above() {
         assert!(LevelFilter::All.admits("TRACE"));
         assert!(LevelFilter::Info.admits("INFO") && LevelFilter::Info.admits("ERROR"));
         assert!(!LevelFilter::Info.admits("DEBUG"));
@@ -264,8 +263,8 @@ mod tests {
         assert_eq!(seeking("nothing matches this"), 0);
     }
 
-    /// The two filters have to compose, or narrowing by level would be undone
-    /// by a text filter that matches more.
+    /// The level and text filters compose: a text filter that matches more lines does not undo the
+    /// level filter.
     #[test]
     fn the_level_and_text_filters_both_apply() {
         let lines = [

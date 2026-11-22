@@ -1,12 +1,11 @@
-//! The spectrogram demucs works on, which is not quite a textbook STFT.
+//! The spectrogram demucs works on, which differs slightly from a textbook STFT.
 //!
-//! Two layers, and they stay distinct. [`Stft`] is the ordinary transform:
-//! periodic Hann, centred, unnormalised, the convention `torch.stft` uses.
-//! [`Spectral`] pads by three half-hops, drops the top frequency bin, and keeps
-//! only the frames corresponding to the input, so a round trip is lossy by
+//! There are two layers, kept distinct. [`Stft`] is the ordinary transform: periodic Hann, centred,
+//! unnormalised, as `torch.stft` does it. [`Spectral`] pads by three half-hops, drops the top
+//! frequency bin, and keeps only the frames that match the input, so a round trip is lossy by
 //! construction.
 //!
-//! Every constant here is dictated by the traced model.
+//! The traced model dictates every constant here.
 
 use anyhow::{Result, bail};
 use mlx_rs::Array;
@@ -21,14 +20,13 @@ const fn div_ceil(a: i32, b: i32) -> i32 {
 /// Window and transform size for every demucs v4 artefact.
 pub const N_FFT: i32 = 4096;
 
-/// Distance between frames. `n_fft / 4`.
+/// The distance between frames, `n_fft / 4`.
 pub const HOP: i32 = 1024;
 
 /// A periodic Hann window of length `n`.
 ///
-/// Periodic, not symmetric: the window is `0.5 - 0.5*cos(2*pi*i/n)` over `n`
-/// points rather than `n - 1`, which is what makes overlapping frames sum flat.
-/// `torch.hann_window` defaults to the same.
+/// The window is periodic: `0.5 - 0.5*cos(2*pi*i/n)` over `n` points, which makes overlapping
+/// frames sum flat; a symmetric window would use `n - 1`. `torch.hann_window` defaults to the same.
 fn hann(n: i32) -> Array {
     let values: Vec<f32> = (0..n)
         .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos())
@@ -38,9 +36,9 @@ fn hann(n: i32) -> Array {
 
 /// Reflect padding along the last axis.
 ///
-/// mlx-rs offers `PadMode::Constant` and `PadMode::Edge` and nothing else, so this
-/// is built from gathers. Mirrors without repeating the edge sample: `[1,2,3,4]`
-/// padded by two is `[3,2,1,2,3,4,3,2]`, which is what `torch` does.
+/// mlx-rs offers only `PadMode::Constant` and `PadMode::Edge`, so this is built from gathers. It
+/// mirrors without repeating the edge sample: `[1,2,3,4]` padded by two is `[3,2,1,2,3,4,3,2]`, as
+/// in `torch`.
 pub fn reflect_pad(x: &Array, left: i32, right: i32) -> Result<Array> {
     let n = *x.shape().last().expect("an array has a last axis");
     if left >= n || right >= n {
@@ -77,9 +75,8 @@ impl Stft {
 
     /// `[..., T] -> [..., F, N]`, with `F = n_fft/2 + 1`.
     ///
-    /// Framing is a strided view rather than a loop over frames: a four-minute
-    /// track is ten thousand frames, and ten thousand slices would dominate the
-    /// transform they were meant to feed.
+    /// Framing is a strided view, with no loop over frames: a four-minute track is ten thousand
+    /// frames, and ten thousand slices would cost more than the transform they feed.
     pub fn forward(&self, x: &Array, centred: bool) -> Result<Array> {
         let x = if centred {
             reflect_pad(x, self.n_fft / 2, self.n_fft / 2)?
@@ -96,8 +93,8 @@ impl Stft {
         }
         let frames = (samples - self.n_fft) / self.hop + 1;
 
-        // Flattened to [rows, T] so the stride arithmetic has one leading axis
-        // to step over, whatever the caller's batch and channel layout was.
+        // Flatten to [rows, T] so the stride arithmetic has one leading axis to step over, whatever
+        // the caller's batch and channel layout.
         let rows: i32 = shape[..shape.len() - 1].iter().product();
         let flat = x.reshape(&[rows, samples])?;
         let framed = ops::as_strided(
@@ -110,8 +107,7 @@ impl Stft {
         let windowed = ops::multiply(&framed, &self.window)?;
         let spectrum = mlx_rs::fft::rfft(&windowed, None, -1)?;
 
-        // Back to the caller's layout, with frequency before time as demucs
-        // expects: [..., F, N].
+        // Restore the caller's layout, with frequency before time as demucs expects: [..., F, N].
         let bins = self.n_fft / 2 + 1;
         let mut out_shape = shape[..shape.len() - 1].to_vec();
         out_shape.push(frames);
@@ -123,9 +119,8 @@ impl Stft {
 
     /// `[..., F, N] -> [..., length]`, undoing [`Self::forward`].
     ///
-    /// Overlap-add with the usual window-square normalisation, which is
-    /// accumulated rather than assumed flat: at the ends, and wherever frames
-    /// have been dropped or added, it is not.
+    /// Overlap-add with the usual window-square normalisation, accumulated and never assumed flat:
+    /// it is not flat at the ends, or wherever frames have been dropped or added.
     pub fn inverse(&self, z: &Array, length: i32, centred: bool) -> Result<Array> {
         let shape = z.shape().to_vec();
         let (bins, frames) = (shape[shape.len() - 2], shape[shape.len() - 1]);
@@ -172,9 +167,9 @@ impl Spectral {
 
     /// `[B, C, T] -> [B, C, F-1, ceil(T/hop)]`, complex.
     ///
-    /// The top frequency bin is dropped and the first two frames are skipped,
-    /// both because the traced model expects exactly that shape. The result is
-    /// not invertible on its own: see [`Self::inverse`].
+    /// The top frequency bin is dropped and the first two frames are skipped, because the traced
+    /// model expects exactly that shape. The result cannot be inverted on its own: see
+    /// [`Self::inverse`].
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let samples = *x.shape().last().expect("an array has a last axis");
         let frames = div_ceil(samples, self.hop);
@@ -191,8 +186,7 @@ impl Spectral {
     /// `[..., F-1, N] -> [..., length]`, undoing [`Self::forward`]'s trimming first: a
     /// zero bin back on top, and two frames of padding at each end.
     ///
-    /// Rank-agnostic because it is called with both `[B, C, F, N]` and
-    /// `[B, S, C, F, N]`.
+    /// It accepts any rank because it is called with both `[B, C, F, N]` and `[B, S, C, F, N]`.
     pub fn inverse(&self, z: &Array, length: i32) -> Result<Array> {
         let mut widths = vec![(0, 0); z.ndim()];
         let n = widths.len();
@@ -209,8 +203,8 @@ impl Spectral {
     /// Inverse transform by overlap-add, with the usual window-square
     /// normalisation so overlapping frames do not sum to a ripple.
     ///
-    /// The window-square sum is accumulated rather than assumed flat: with the
-    /// frames this drops and re-pads at the ends, it is not.
+    /// The window-square sum is accumulated: with the frames this drops and re-pads at the ends, it
+    /// is not flat.
     fn istft(&self, z: &Array, length: i32) -> Result<Array> {
         if N_FFT % self.hop != 0 {
             bail!("a hop of {} does not divide {N_FFT} evenly", self.hop);
@@ -243,22 +237,19 @@ impl Spectral {
     }
 }
 
-/// Sum `[rows, frames, n_fft]` back into `[rows, width]`, each frame `hop`
-/// further along than the last.
-///
-/// A handful of reshapes, not a loop. Frames `ceil(n_fft / hop)` apart cannot
-/// overlap, so gathering every k-th one and laying them end to end places them all
-/// at once, and the whole overlap-add is k of those summed at one-hop offsets.
-///
-/// End to end is only right when the hop divides the window. demucs hops a quarter
-/// of a 4096-point window and it does; RoFormer hops 441 of 2048 and it does not,
-/// leaving a 157-sample gap between frames five apart. Widening each frame's slot
-/// to `k * hop` restores the spacing and costs nothing when the slot is already
-/// the window.
-///
-/// The obvious spelling, walking the frames and placing each into a zeroed buffer,
-/// allocates a whole-segment tensor per frame, which measured at forty per cent of
-/// the model's entire forward pass.
+/// Sum `[rows, frames, n_fft]` back into `[rows, width]`, each frame `hop` further along than the
+/// last. It uses a handful of reshapes and no loop.
+// Frames `ceil(n_fft / hop)` apart cannot overlap, so gathering every k-th one and laying them end
+// to end places them all at once, and the whole overlap-add is k of those summed at one-hop
+// offsets.
+//
+// Laying frames end to end is right only when the hop divides the window. demucs hops a quarter of
+// a 4096-point window, which divides; RoFormer hops 441 of 2048, which does not, leaving a
+// 157-sample gap between frames five apart. Widening each frame's slot to `k * hop` restores the
+// spacing and costs nothing when the slot already equals the window.
+//
+// Do not retry the per-frame form, which places each frame into a zeroed buffer: it allocates a
+// whole-segment tensor per frame and takes forty per cent of the model's forward pass.
 fn overlap_add(frames_time: &Array, hop: i32, width: i32) -> Result<Array> {
     let s = frames_time.shape().to_vec();
     let (rows, frames, n_fft) = (s[0], s[1], s[2]);
@@ -320,42 +311,35 @@ fn slice_last(x: &Array, start: i32, end: i32) -> Result<Array> {
 }
 
 /// Drop the phase of the DC bin, which the transform is defined to ignore.
-///
-/// `irfft` reads `n/2 + 1` complex bins and writes `n` real samples, so the
-/// imaginary parts of DC and Nyquist are two degrees of freedom the output cannot
-/// carry. A correct inverse discards them. MLX's CUDA kernel does not, and folds
-/// them into the samples instead.
-///
-/// The affected shapes look like kernel selection rather than a threshold:
-/// monotonic in the batch for a fixed `n`, and not monotonic in `n`. `n = 8192` is
-/// wrong at a single row while `n = 16384` is right up to 32, and `n = 512` is
-/// right everywhere. Both models sit inside the region, htdemucs at `n = 4096`
-/// from 64 rows and RoFormer at `n = 2048` from 1024. CPU and Metal are outside it
-/// everywhere.
-///
-/// The decoder's mask does not arrive with a real DC, so this is not
-/// hypothetical. Measured by `a_whole_track_matches_the_reference`:
-///
-/// ```text
-///          CUDA      Metal
-///   before  -56.3    -124.8
-///   after  -121.4    -123.9
-/// ```
-///
-/// Metal's 0.9 dB is second-order rounding, below the level the two answers
-/// already differ by.
-///
-/// Nyquist needs no such care: `inverse` pads that bin in whole, and zero.
+// `irfft` reads `n/2 + 1` complex bins and writes `n` real samples, so the imaginary parts of DC
+// and Nyquist are two degrees of freedom the output cannot carry. A correct inverse discards them;
+// MLX's CUDA kernel folds them into the samples.
+//
+// The affected shapes follow kernel selection, with no single threshold: monotonic in the batch for
+// a fixed `n`, and not monotonic in `n`. `n = 8192` is wrong at a single row while `n = 16384` is
+// right up to 32 rows, and `n = 512` is right everywhere. Both models sit inside the affected
+// region, htdemucs at `n = 4096` from 64 rows and RoFormer at `n = 2048` from 1024. CPU and Metal
+// are outside it everywhere.
+//
+// The decoder's mask has a nonzero imaginary DC, so the fold changes the output. The null of
+// `a_whole_track_matches_the_reference`, in dB:
+//
+//                              CUDA      Metal
+//       raw irfft              -56.3    -124.8
+//       imaginary DC removed  -121.4    -123.9
+//
+// Metal's 0.9 dB change is second-order rounding, below the difference between the CUDA and Metal
+// results.
+//
+// Nyquist needs no such care: `inverse` pads that bin whole, as zero.
 fn real_dc(z: &Array) -> Result<Array> {
     let bins = z.shape()[z.ndim() - 1];
     let mut selector = vec![0.0f32; bins as usize];
     selector[0] = 1.0;
     let selector = Array::from_slice(&selector, &[bins]);
 
-    //  Subtracting the component rather than rebuilding the array around a real DC.
-    //  Both spellings measure identically, and this one is exact by construction in
-    //  both directions: at bin 0 the imaginary part cancels with itself, and
-    //  everywhere else the subtrahend is zero.
+    // Subtract the component. This form is exact by construction in both directions: at bin 0 the
+    // imaginary part cancels with itself, and everywhere else the subtrahend is zero.
     let i = Array::from_complex(mlx_rs::complex64::new(0.0, 1.0));
     let phase = ops::multiply(&ops::multiply(&ops::imag(z)?, &selector)?, &i)?;
     Ok(ops::subtract(z, &phase)?)

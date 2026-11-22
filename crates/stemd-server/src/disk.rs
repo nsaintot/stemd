@@ -1,5 +1,5 @@
-//! Free disk space and memory pressure, read so work is refused or trimmed
-//! before the machine runs out.
+//! Reads free disk space and memory pressure, so work is refused or trimmed before the machine runs
+//! out.
 //!
 //! With the disk full, macOS cannot grow swap, and a separation that needs more
 //! memory stalls the whole process inside an allocation.
@@ -50,13 +50,14 @@ pub fn ensure_room_for(path: &Path, bytes: u64) -> Result<(), DiskFull> {
     }
 }
 
-/// Room a cache may hold: its cap, reduced so the volume keeps [`FLOOR`] free.
-/// `used` is what the cache already holds on that volume.
+/// The bytes a cache may hold: its cap, reduced so the volume keeps [`FLOOR`] free. `used` is the
+/// number of bytes the cache already holds on that volume.
 pub fn budget(cap: u64, used: u64, path: &Path) -> u64 {
     free_bytes(path).map_or(cap, |free| fit(cap, used, free))
 }
 
-/// `cap`, cut so that a cache holding `used` with `free` left keeps [`FLOOR`] free.
+/// `cap`, reduced so that a cache holding `used` bytes, with `free` bytes left on the volume, keeps
+/// [`FLOOR`] free.
 const fn fit(cap: u64, used: u64, free: u64) -> u64 {
     let room = (used + free).saturating_sub(FLOOR);
     if cap < room { cap } else { room }
@@ -210,7 +211,7 @@ mod tests {
         assert_eq!(fit(4 * gb, gb, 50 * gb), 4 * gb);
         // 3 GB free with 1 GB held: 2 GB may be held in all.
         assert_eq!(fit(4 * gb, gb, 3 * gb), 2 * gb);
-        // Under the floor already: nothing.
+        // Already under the floor: the cache may hold nothing.
         assert_eq!(fit(4 * gb, 0, gb), 0);
     }
 }

@@ -8,7 +8,7 @@ use eframe::egui::{self, Align2, Rect, pos2, vec2};
 use super::theme::{self, Palette, Weight};
 use super::update;
 
-/// Height of the bar. The content starts under it.
+/// The height of the bar. The content starts below it.
 pub const HEIGHT: f32 = if cfg!(target_os = "macos") {
     28.0
 } else if cfg!(windows) {
@@ -17,7 +17,7 @@ pub const HEIGHT: f32 = if cfg!(target_os = "macos") {
     0.0
 };
 
-/// Centre line of the name: level with the traffic lights on macOS.
+/// The centre line of the name, level with the traffic lights on macOS.
 const TEXT_Y: f32 = if cfg!(target_os = "macos") {
     16.0
 } else {
@@ -67,10 +67,10 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette) {
     update::slot(ui, anchor, align, palette, dim);
 }
 
-/// Space between the name and the version button.
+/// The space between the name and the version button.
 const GAP: f32 = 4.0;
 
-/// Inset of the update slot from the window's side.
+/// The inset of the update slot from the window's side.
 const CORNER: f32 = 14.0;
 
 #[cfg(windows)]
@@ -83,14 +83,14 @@ mod windows {
     use super::super::theme::{Palette, white};
     use super::HEIGHT;
 
-    /// Size of one window button, as Windows 11 draws them.
+    /// The size of one window button, as Windows 11 draws them.
     const BUTTON: egui::Vec2 = vec2(46.0, HEIGHT);
 
-    /// Width of the resize grip along each edge, and of each corner.
+    /// The width of the resize grip along each edge, and of each corner.
     const EDGE: f32 = 5.0;
     const CORNER: f32 = 12.0;
 
-    /// The red Windows fills the close button with under the pointer.
+    /// The red that Windows uses to fill the close button under the pointer.
     const CLOSE_RED: Color32 = Color32::from_rgb(0xC4, 0x2B, 0x1C);
 
     #[derive(Clone, Copy, PartialEq, Eq)]

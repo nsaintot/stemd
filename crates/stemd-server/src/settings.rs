@@ -1,17 +1,16 @@
 //! Preferences the window changes and the next launch remembers.
 //!
-//! Persisted: which model loads, the output format and sample rate a client gets
-//! when it does not ask for one, the parts a drop writes, whether the server
-//! answers and on which port, the longest track accepted, and the cache's size
-//! and how long it keeps whole tracks.
+//! The file keeps which model loads, the output format and sample rate a client gets when it does
+//! not ask for one, the parts a drop writes, whether the server answers and on which port, the
+//! longest track accepted, and the cache's size and how long it keeps whole tracks.
 //!
 //! Precedence is flag, then file, then built-in default. A flag is for one run and
 //! is never written back, so a launch script that pins `--output-format f32le`
 //! does not redefine what the window shows next time. Every change the window
 //! makes is saved.
 //!
-//! Nothing here is allowed to stop the server. A missing file is a first run, and
-//! a damaged one is worth a warning and a default.
+//! Nothing here may stop the server: a missing file means a first run, and a damaged one gets a
+//! warning and the defaults.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,31 +25,29 @@ use crate::models::{self, DEFAULT_PRESET, Preset, RETIRED};
 /// What the window can change and the next launch reads back.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
-    /// The preset loaded at boot. Only ever a preset: `--demucs-model` can name
-    /// a hand-traced artefact, but that is a flag for one run, so it is not
-    /// something the window can select or the file can hold.
+    /// The preset loaded at launch. It is always a preset: `--demucs-model` can name a hand-traced
+    /// artefact, but only for one run, so neither the window nor the file can hold one.
     pub preset: Preset,
-    /// Format for a request that does not name one.
+    /// The format for a request that does not name one.
     pub format: StemFormat,
-    /// Output rate for a request that does not name one.
+    /// The output rate for a request that does not name one.
     pub rate: OutputRate,
-    /// Parts a dropped track writes beside it. Jobs over HTTP name their own.
+    /// The parts a dropped track writes next to it. Jobs over HTTP name their own.
     pub drop_parts: DropParts,
     /// Whether the HTTP API answers. The window has a switch; headless always
     /// serves.
     pub serving: bool,
-    /// Disk the cache may occupy, in gigabytes.
+    /// The disk space the cache may occupy, in gigabytes.
     pub cache_max_gb: f64,
     /// Days a whole track is kept unused; 0 keeps it until the cache is full.
     pub whole_max_days: f64,
-    /// Port the API listens on, on every interface.
+    /// The port the API listens on, on every interface.
     pub port: u16,
-    /// Longest track accepted, in minutes; 0 for the longest this machine's
-    /// memory holds.
+    /// The longest track accepted, in minutes; 0 for the longest that this machine's memory holds.
     pub max_track_minutes: f64,
 }
 
-/// Port the API listens on when nothing else is set.
+/// The port the API listens on when nothing else is set.
 pub const DEFAULT_PORT: u16 = 8420;
 
 /// Which parts a drop writes.
@@ -127,7 +124,7 @@ impl Settings {
         (max_bytes, whole_max_age)
     }
 
-    /// Longest track accepted, in seconds, never past `longest` minutes.
+    /// The longest track accepted, in seconds, never past `longest` minutes.
     pub fn max_track_secs(&self, longest: u32) -> f64 {
         let longest = f64::from(longest);
         let minutes = if self.max_track_minutes > 0.0 {
@@ -138,23 +135,19 @@ impl Settings {
         minutes * 60.0
     }
 
-    /// Bring the rate down to one the format can actually carry.
-    ///
-    /// The pair is what a client gets, so it has to be a pair that exists. MP3
-    /// is the only format that constrains the rate (it has no 96 kHz mode)
-    /// and LAME does not refuse one it lacks: it resamples to 48 kHz on its
-    /// own, slowly, and writes a file at a rate nobody chose. Choosing 48 kHz
-    /// deliberately gets the same audio in a fraction of the time and says so.
-    ///
-    /// Held here rather than at each control because the pair can be made
-    /// invalid four ways: two flags, two menus, a hand-edited file, and a file
-    /// written by a version that allowed it.
+    /// Lower the rate to one the format can carry.
+    // MP3 is the only format that limits the rate (it has no 96 kHz mode), and LAME does not
+    // refuse a missing rate: it resamples to 48 kHz on its own, slowly. Choosing 48 kHz here gives
+    // the same audio in a fraction of the time, and the setting shows it.
+    //
+    // The check lives here because the pair can become invalid in several ways: two flags, two
+    // menus, a hand-edited file, and a file written by an older version.
     fn reconcile(&mut self) {
         if self.format.carries(self.rate) {
             return;
         }
         let was = self.rate;
-        // The highest it can carry, being the nearest thing to what was asked.
+        // The highest rate the format carries is the closest to what was asked.
         self.rate = self.format.rates().last().unwrap_or_default();
         tracing::info!(
             "{} has no {} Hz mode; writing {} Hz instead",
@@ -181,18 +174,16 @@ impl Default for Settings {
     }
 }
 
-/// The on-disk shape, one step removed from [`Settings`].
-///
-/// Every field is optional and stored as the same string a flag would take, so the
-/// file stays hand-editable and one unreadable field costs that field rather than
-/// the whole file. Serialising the enums directly would tie the format to their
-/// variant names.
-///
-/// Unknown keys are ignored, so a file written by a later version still loads.
+/// The on-disk form of [`Settings`].
+// Every field is optional and stored as the string a flag would take, so the file stays editable
+// by hand and an unreadable field loses only that field. Serialising the enums directly would tie
+// the file format to their variant names.
+//
+// Unknown keys are ignored, so a file written by a later version still loads.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Stored {
-    /// Artefact name, as `--demucs-model` takes it.
+    /// The artefact name, as `--demucs-model` takes it.
     model: Option<String>,
     output_format: Option<String>,
     output_sample_rate: Option<u32>,
@@ -220,18 +211,16 @@ impl Stored {
         }
     }
 
-    /// Defaults for anything absent or unrecognised, with a line about what was
-    /// dropped: a preference that silently reverts is worse than one that says
-    /// it could not be read.
+    /// Convert to [`Settings`], with defaults for anything absent or unrecognised, and log each
+    /// field that was dropped.
     fn into_settings(self) -> Settings {
         let mut settings = Settings::default();
 
         if let Some(model) = self.model {
             match Preset::from_artefact(&model) {
                 Some(preset) => settings.preset = preset,
-                // A preset that was retired between versions is the one case
-                // where the file is not wrong, it is just old. Saying so beats
-                // "ignoring model ..." for something the user did pick once.
+                // A preset retired between versions means the file is from an older version, and
+                // the log says so.
                 None if RETIRED.contains(&model.as_str()) => tracing::info!(
                     "settings: {model} is no longer offered; starting on {}. \
                      --demucs-model {model} still loads it",
@@ -309,12 +298,11 @@ fn warn_ignored(field: &str, found: &str, fallback: &str) {
     tracing::warn!("settings: ignoring {field} {found:?}, using {fallback}");
 }
 
-/// Fields a flag fixed for this run. A pinned field is not editable, and the
-/// window greys its control out.
+/// The fields a flag fixed for this run. A pinned field cannot be edited, and the window greys out
+/// its control.
 ///
-/// The model is deliberately not here. `--demucs-model` decides what boots, but
-/// switching model in the window is an explicit act with a download behind it,
-/// and refusing it would be worse than honouring it.
+/// The model is not here: `--demucs-model` decides what loads at launch, but the window still lets
+/// the user switch models, since a switch is an explicit choice with a download behind it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Pinned {
     pub format: bool,
@@ -325,12 +313,10 @@ pub struct Pinned {
     pub max_track_minutes: bool,
 }
 
-/// What the file says, and what this run is actually using.
-///
-/// The two differ exactly where a flag overrides one. Writes serialise `saved`, so
-/// a flag has no path to the file at all. Disabling the pinned control is not
-/// enough on its own: a write is one document, so changing the rate in the window
-/// would otherwise carry a `--output-format` flag into the file alongside it.
+/// What the file says, and what this run uses. Writes serialise `saved`, so a flag never reaches
+/// the file.
+// The two differ where a flag overrides a field. A write saves the whole document, so with a single
+// copy, changing the rate in the window would also save the value of an `--output-format` flag.
 #[derive(Debug, Clone, Copy)]
 struct State {
     saved: Settings,
@@ -345,14 +331,13 @@ pub struct SettingsFile {
 }
 
 impl SettingsFile {
-    /// Read the file, or start from defaults if there is not a usable one.
+    /// Read the file, or start from defaults if it is not usable.
     ///
-    /// Infallible on purpose: this runs before the server exists, and no state of
-    /// a preferences file is worth failing a launch over.
+    /// This never fails: it runs before the server exists, and no state of a preferences file
+    /// should fail a launch.
     pub fn open(path: PathBuf) -> Self {
         let saved = load(&path).unwrap_or_else(|err| {
-            // Not a warning when the file is simply absent: that is every first
-            // run, and it is not a problem.
+            // An absent file means a first run, so it gets no warning.
             if path.exists() {
                 tracing::warn!(
                     "settings: {} is unreadable ({err:#}); using defaults",
@@ -382,8 +367,8 @@ impl SettingsFile {
             state.current.rate = rate;
             self.pinned.rate = true;
         }
-        // A flag can name a pair that does not exist just as easily as the file
-        // can. Only `current`: the file still says what it said.
+        // A flag can name an impossible pair just as the file can. Reconcile only `current`; the
+        // file keeps what it says.
         state.current.reconcile();
         drop(state);
         self
@@ -479,9 +464,9 @@ impl SettingsFile {
 
     /// Change both copies and write the file.
     ///
-    /// Only ever reached for a field no flag pinned, so applying the change to `saved`
-    /// cannot carry a flag into the file. A failed write is a warning: the change still
-    /// applies to the running server, and only the next launch is affected.
+    /// This is reached only for a field that no flag pinned, so applying the change to `saved`
+    /// cannot carry a flag into the file. A failed write is logged as a warning; the change still
+    /// applies to the running server, and only the next launch misses it.
     fn write(&self, change: impl Fn(&mut Settings)) {
         let settings = {
             let mut state = self.state.lock();
@@ -514,10 +499,9 @@ fn load(path: &Path) -> Result<Settings> {
 
 /// Write through a temporary file in the same directory.
 ///
-/// A settings file is rewritten whenever a menu changes, including while the
-/// machine is shutting down. Truncating the real file first would make an
-/// interrupted write leave a half-written one behind, which is exactly the state
-/// [`SettingsFile::open`] has to throw away.
+/// The file is rewritten whenever a menu changes, even while the machine shuts down. Writing the
+/// real file in place would let an interrupted write leave it half-written, which
+/// [`SettingsFile::open`] would then discard.
 fn save(path: &Path, settings: &Settings) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -557,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_tick_stays() {
+    fn the_last_ticked_part_cannot_be_unticked() {
         let one = DropParts::parse("vocals").unwrap();
         assert_eq!(one.toggle("vocals"), one);
     }
@@ -595,9 +579,8 @@ mod tests {
         assert_eq!(reopened.get().format, StemFormat::Pcm32);
     }
 
-    /// The window offers only rates the format carries, but the file is
-    /// hand-editable and a flag can name either half of the pair. Whatever the
-    /// route in, what comes out has to be a pair that exists.
+    /// The window offers only rates the format carries, but the file can be edited by hand and a
+    /// flag can name either half of the pair. Every route ends with a valid pair.
     #[test]
     fn a_format_and_a_rate_that_cannot_go_together_are_reconciled() {
         let path = scratch();
@@ -606,7 +589,7 @@ mod tests {
         file.set_format(StemFormat::Mp3);
         assert_eq!(file.get().rate, OutputRate::Hz48000);
 
-        // And it survives the round trip rather than coming back invalid.
+        // The corrected pair survives the round trip.
         assert_eq!(SettingsFile::open(path).get().rate, OutputRate::Hz48000);
     }
 
@@ -627,8 +610,8 @@ mod tests {
         assert_eq!(reopened.get().rate, OutputRate::Hz96000);
     }
 
-    /// A flag is for one run. It has to change what the server does without
-    /// touching what the window will offer next time.
+    /// A flag applies to one run: it changes what the server does without changing what the window
+    /// offers next time.
     #[test]
     fn a_flag_overrides_the_file_without_rewriting_it() {
         let path = scratch();
@@ -715,8 +698,7 @@ mod tests {
         assert_eq!((next.port, next.max_track_minutes), (8420, 10.0));
     }
 
-    /// The file is meant to be editable by hand, so the names in it have to be
-    /// the ones the flags and the API already use.
+    /// The file is editable by hand, so it uses the same names as the flags and the API.
     #[test]
     fn the_file_spells_settings_the_way_the_flags_do() {
         let path = scratch();
@@ -725,16 +707,15 @@ mod tests {
         file.set_rate(OutputRate::Hz48000);
 
         let text = std::fs::read_to_string(&path).expect("written");
-        // The artefact name, whatever it currently is: the point is that the
-        // file holds what `--demucs-model` takes, not which model that is.
+        // Use the artefact name, whatever it is now: the file holds the value `--demucs-model`
+        // takes.
         let artefact = Preset::Balanced.artefact();
         assert!(text.contains(&format!("\"{artefact}\"")), "{text}");
         assert!(text.contains("\"flac\""), "{text}");
         assert!(text.contains("48000"), "{text}");
     }
 
-    /// A preferences file is not a reason to fail a launch, whatever state it is
-    /// in. Each of these must leave a usable server.
+    /// No state of the preferences file fails a launch; each case below leaves a usable server.
     #[test]
     fn nothing_in_the_file_can_stop_the_server() {
         for content in [
@@ -759,7 +740,7 @@ mod tests {
         }
     }
 
-    /// One unreadable field must not discard the two beside it.
+    /// One unreadable field does not discard the fields beside it.
     #[test]
     fn a_bad_field_costs_that_field_and_no_others() {
         let path = scratch();
@@ -779,8 +760,8 @@ mod tests {
         assert_eq!(settings.format, StemFormat::Flac, "the default stands in");
     }
 
-    /// Every preset has to survive the round trip, or switching to one in the
-    /// window would quietly load a different one next launch.
+    /// Every preset survives the round trip, so switching to it in the window loads the same preset
+    /// at the next launch.
     #[test]
     fn every_preset_the_window_offers_round_trips_through_the_file() {
         for preset in Preset::ALL {
@@ -804,7 +785,7 @@ mod tests {
         }
     }
 
-    /// An interrupted write must not be able to leave the real file truncated.
+    /// An interrupted write cannot leave the real file truncated.
     #[test]
     fn a_write_never_exposes_a_half_written_file() {
         let path = scratch();

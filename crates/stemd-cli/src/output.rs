@@ -11,7 +11,7 @@ pub type Planar = Vec<Vec<f32>>;
 
 /// One part written out, and where it came from.
 pub struct Part {
-    /// "downloaded" or "rebuilt here", which side of the wire produced it.
+    /// "downloaded" or "rebuilt here": the side of the transfer that produced the part.
     pub origin: &'static str,
     pub name: String,
     pub samples: Planar,
@@ -27,11 +27,10 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    /// Pick an encoding, scaling to fit 16 bits when that is where it is going.
+    /// Pick an encoding, scaling to fit 16 bits when writing FLAC.
     ///
-    /// One shared scale across every part, so they can be auditioned against each
-    /// other. Downloaded stems are re-encoded rather than written as they arrived
-    /// because each carries its own transfer gain.
+    /// One scale is shared across every part, so the parts can be auditioned against each other.
+    /// Downloaded stems are re-encoded because each carries its own transfer gain.
     pub fn choose(parts: &[Part], wav_f32: bool) -> Self {
         if wav_f32 {
             return Self::WavF32;
@@ -126,11 +125,10 @@ pub fn rms_dbfs(planar: &[Vec<f32>]) -> f64 {
     20.0 * (sum / n as f64).sqrt().log10()
 }
 
-/// Level of `mix - sum(parts)` relative to `mix`, in dB.
+/// The level of `mix - sum(parts)` relative to `mix`, in dB.
 ///
-/// With the third part derived by subtraction this is exact arithmetic, so
-/// anything above roughly -120 dB means a part went missing rather than that the
-/// model separated badly. Model quality is a different number entirely.
+/// With the third part derived by subtraction this is exact arithmetic, so anything above roughly
+/// -120 dB means a part went missing; it says nothing about separation quality.
 pub fn reconstruction_null_db(mix: &[Vec<f32>], parts: &[Part]) -> f64 {
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (c, mix_ch) in mix.iter().enumerate() {
@@ -150,8 +148,8 @@ pub fn reconstruction_null_db(mix: &[Vec<f32>], parts: &[Part]) -> f64 {
 mod tests {
     use super::*;
 
-    /// Deliberately not a whole number of blocks: the trailing partial block is
-    /// what makes an encoder mis-declare the stream.
+    /// A stereo tone. Tests pass a length that is not a whole number of blocks, because a trailing
+    /// partial block makes an encoder mis-declare the stream.
     fn tone(frames: usize) -> Planar {
         (0..2)
             .map(|c| {

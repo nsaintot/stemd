@@ -32,7 +32,7 @@ impl Chunked for Model {
     fn sources(&self) -> i32 {
         3
     }
-    /// Drums, vocals and bass.
+    /// Separate a chunk into drums, vocals and bass.
     fn separate_chunk(&self, chunk: &Array) -> Result<Array> {
         let mean = ops::mean_axes(chunk, &[2], true)?;
         let drums = ops::multiply(chunk, Array::from_f32(0.5))?;
@@ -48,9 +48,9 @@ impl Chunked for Model {
 pub struct Toy {
     model: Model,
     overlap: f32,
-    /// Slept before each segment, so a test can see work interleave.
+    /// The sleep before each segment, so a test can see work interleave.
     pub delay: Duration,
-    /// Segments run so far.
+    /// The number of segments run so far.
     pub runs: Arc<AtomicUsize>,
 }
 

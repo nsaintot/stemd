@@ -14,7 +14,7 @@ use crate::output::{Output, output_index};
 
 use super::{Excerpt, RESAMPLE_CONTEXT, Spans, gcd};
 
-/// What a track is, fixed when it is opened.
+/// A track's fixed properties, set when it is opened.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackSpec {
     pub frames: usize,
@@ -24,12 +24,12 @@ pub struct TrackSpec {
     pub grid: Grid,
     /// True when the model needs the whole mix's normalisation.
     pub normalises: bool,
-    /// The parts separated, which decide what the models run.
+    /// The parts to separate, which decide which models run.
     pub parts: Parts,
 }
 
 impl TrackSpec {
-    /// Bytes a track holds from its open: the mix and one buffer per part, as f32.
+    /// The bytes a track holds from the moment it opens: the mix and one f32 buffer per part.
     pub fn memory(&self) -> u64 {
         let buffers = 1 + self.parts.names().count();
         (buffers * self.channels * self.frames * std::mem::size_of::<f32>()) as u64
@@ -48,20 +48,20 @@ impl From<&TrackSpec> for TrackInfo {
     }
 }
 
-/// What became of the whole upload once it arrived.
+/// The outcome of checking the whole upload once it has arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// The samples hash to this id, and any statistics the client sent match.
     Verified(String),
-    /// The client's mean and std are not the mix's, so the stems are not the
-    /// ones a whole-track run gives, and nothing of this track is shared.
+    /// The client's mean and std do not match the mix, so the stems differ from a whole-track run
+    /// and nothing of this track is shared.
     Unpublishable(String),
-    /// The samples hash to this id, which is not the id the track was opened on.
+    /// The samples hash to this id, which differs from the id the track was opened with.
     Mismatch(String),
 }
 
 pub(super) struct TrackState {
-    /// Shared once the whole upload is in, so it is hashed outside the lock.
+    /// The mix, shared once the whole upload is in, so it can be hashed outside the lock.
     pub(super) mix: Arc<Audio>,
     pub(super) arrived: Spans,
     pub(super) norm: Option<Normalisation>,
@@ -79,10 +79,11 @@ pub(super) struct TrackState {
 pub struct Track {
     /// Identifies the track while it is open; it stays the same when sessions join.
     pub uid: u64,
-    /// The `model_id` that separates it.
+    /// The `model_id` of the model that separates it.
     pub model_id: String,
     pub spec: TrackSpec,
-    /// The id the open named with `track=`, trusted only for reading stored pieces until the upload hashes to it.
+    /// The id that the open named with `track=`. Until the upload hashes to it, it is trusted only
+    /// for reading stored pieces.
     pub claim: Option<String>,
     pub(super) state: Mutex<TrackState>,
 }
@@ -128,7 +129,7 @@ impl Track {
         }
     }
 
-    /// Samples piece `k` covers.
+    /// The samples that piece `k` covers.
     pub fn piece(&self, k: usize) -> Range<usize> {
         let stride = self.spec.grid.stride().unsigned_abs() as usize;
         crate::output::piece_span(k, stride, self.spec.frames)
@@ -136,8 +137,8 @@ impl Track {
 
     /// Place `audio` at track sample `offset`.
     ///
-    /// Samples another session already uploaded must be the same to the bit.
-    /// Returns the verdict once this upload completes the track.
+    /// Samples that another session already uploaded must match bit for bit. Returns the verdict
+    /// when this upload completes the track.
     pub fn upload(&self, offset: usize, audio: &Audio) -> Result<Option<Verdict>, UploadError> {
         let mut state = self.state.lock();
         Self::check_open(&state).map_err(UploadError::Closed)?;
@@ -209,7 +210,8 @@ impl Track {
         }
     }
 
-    /// The id stored pieces are read under: the verified id, or the claim until the upload hashes.
+    /// The id that stored pieces are read under: the verified id, or the claim until the upload is
+    /// hashed.
     pub fn stored_id(&self) -> Option<String> {
         match &self.state.lock().verdict {
             Some(Verdict::Verified(id)) => Some(id.clone()),
@@ -241,7 +243,7 @@ impl Track {
             window.from.unsigned_abs() as usize,
             window.to.unsigned_abs() as usize,
         );
-        // Models trained on raw audio ignore it.
+        // Models trained on raw audio ignore the normalisation.
         let norm = state.norm.unwrap_or_else(|| Normalisation::new(0.0, 1.0));
         Ok((state.mix.excerpt(from, to), norm))
     }
@@ -258,7 +260,7 @@ impl Track {
         }
     }
 
-    /// Copy the final stems over `from..to` in.
+    /// Copy the final stems over `from..to` into the track.
     pub fn store(&self, from: usize, to: usize, stems: &Stems) -> Result<()> {
         let mut state = self.state.lock();
         for (name, buffer) in &mut state.stems {
@@ -284,8 +286,8 @@ impl Track {
         self.state.lock().closed.clone()
     }
 
-    /// True when piece `k` at `output` can be written: the piece is ready, and
-    /// so is the context a rate conversion needs, and it was not written yet.
+    /// True when piece `k` at `output` can be written: the piece and the context a rate conversion
+    /// needs are ready, and the piece has not been written yet.
     pub fn piece_writable(&self, k: usize, type_dir: &str, converts: bool) -> bool {
         let state = self.state.lock();
         if state.closed.is_some() || state.written.contains(&(type_dir.to_owned(), k)) {
@@ -321,9 +323,9 @@ impl Track {
 
     /// Part `name` over `from..to` at `output`'s rate.
     ///
-    /// `from..to` are track samples at the model's rate and must be ready. At
-    /// another rate the range is converted with up to [`RESAMPLE_CONTEXT`]
-    /// samples either side, taken from what is ready around it.
+    /// `from..to` are track samples at the model's rate and must be ready. At another rate, the
+    /// range is converted with up to [`RESAMPLE_CONTEXT`] samples on each side, taken from the
+    /// ready samples around it.
     pub fn read(&self, output: &Output, name: &str, from: usize, to: usize) -> Result<Excerpt> {
         let (audio, start) = {
             let state = self.state.lock();
@@ -332,7 +334,7 @@ impl Track {
                 bail!("samples {from}..{to} are not ready");
             }
             if !output.served().contains(&name) {
-                bail!("this session serves {:?}, not {name}", output.served());
+                bail!("stem: expected one of {:?}, got {name}", output.served());
             }
             let model = self.spec.sample_rate;
             let out = output.rate.hz();
@@ -341,7 +343,8 @@ impl Track {
             } else {
                 let span = state.ready.span_of(from).cloned().unwrap_or(from..to);
                 let step = (model / gcd(model, out)) as usize;
-                // A multiple of `step` keeps the output grid; unready samples read as silence.
+                // Starting at a multiple of `step` keeps the output grid aligned; samples that are
+                // not ready read as silence.
                 let start = from.saturating_sub(RESAMPLE_CONTEXT).max(span.start) / step * step;
                 (start, (to + RESAMPLE_CONTEXT).min(span.end), span.start)
             };
@@ -381,7 +384,8 @@ impl Track {
         stemd_core::stems::remainder(&state.mix.excerpt(from, to), parts.iter())
     }
 
-    /// Pieces ready in memory or `stored`, samples uploaded, and samples ready or stored.
+    /// The pieces ready in memory or in `stored`, the samples uploaded, and the samples ready or
+    /// stored.
     pub(super) fn counts(&self, stored: &HashSet<usize>) -> (usize, usize, usize) {
         let state = self.state.lock();
         let mut covered = state.ready.clone();

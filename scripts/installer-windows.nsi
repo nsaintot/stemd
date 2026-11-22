@@ -2,23 +2,21 @@
 ;
 ; Two modes, chosen on the first page. Just for me, into
 ; %LOCALAPPDATA%\Programs\Stemd, is the default and needs no administrator. For
-; all users goes to Program Files and does.
+; all users installs to Program Files and needs one.
 ;
-; The per-user directory has to be `Programs\Stemd` and not `Stemd`, because
-; %LOCALAPPDATA%\stemd is where the program keeps its weights and its cache, and
-; an uninstaller pointed at that directory would take a gigabyte the user
-; downloaded with it. MultiUser resolves FOLDERID_UserProgramFiles, so that is
-; already what it picks; the constraint is written down here because the obvious
-; simplification breaks it silently.
+; The per-user directory must be `Programs\Stemd`: %LOCALAPPDATA%\stemd holds
+; the program's weights and cache, and an uninstaller pointed there would delete
+; a gigabyte the user downloaded. MultiUser resolves FOLDERID_UserProgramFiles,
+; which already gives that directory. Do not change it to `stemd`.
 ;
-; The other thing the two modes differ in is CUDA. `install-cuda.cmd` writes
-; about 1.2 GB beside the executable, which a per-user install can do and a
-; Program Files one cannot, so the all-users install lays down a copy that asks
-; for an administrator instead of failing with a permission error a gigabyte in.
+; The modes also differ for CUDA. `install-cuda.cmd` writes about 1.2 GB next to
+; the executable, which a per-user install can do and a Program Files install
+; cannot, so the all-users install adds a copy that asks for an administrator,
+; which avoids a permission error a gigabyte into the download.
 ;
 ; The uninstaller removes the install directory and the shortcut. Weights,
-; settings and the stem cache live in the user data directory and are left
-; alone: they are a download, not an opinion about whether stemd is installed.
+; settings and the stem cache live in the user data directory and stay: they are
+; downloaded data, independent of whether stemd is installed.
 
 Unicode true
 ManifestDPIAware true
@@ -42,12 +40,11 @@ SetCompressor /SOLID lzma
 !define HOMEPAGE "https://github.com/nsaintot/stemd"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\stemd"
 
-; Highest rather than user, because the all-users option needs a token this
-; process does not otherwise have and stock NSIS cannot elevate mid-run: that
-; wants the UAC plugin, which is not part of NSIS. The cost is one consent
-; prompt at launch on an administrator account, including for a per-user
-; install. The benefit is that choosing all users works rather than failing on
-; the first write.
+; Request the highest level: the all-users option needs a token this process
+; does not otherwise have, and stock NSIS cannot elevate mid-run without the UAC
+; plugin, which is not part of NSIS. This costs one consent prompt at launch on
+; an administrator account, even for a per-user install, and lets the all-users
+; choice succeed on its first write.
 !define MULTIUSER_EXECUTIONLEVEL Highest
 !define MULTIUSER_MUI
 !define MULTIUSER_INSTALLMODE_COMMANDLINE
@@ -135,9 +132,9 @@ Section "Stemd" SecMain
   SectionIn RO
   Call WaitForStemdToExit
   SetOutPath "$INSTDIR"
-  ; Overwritten in place rather than uninstalled first: a previous install may
-  ; hold the CUDA runtime, and removing it would mean downloading it again for
-  ; no reason. The file set is fixed, so nothing is left stale.
+  ; Overwrite in place without uninstalling first: a previous install may hold
+  ; the CUDA runtime, and removing it would mean downloading it again. The file
+  ; set is fixed, so nothing is left stale.
   File /r "${SOURCE}\*"
   File "${ICON}"
 
@@ -162,8 +159,8 @@ Section "Stemd" SecMain
   WriteRegStr   SHCTX "${UNINST_KEY}" "Publisher"       "${PUBLISHER}"
   WriteRegStr   SHCTX "${UNINST_KEY}" "URLInfoAbout"    "${HOMEPAGE}"
   WriteRegStr   SHCTX "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
-  ; With the mode on it, so the uninstaller reads the hive it was written to
-  ; rather than guessing from whatever token happens to be running it.
+  ; Record the mode, so the uninstaller reads the hive it was written to and
+  ; does not guess from the token running it.
   WriteRegStr   SHCTX "${UNINST_KEY}" "UninstallString" \
     '"$INSTDIR\Uninstall.exe" /$MultiUser.InstallMode'
   WriteRegStr   SHCTX "${UNINST_KEY}" "QuietUninstallString" \
@@ -178,11 +175,12 @@ Section "Stemd" SecMain
   WriteRegDWORD SHCTX "${UNINST_KEY}" "EstimatedSize" "$0"
 SectionEnd
 
-; The CUDA runtime and cuDNN, about 1.2 GB from NVIDIA, laid beside the program
-; during the install with the download in the details pane. A component rather
-; than a script beside the executable, because nobody finds the script, and the
-; difference is a separation in seconds instead of minutes. A failed download
-; leaves a working program on the CPU and the script to try again.
+; The CUDA runtime and cuDNN, about 1.2 GB from NVIDIA, installed beside the
+; program with the download shown in the details pane. It is a component because
+; ; users rarely find a script beside the executable, and it makes a separation
+; take
+; seconds where the CPU takes minutes. A failed download leaves a working
+; program on the CPU, and the script to try again.
 Section "GPU support (CUDA runtime, 1.2 GB download)" SecCuda
   WriteRegDWORD SHCTX "${UNINST_KEY}" "GpuSupport" 1
   DetailPrint "Fetching the CUDA runtime beside Stemd, about 1.2 GB..."
@@ -214,8 +212,9 @@ Function .onInit
   ${EndIf}
   SetRegView 64
   !insertmacro MULTIUSER_INIT
-  ; No NVIDIA driver, nothing for the runtime to reach: the GPU component is
-  ; left unticked and greyed out rather than downloading 1.2 GB for nothing.
+  ; No NVIDIA driver, so the runtime would have nothing to reach: the GPU
+  ; component is left unticked and greyed out, which saves a useless 1.2 GB
+  ; download.
   ${IfNot} ${FileExists} "$SYSDIR\nvcuda.dll"
     SectionSetFlags ${SecCuda} ${SF_RO}
   ${Else}
@@ -300,9 +299,9 @@ FunctionEnd
 Section "Uninstall"
   Delete "$SMPROGRAMS\${NAME}\${NAME}.lnk"
   RMDir  "$SMPROGRAMS\${NAME}"
-  ; Guarded, because `RMDir /r` on a directory this did not create is the worst
-  ; thing an uninstaller can do, and the registry value it comes from is not
-  ; ours to trust.
+  ; Guarded, because `RMDir /r` on a directory this installer did not create
+  ; would delete user data, and the registry value it comes from cannot be
+  ; trusted.
   IfFileExists "$INSTDIR\stemd-server.exe" 0 +2
     RMDir /r "$INSTDIR"
   DeleteRegKey SHCTX "${UNINST_KEY}"

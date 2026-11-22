@@ -18,15 +18,14 @@ use crate::pcm::Audio;
 use crate::progress::{Cancelled, Progress, ProgressSink, Stage};
 use crate::stems::{Parts, Stems};
 
-/// Progress is reported in thousandths rather than in chunks, because the two
-/// halves are nowhere near the same size.
+/// The progress units for one separation: thousandths of the bar, since the two halves differ
+/// greatly in cost.
 const UNITS: u32 = 1000;
 
-/// How much of that belongs to the vocals half.
+/// The share of [`UNITS`] that belongs to the vocals half.
 ///
-/// Measured: of 69.1 s on a 120 s track, BS-RoFormer is about 62.6 s and the
-/// single demucs model about 6.5 s. Counting chunks instead would be close for the
-/// count and badly wrong for the time.
+/// On a 120 s track that takes 69.1 s, BS-RoFormer takes about 62.6 s and the single demucs model
+/// about 6.5 s. Splitting by chunk count would make the bar move far from the elapsed time.
 const VOCALS_UNITS: u32 = 900;
 
 /// Where a half's chunk count lands on the overall bar.
@@ -56,9 +55,8 @@ pub(crate) fn to_array(mix: &Audio, norm: Option<&Normalisation>) -> Result<Arra
 
 impl Half {
     fn roformer(weights: &Weights, precision: Precision) -> Result<Self> {
-        // Which variant is the artefact's business, not the preset's: a
-        // BS-RoFormer and a BS PolarFormer are the same architecture at
-        // different widths and only the tensors say which is in the file.
+        // The artefact decides the variant: a BS-RoFormer and a BS PolarFormer share one
+        // architecture at different widths, and only the tensors in the file tell them apart.
         let config = stemd_mlx::roformer::Config {
             precision,
             ..stemd_mlx::roformer::Config::of(weights)
@@ -108,9 +106,8 @@ impl HybridSeparator {
             bail!("nothing to separate: the mix has no frames");
         }
 
-        // Both halves report onto one bar, each into its own span of it. The
-        // spans are equal when both halves are demucs and lopsided when one is
-        // a RoFormer, which is nine times the work.
+        // Both halves report onto one bar, each into its own span. The spans are equal when both
+        // halves are demucs, and uneven when one is a RoFormer, which does nine times the work.
         let vocals_units = if self.halves_cost_the_same() {
             UNITS / 2
         } else {
@@ -118,9 +115,8 @@ impl HybridSeparator {
         };
         sink.update(within(0, 0, 0, 1));
 
-        // The normalisation belongs to the audio a half is given, not to the
-        // track: under `cascade` the second half is handed the instrumental,
-        // whose mono statistics are not the mixture's.
+        // The normalisation follows the audio a half receives: under `cascade` the second half gets
+        // the instrumental, whose mono statistics differ from the mixture's.
         let run = |half: &Half, source: &Audio, base: u32, span: u32| -> Result<Vec<Vec<f32>>> {
             let norm = Normalisation::of(source);
             let input = to_array(source, half.normalised.then_some(&norm))?;
@@ -149,10 +145,9 @@ impl HybridSeparator {
 
         let vocals = run(&self.vocals, mix, 0, vocals_units)?;
 
-        // Either the drums half sees the mixture, or it sees what the vocals
-        // half left behind. Held outside the `if` so the common path passes
-        // `mix` by reference rather than copying a six-minute track to say the
-        // same thing.
+        // The drums half sees either the mixture or the audio the vocals half left. The binding is
+        // declared outside the `if`, so the common path passes `mix` by reference and copies no
+        // six-minute track.
         let instrumental;
         let for_drums: &Audio = if self.config.cascade {
             instrumental = Audio::new(

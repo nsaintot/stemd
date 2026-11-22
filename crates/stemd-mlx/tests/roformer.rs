@@ -1,10 +1,10 @@
-//! BS-RoFormer, as far as it has been ported.
+//! Null tests for the BS-RoFormer port.
 //!
 //! Runs against whichever artefact `STEMD_MLX_ROFORMER` names: viperx or
 //! PolarFormer (vocals only) or stemd's own 4-stem model. See
 //! docs/evaluation.md.
 //!
-//! Ignored: needs `STEMD_MLX_ROFORMER` pointing at a converted artefact.
+//! Ignored by default: the tests need `STEMD_MLX_ROFORMER` pointing at a converted artefact.
 
 mod common;
 
@@ -15,30 +15,23 @@ use stemd_mlx::roformer::{BsRoformer, Config};
 /// The fixtures are ~40 MB, so they live outside the repository.
 const FIXTURES: &str = "STEMD_MLX_ROFORMER_FIXTURES";
 
-/// Which of the two artefacts is under test, asked of its tensors.
-///
-/// Both are this architecture: BS-RoFormer at `dim` 512 with rotary position,
-/// and BS PolarFormer at 256 with polar. They differ in four config values and
-/// no code, so every null test below runs against whichever artefact
-/// `STEMD_MLX_ROFORMER` points at, and the fixtures beside it decide which one
-/// is being checked. Guessing from the filename would work until someone
-/// renamed a file; the presence of `pope_embed` cannot be renamed.
+/// The artefact under test, read from its tensors.
+// Both are this architecture: BS-RoFormer at `dim` 512 with rotary position, and BS PolarFormer at
+// 256 with polar. They differ in four config values and no code, so every null test below runs
+// against the artefact `STEMD_MLX_ROFORMER` points at, and the fixtures beside it decide which one
+// is checked. The variant is read from the `pope_embed` tensors, never from the file name.
 fn config_of(w: &stemd_mlx::weights::Weights) -> Config {
     let config = Config::of(w);
     println!("(dim {}, {:?} position)", config.dim, config.positional);
     config
 }
 
-/// The artefact as the server would load it: cast to the precision the config
-/// asks for, rather than left at whatever the file happened to store.
-///
-/// The PolarFormer artefact is published as float16 and the viperx one as
-/// float32, so this matters for saying what was tested, but it changes none of
-/// the numbers below, which is worth recording because it was expected to.
-/// mlx promotes, and these fixtures are float32, so a half weight meeting a
-/// float32 activation computes in float32 from the first matmul on. The cast is
-/// here so the test says what it runs at rather than inheriting it from how a
-/// publisher happened to save a file.
+/// The artefact as the server would load it: cast to the precision the config asks for, whatever
+/// precision the file stores.
+// The PolarFormer artefact is published as float16 and the viperx one as float32. The cast changes
+// none of the numbers below: mlx promotes, and these fixtures are float32, so a half weight
+// meeting a float32 activation computes in float32 from the first matmul on. The cast makes the
+// test state the precision it runs at.
 fn model_of(w: &stemd_mlx::weights::Weights) -> BsRoformer {
     let config = config_of(w);
     let cast = w.cast(config.precision).expect("casting the artefact");
@@ -47,10 +40,8 @@ fn model_of(w: &stemd_mlx::weights::Weights) -> BsRoformer {
 
 /// The converted artefact is readable, complete, and shaped as expected.
 ///
-/// Worth its own test before a line of the model is written against it: the
-/// conversion had to clone twenty-four aliased rotary buffers to be writable
-/// at all, and a silent truncation there would show up much later as a layer
-/// that would not load.
+/// The conversion clones twenty-four aliased rotary buffers to make them writable, and a silent
+/// truncation there would only show up later as a layer that does not load.
 #[test]
 #[ignore]
 fn the_converted_artefact_is_what_the_checkpoint_said() {
@@ -79,8 +70,8 @@ fn the_converted_artefact_is_what_the_checkpoint_said() {
                 attn.has("to_qkv.weight"),
                 "block {block}'s {what} transformer has no fused qkv"
             );
-            // Gamma and no beta: these are RMS norms, not layer norms, and
-            // reaching for the wrong one would load fine and be wrong.
+            // Gamma and no beta: these are RMS norms, and a layer norm would load fine and be
+            // wrong.
             assert!(
                 attn.has("norm.gamma"),
                 "block {block} {what}: no norm gamma"
@@ -89,8 +80,8 @@ fn the_converted_artefact_is_what_the_checkpoint_said() {
                 !attn.has("norm.beta"),
                 "block {block} {what}: RMSNorm has no beta"
             );
-            // Per-head gating, which is easy to miss reading the paper rather
-            // than the weights: eight gates for eight heads.
+            // Per-head gating, easy to miss in the paper and visible in the weights: eight gates
+            // for eight heads.
             assert!(
                 attn.has("to_gates.weight"),
                 "block {block} {what}: no head gates"
@@ -109,11 +100,9 @@ fn the_converted_artefact_is_what_the_checkpoint_said() {
 
 /// The spectrogram, before anything is built on it.
 ///
-/// BS-RoFormer takes an ordinary centred STFT: 2048-point, 441 hop, periodic
-/// Hann, which is the same transform `crate::spectral::Stft` already does for
-/// demucs at different constants. So this is really a test that reusing it is
-/// legitimate, and it is cheap enough to be worth being sure about: everything
-/// downstream reads these numbers.
+/// BS-RoFormer takes an ordinary centred STFT: 2048-point, 441 hop, periodic Hann, the transform
+/// `crate::spectral::Stft` already does for demucs at different constants. So this checks that
+/// reusing it is valid; it is cheap, and everything downstream reads these numbers.
 #[test]
 #[ignore]
 fn the_spectrogram_matches_the_reference() {
@@ -142,13 +131,10 @@ fn the_spectrogram_matches_the_reference() {
 }
 
 /// The band split: sixty-two projections, and the interleaving that feeds them.
-///
-/// Two things are being checked at once and only one of them is arithmetic.
-/// The interleaving has to order the last axis by frequency, then audio
-/// channel, then real and imaginary: get that wrong and every band is handed
-/// a mixture of its neighbours' bins, at exactly the right shape. The
-/// projections then have to be applied to the right slices, which is the same
-/// mistake one level up.
+// Two things are checked at once, and only one is arithmetic. The interleaving must order the last
+// axis by frequency, then audio channel, then real and imaginary; otherwise every band gets a mix
+// of its neighbours' bins at exactly the right shape. The projections must then be applied to the
+// right slices.
 #[test]
 #[ignore]
 fn the_band_split_matches_the_reference() {
@@ -173,13 +159,10 @@ fn the_band_split_matches_the_reference() {
 }
 
 /// The two halves of a transformer layer, separately.
-///
-/// A whole block agreeing tells you less than knowing which half did, and
-/// these two fail in different ways: attention has a rotary convention and a
-/// per-head gate to get wrong, the feed-forward has only the order of two
-/// matrices. Both take the packed shape the reference hands them:
-/// `[bands, frames, dim]` for the time transformer, because that is what the
-/// hooks captured.
+// Each half is checked on its own because they fail in different ways: attention has a rotary
+// convention and a per-head gate to get wrong, and the feed-forward has only the order of two
+// matrices. Both take the packed shape the reference gives them: `[bands, frames, dim]` for the
+// time transformer.
 #[test]
 #[ignore]
 fn attention_and_feed_forward_match_the_reference() {
@@ -211,7 +194,7 @@ fn attention_and_feed_forward_match_the_reference() {
     println!("attention: {null:.1} dB");
     assert!(null < -100.0, "attention nulls at only {null:.1} dB");
 
-    // The feed-forward is fed the residual sum, which is what it sees in place.
+    // The feed-forward receives the residual sum, as it does inside the model.
     let after = mlx_rs::ops::add(&got_attn, &packed).expect("residual");
     let got_ff = ff.forward(&after).expect("feed-forward");
     let want_ff = external(FIXTURES, "rof_ff0").expect("fixture");
@@ -320,29 +303,22 @@ fn the_mask_matches_the_reference() {
     let null = null_db(&got, &want);
     println!("mask: {null:.1} dB");
 
-    // -90 rather than the -100 every other stage clears, and the reason is not
-    // "PolarFormer needed it": this stage is a tanh and a sigmoid over 62 bands
-    // of 1024 hidden units, and both models land shallower here than either
-    // does on a plain matmul. PolarFormer measures -95.9 dB from an exact input
-    // -- the fixture -- so what is being seen is this stage's own arithmetic
-    // and not error arriving from upstream.
+    // The threshold is -90 dB, where every other stage clears -100: this stage is a tanh and a
+    // sigmoid over 62 bands of 1024 hidden units, and both models land shallower here than on a
+    // plain matmul. PolarFormer measures -95.9 dB from an exact input, the fixture, so the error is
+    // this stage's own arithmetic and does not come from upstream.
     //
-    // It is not fully explained and it does not need to be to be bounded:
-    // -95.9 dB is 1.6e-5 of the signal, the whole model nulls at -88.7 dB
-    // against a -60 dB bar, and the model's own separation error is thirty
-    // decibels above either. A threshold set where a different artefact
-    // happened to land is not a threshold, so this one is set where the claim
-    // is -- inaudible, and far under the model's own error.
+    // The error is bounded: -95.9 dB is 1.6e-5 of the signal, the whole model nulls at -88.7 dB
+    // against a -60 dB bar, and the model's own separation error is thirty decibels above either.
+    // The threshold sits well under the model's own error and is inaudible.
     assert!(null < -90.0, "the mask nulls at only {null:.1} dB");
 }
 
 /// The whole model: audio in, every stem out.
 ///
-/// Everything above this passes on its own, so what is left for this to catch
-/// is the wiring between them: the complex multiply, the order the frequency
-/// and channel axes are unpicked in, the dropped DC bin, and the inverse.
-/// Those are exactly the steps with no learned weights to disagree about, and
-/// therefore the ones that fail silently.
+/// Everything above passes on its own, so this catches the wiring between the stages: the complex
+/// multiply, the order the frequency and channel axes are unpicked in, the dropped DC bin, and the
+/// inverse. Those steps have no learned weights to disagree about, so they fail silently.
 #[test]
 #[ignore]
 fn the_whole_model_matches_the_reference() {
@@ -372,12 +348,10 @@ fn the_whole_model_matches_the_reference() {
 
 /// A track shorter than one chunk still goes through the window protocol.
 ///
-/// The comparison that suggests itself: segmenting a one-second track should
-/// equal running the model on that second: is false here for the same reason
-/// it is false for htdemucs: the chunk is centred in a full window and the
-/// model sees eight seconds of mostly silence, which is different audio. What
-/// has to hold is that the crossfade weighting and the division by the
-/// accumulated weight cancel on top of whatever the model then says.
+/// Segmenting a one-second track does not equal running the model on that second, for the same
+/// reason as with htdemucs: the chunk is centred in a full window, so the model sees eight seconds
+/// of mostly silence, which is different audio. What must hold is that the crossfade weighting and
+/// the division by the accumulated weight cancel on top of the model's output.
 #[test]
 #[ignore]
 fn a_short_track_survives_the_crossfade() {

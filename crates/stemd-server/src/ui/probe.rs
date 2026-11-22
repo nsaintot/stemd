@@ -1,8 +1,7 @@
 //! A headless egui harness, so a window bug can be reproduced without a window.
 //!
-//! [`egui::Context::run_ui`] takes synthetic input and returns the shapes it would
-//! have drawn. It reads shapes rather than pixels, so it says nothing about how
-//! the window looks; what it pins is geometry.
+//! [`egui::Context::run_ui`] takes synthetic input and returns the shapes it would have drawn. The
+//! tests check shapes, so they cover geometry and say nothing about colours or pixels.
 
 use eframe::egui;
 
@@ -83,8 +82,8 @@ fn log_text_extent(total: usize) -> egui::Rect {
     extent
 }
 
-/// A log with far more lines than fit must draw enough of them to fill the box.
-/// The tolerance is one row: the last row may be partly clipped.
+/// A log with far more lines than fit draws enough of them to fill the box, within one row, since
+/// the last row may be partly clipped.
 #[test]
 fn a_full_log_fills_the_box_it_is_given() {
     let drawn = log_text_extent(200).height();
@@ -97,7 +96,7 @@ fn a_full_log_fills_the_box_it_is_given() {
     );
 }
 
-/// And the other direction: a handful of lines must not be stretched to fill it.
+/// A log with a handful of lines is not stretched to fill the box.
 #[test]
 fn a_short_log_stays_short() {
     let drawn = log_text_extent(4).height();
@@ -107,19 +106,17 @@ fn a_short_log_stays_short() {
     );
 }
 
-/// Text drawn outside the region it is clipped to, with what it says.
+/// Text drawn outside the region it is clipped to, with its content.
 ///
-/// This is the shape of a whole family of window bugs: a string put somewhere
-/// too small for it, which renders as ribbons rather than as an error. Reading
-/// the galley's own rect against the clip rect catches it without anyone
-/// looking.
+/// A string placed in a region too small for it renders as ribbons and raises no error; comparing
+/// each galley's rect with its clip rect catches it.
 fn clipped_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
     fn walk(shape: &egui::epaint::Shape, clip: egui::Rect, out: &mut Vec<(String, f32)>) {
         match shape {
             egui::epaint::Shape::Text(text) => {
                 let drawn = text.galley.rect.translate(text.pos.to_vec2());
-                // A point of slack: egui rounds glyph rects and a descender
-                // grazing the edge is not the bug being looked for.
+                // Allow one point of slack: egui rounds glyph rects, and a descender grazing the
+                // edge is harmless.
                 let overflow = (drawn.height() - clip.height()).max(0.0);
                 if overflow > 1.0 {
                     out.push((text.galley.text().to_owned(), overflow));
@@ -321,23 +318,18 @@ fn a_failed_startup_shows_the_error_and_a_quit_button() {
     }
 }
 
-/// The figure beside a bar never reads 100% before the work is done, and never
-/// runs past three characters.
-///
-/// Both are about the same thing: the room reserved for it beside the bar is
-/// fixed, and a bar that says it has finished while it is still going is worse
-/// than one that says 99%.
+/// The percentage beside a bar never reads 100% before the work is done, and never runs past three
+/// characters, because the room reserved for it beside the bar is fixed.
 #[test]
 fn the_percentage_beside_a_bar_is_honest_and_fits() {
     use super::status::percent;
 
     assert_eq!(percent(0.0), "0%");
     assert_eq!(percent(1.0), "100%");
-    // Anything short of finished must round down, not to nearest.
+    // Anything short of finished rounds down.
     assert_eq!(percent(0.999), "99%");
     assert_eq!(percent(0.995), "99%");
-    // A fraction outside the range is a bug elsewhere, not a reason to draw
-    // "-3%" or "31400%" into a 34-point gap.
+    // A fraction outside the range is clamped, so the 34-point gap never shows "-3%" or "31400%".
     assert_eq!(percent(-0.5), "0%");
     assert_eq!(percent(2.5), "100%");
 
@@ -368,8 +360,7 @@ fn rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
 
 /// A working drop shows its title, its stage and a bar centred under them.
 ///
-/// The bar and its figure are one row: centring the bar alone would push the row
-/// right by half the figure's width.
+/// The bar is centred on its own, and the percentage sits past its right end.
 #[test]
 fn the_drop_zone_progress_bar_is_centred() {
     let ctx = themed();
@@ -436,10 +427,8 @@ fn the_drop_zone_progress_bar_is_centred() {
 
 /// The quit confirmation draws both answers and names the track.
 ///
-/// The failure this guards against is not cosmetic. A dialog that appears with
-/// no way to say no is worse than no dialog: the close has already been vetoed
-/// by the time it is drawn, so a missing "Keep separating" leaves a window that
-/// cannot be closed at all except by quitting the process another way.
+/// A dialog with a missing answer leaves the window stuck, because the close is already vetoed when
+/// the dialog appears.
 #[test]
 fn the_quit_confirmation_offers_both_answers() {
     let ctx = themed();
@@ -469,8 +458,7 @@ fn the_quit_confirmation_offers_both_answers() {
         "the dialog does not say which track is running: {drawn:?}"
     );
 
-    // Nothing is clipped away: this text is long and the modal is narrow, and a
-    // truncated warning is the second time that has happened in this window.
+    // Nothing is clipped away, although the text is long and the modal is narrow.
     let clipped = clipped_text(&shapes);
     assert!(
         clipped.is_empty(),
@@ -480,10 +468,9 @@ fn the_quit_confirmation_offers_both_answers() {
 
 /// The height the separated list takes in the layout, given `rows` finished drops.
 ///
-/// The layout height is the thing under test rather than what the rows draw: the
-/// window measures the sections panel and resizes itself by the difference, so a
-/// list that reports twelve rows tall grows the window whether or not it paints
-/// them.
+/// The tests check the layout height, because the window measures the sections panel and resizes
+/// itself by the difference: a list that reports twelve rows grows the window whether or not it
+/// paints them.
 fn recents_height(rows: usize) -> f32 {
     let ctx = themed();
     let palette = super::theme::Palette::of(&ctx);
@@ -514,7 +501,7 @@ fn recents_height(rows: usize) -> f32 {
             .rect
             .height();
     };
-    // Twice: the scroll area sizes itself from what it measured last frame.
+    // Run two frames: the scroll area sizes itself from what it measured on the last frame.
     frame(&ctx, None, false, &mut build);
     frame(&ctx, None, false, &mut build);
     height
@@ -544,8 +531,8 @@ fn a_short_separated_list_is_as_tall_as_its_rows() {
     }
 }
 
-/// The Clients list at the narrowest window: the visible rows drawn, no text past the
-/// panel or over another, and the height [`super::activity::height`] promised.
+/// The Clients list at the narrowest window: the visible rows are drawn, no text runs past the
+/// panel or over other text, and the height matches what [`super::activity::height`] promised.
 #[test]
 fn the_clients_list_fits_the_narrowest_window() {
     use std::time::Instant;
@@ -601,8 +588,8 @@ fn the_clients_list_fits_the_narrowest_window() {
     frame(&ctx, None, false, &mut build);
     let shapes = frame(&ctx, None, false, &mut build);
 
-    // The cut row fades out one point at a time, each a copy of the row clipped
-    // to that strip; the bottom strip, at zero opacity, draws nothing.
+    // The partly visible row fades out in one-point strips, each a copy of the row clipped to that
+    // strip; the bottom strip, at zero opacity, draws nothing.
     let strip = 1.0;
     for c in &shapes {
         if let egui::epaint::Shape::Text(t) = &c.shape {
@@ -634,7 +621,7 @@ fn the_clients_list_fits_the_narrowest_window() {
             texts.push(text);
         }
     }
-    // Two rows and part of the third; the rest scroll.
+    // Two rows and part of the third are visible; the others scroll.
     for want in ["Clients", "Job 1", "Job 2", "Session 1"] {
         assert!(
             texts.iter().any(|(t, _)| t.starts_with(want)),
@@ -664,9 +651,8 @@ fn visible_cap() -> f32 {
     super::recents::ROW_HEIGHT * 3.5
 }
 
-/// Every non-ASCII character the window draws as text has a glyph in the fonts
-/// it binds. A missing glyph draws nothing at all, so this fails silently on
-/// screen.
+/// Every non-ASCII character the window draws as text has a glyph in the bound fonts. A missing
+/// glyph draws nothing, with no error on screen.
 #[test]
 fn the_marks_drawn_as_text_have_glyphs() {
     use super::theme::{Weight, font};

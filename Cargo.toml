@@ -1,8 +1,9 @@
 [workspace]
 resolver = "3"
-# The vendored MLX fork is reached through [patch.crates-io] below, not as a
-# member. Cargo claims any crate inside the workspace directory unless told
-# otherwise, and without this the build stops to say they are not listed.
+# The vendored MLX fork is reached through [patch.crates-io] below and is not a
+# member. Cargo claims every crate inside the workspace directory unless told
+# otherwise; without this exclusion the build stops and reports the crates as
+# unlisted.
 exclude = ["vendor"]
 members = [
     "crates/stemd-audio",
@@ -28,13 +29,14 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
-# MLX, forked to build off Apple silicon. `mlx-sys` 0.2.0 emits Apple-only link
-# directives and bundles an mlx-c with no CUDA backend and no x86 half type;
-# 0.25.3 and 0.2.0 are the newest published versions of either and neither has a
-# `cuda` feature, so there is nothing to upgrade to. See vendor/mlx-rs-stemd.
+# MLX, forked to build on platforms other than Apple silicon. `mlx-sys` 0.2.0
+# emits Apple-only link directives and bundles an mlx-c with no CUDA backend and
+# no x86 half type. 0.25.3 and 0.2.0 are the newest published versions of the
+# two crates, and neither has a `cuda` feature, so no upgrade fixes this. See
+# vendor/mlx-rs-stemd.
 #
-# A clone needs `--recurse-submodules`, or `git submodule update --init` after
-# the fact. Without it these paths do not exist and cargo says so plainly.
+# A clone needs `--recurse-submodules`, or `git submodule update --init`
+# afterwards; without it these paths do not exist and cargo reports that.
 [patch.crates-io]
 mlx-sys = { path = "vendor/mlx-rs-stemd/mlx-sys" }
 mlx-rs = { path = "vendor/mlx-rs-stemd/mlx-rs" }

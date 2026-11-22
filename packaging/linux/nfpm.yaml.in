@@ -66,8 +66,8 @@ overrides:
     recommends:
       - avahi-daemon
   rpm:
-    # Sonames rather than package names: RPM provides them automatically and
-    # every RPM family satisfies them under its own package names.
+    # Use sonames: RPM provides them automatically, and every RPM family
+    # satisfies them under its own package names.
     depends:
       - libc.so.6(GLIBC_2.35)(64bit)
       - libstdc++.so.6(GLIBCXX_3.4.30)(64bit)

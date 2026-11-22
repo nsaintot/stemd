@@ -13,7 +13,7 @@ use crate::discovery::Advertiser;
 
 pub struct Serving {
     shared: Arc<Shared>,
-    /// Instance name to advertise under; `None` with `--no-mdns`.
+    /// The instance name to advertise under; `None` with `--no-mdns`.
     instance: Option<String>,
     port: AtomicU16,
 }
@@ -30,7 +30,7 @@ struct Shared {
 }
 
 impl Serving {
-    /// Start in `on`, advertising `model` if on and announcing is allowed.
+    /// Start in state `on`, advertising `model` when on and announcing is allowed.
     pub fn new(on: bool, announce: Option<(String, u16)>, model: &str) -> Self {
         let serving = Self {
             shared: Arc::new(Shared {
@@ -82,9 +82,9 @@ impl Serving {
         }
     }
 
-    /// Announce over mDNS on a background thread: registering can take long
-    /// enough to stall the window. A failure is a warning: a client with the
-    /// address configured out of band still works.
+    /// Announce over mDNS on a background thread, since registering can take long enough to stall
+    /// the window. A failure is logged as a warning, since a client configured with the address
+    /// still works.
     fn advertise(&self, model: &str) {
         let Some(instance) = self.instance.clone() else {
             return;

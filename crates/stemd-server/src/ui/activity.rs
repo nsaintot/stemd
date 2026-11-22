@@ -1,10 +1,9 @@
-//! The Clients list: whole-track jobs and sessions from API clients, and the
+//! The Clients list, which shows API clients' whole-track jobs and sessions, and the number of
 //! session segments waiting.
 //!
-//! Rows name jobs and sessions by number, such as "Job 2" and "Session 3"; no
-//! track id or title is read or shown. Client jobs list in queue order, the
-//! running one first, the way queued drops list under Separated. The list shows
-//! only while there is something in it.
+//! Rows name jobs and sessions by number, such as "Job 2" and "Session 3"; the list never reads or
+//! shows a track id or title. Client jobs are listed in queue order with the running job first, as
+//! queued drops are listed under Separated. The list shows only while it has rows.
 
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use super::theme::{self, Brushes, Palette, Weight, white};
 
 const RADIUS: f32 = 16.0;
 
-/// Rows shown before the list scrolls; the cut row fades out.
+/// The number of rows shown before the list scrolls; the partly visible row fades out.
 const MAX_VISIBLE: f32 = 2.75;
 
 /// How long an ended session stays in the list.
@@ -31,12 +30,12 @@ const ENDED_FOR: Duration = Duration::from_secs(15);
 /// A client job in the list.
 #[derive(Clone, Debug)]
 pub struct JobRow {
-    /// Counts API jobs from 1 since the server started.
+    /// The API job's number, counting from 1 since the server started.
     pub number: u64,
     pub progress: Progress,
-    /// Seconds left, once there is an estimate. Only a job separating has one.
+    /// Seconds left, once there is an estimate. Only a job that is separating has one.
     pub left: Option<f64>,
-    /// A protocol 1 client waits on it.
+    /// True when a protocol 1 client waits on the job.
     pub protocol_1: bool,
 }
 
@@ -51,8 +50,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Read the server state; `eta` follows the running client job, `now` being
-    /// the window's clock.
+    /// Read the server state. `eta` follows the running client job, and `now` is the window's
+    /// clock.
     pub fn read(state: &AppState, eta: &mut Eta, now: f64) -> Self {
         let queue = &state.queue;
         let segment_secs = queue.segment_run_seconds();
@@ -81,7 +80,7 @@ impl Snapshot {
         }
     }
 
-    /// Rows in the list: client jobs, open sessions, ended sessions.
+    /// The number of rows in the list: client jobs, open sessions and ended sessions.
     pub fn rows(&self) -> usize {
         self.jobs.len() + self.sessions.len() + self.ended.len()
     }
@@ -92,7 +91,7 @@ impl Snapshot {
     }
 }
 
-/// Height the list takes for `snapshot`, heading included; 0 when hidden.
+/// The height the list takes for `snapshot`, heading included; 0 when the list is hidden.
 pub fn height(snapshot: &Snapshot) -> f32 {
     if !snapshot.any() {
         return 0.0;
@@ -107,7 +106,8 @@ pub fn length(frames: usize, sample_rate: u32) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// Session segments waiting, for the right of the heading; empty when none.
+/// The number of session segments waiting, shown at the right of the heading; empty when none are
+/// waiting.
 pub fn queue_text(snapshot: &Snapshot) -> String {
     let high: usize = snapshot.sessions.iter().map(|s| s.high).sum();
     let normal: usize = snapshot.sessions.iter().map(|s| s.normal).sum();
