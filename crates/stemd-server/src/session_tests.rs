@@ -96,6 +96,7 @@ fn open_as(
             norm,
             peak: None,
             model_id: "toy-00000000".into(),
+            claim: None,
         })
         .expect("room for a session")
 }
@@ -560,6 +561,7 @@ fn open_at(queue: &Queue, frames: usize, format: StemFormat, rate: OutputRate) -
             norm: None,
             peak: None,
             model_id: "toy-00000000".into(),
+            claim: None,
         })
         .expect("room for a session")
 }

@@ -56,6 +56,8 @@ pub enum Verdict {
     /// The client's mean and std are not the mix's, so the stems are not the
     /// ones a whole-track run gives, and nothing of this track is shared.
     Unpublishable(String),
+    /// The samples hash to this id, which is not the id the track was opened on.
+    Mismatch(String),
 }
 
 pub(super) struct TrackState {
@@ -80,6 +82,8 @@ pub struct Track {
     /// The `model_id` that separates it.
     pub model_id: String,
     pub spec: TrackSpec,
+    /// The id the open named with `track=`, trusted only for reading stored pieces until the upload hashes to it.
+    pub claim: Option<String>,
     pub(super) state: Mutex<TrackState>,
 }
 
@@ -89,6 +93,7 @@ impl Track {
         model_id: String,
         spec: TrackSpec,
         norm: Option<Normalisation>,
+        claim: Option<String>,
     ) -> Self {
         let silent = || {
             Audio::new(
@@ -99,6 +104,7 @@ impl Track {
         Self {
             uid,
             model_id,
+            claim,
             state: Mutex::new(TrackState {
                 mix: Arc::new(silent()),
                 arrived: Spans::default(),
@@ -184,7 +190,9 @@ impl Track {
         if self.spec.normalises && state.norm.is_none() {
             state.norm = Some(computed);
         }
-        let verdict = if client_norm_differs {
+        let verdict = if self.claim.as_ref().is_some_and(|claim| *claim != actual) {
+            Verdict::Mismatch(actual)
+        } else if client_norm_differs {
             Verdict::Unpublishable(actual)
         } else {
             Verdict::Verified(actual)
@@ -198,6 +206,15 @@ impl Track {
         match &self.state.lock().verdict {
             Some(Verdict::Verified(id)) => Some(id.clone()),
             _ => None,
+        }
+    }
+
+    /// The id stored pieces are read under: the verified id, or the claim until the upload hashes.
+    pub fn stored_id(&self) -> Option<String> {
+        match &self.state.lock().verdict {
+            Some(Verdict::Verified(id)) => Some(id.clone()),
+            Some(Verdict::Mismatch(_)) => None,
+            None | Some(Verdict::Unpublishable(_)) => self.claim.clone(),
         }
     }
 

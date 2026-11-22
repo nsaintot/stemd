@@ -27,10 +27,10 @@ use stemd_core::{Audio, Normalisation, StemFormat};
 
 use crate::api::error::ApiError;
 use crate::api::params::{CreateParams, default_channels, default_rate, parse_output};
-use crate::cache::Cache;
+use crate::cache::{Cache, TrackInfo};
 use crate::output::{Output, output_span};
 use crate::sessions::{
-    JoinError, OpenError, Request, Session, Sessions, TrackSpec, UploadError, WindowRequest,
+    Claim, JoinError, OpenError, Request, Session, Sessions, TrackSpec, UploadError, WindowRequest,
 };
 use crate::state::AppState;
 use crate::stem_http::{audio_response, send_whole};
@@ -50,7 +50,7 @@ struct OpenParams {
     /// Track length in samples, at `sample_rate`. Required unless `track` is set.
     #[serde(default)]
     frames: Option<usize>,
-    /// The id of an open track to join instead of uploading.
+    /// A track id: an open track is joined, a stored one opens on its pieces.
     #[serde(default)]
     track: Option<String>,
     /// The client's key for the file the audio came from; see `GET /v2/separations?file=`.
@@ -165,11 +165,24 @@ async fn open(
     if let Some(key) = &params.file {
         crate::stem_http::check_file_key(key)?;
     }
-    if let Some(id) = &params.track {
-        return join(&state, &params, id, output, in_format, body).await;
-    }
-    let Some(frames) = params.frames.filter(|&f| f > 0) else {
-        return Err(ApiError::bad_request("frames must be at least 1"));
+    let (frames, stored) = match &params.track {
+        Some(id)
+            if state
+                .queue
+                .sessions()
+                .open_track(id, output.parts)
+                .is_some() =>
+        {
+            return join(&state, &params, id, output, in_format, body).await;
+        }
+        Some(id) => {
+            let (info, claim) = stored_claim(&state, &params, &output, id).await?;
+            (info.frames, Some((info, claim)))
+        }
+        None => match params.frames.filter(|&f| f > 0) {
+            Some(frames) => (frames, None),
+            None => return Err(ApiError::bad_request("frames must be at least 1")),
+        },
     };
     let secs = frames as f64 / f64::from(model_rate);
     let max_secs = state.max_track_secs();
@@ -185,6 +198,20 @@ async fn open(
     }
     let grid = session_grid(&state, &info, frames)?;
     let norm = parse_levels(&params)?;
+    let spec = TrackSpec {
+        frames,
+        channels: params.channels,
+        sample_rate: model_rate,
+        grid,
+        normalises: state.queue.normalises(),
+        parts: output.parts,
+    };
+    let claim = match stored {
+        Some((info, claim)) if info == TrackInfo::from(&spec) => Some(claim),
+        Some((_, claim)) => return Err(unknown_track(&claim.id)),
+        None => None,
+    };
+    let claimed = claim.as_ref().map(|c| c.id.clone());
 
     let session = state
         .queue
@@ -192,17 +219,11 @@ async fn open(
         .open(Request {
             output: output.clone(),
             in_format,
-            track: TrackSpec {
-                frames,
-                channels: params.channels,
-                sample_rate: model_rate,
-                grid,
-                normalises: state.queue.normalises(),
-                parts: output.parts,
-            },
+            track: spec,
             norm,
             peak: params.peak,
             model_id: state.switcher.cache_id(),
+            claim,
         })
         .map_err(open_error)?;
     session.set_file(params.file.clone());
@@ -212,6 +233,9 @@ async fn open(
         grid.len(),
         grid.segment(),
     );
+    if let Some(id) = claimed {
+        tracing::info!(session = %session.id, "opened on stored pieces of {id}");
+    }
 
     if !body.is_empty()
         && let Err(err) = place(&state, &session, 0, body).await
@@ -304,13 +328,44 @@ fn open_error(e: OpenError) -> ApiError {
     ApiError::new(status, format!("{e}"))
 }
 
-/// The 404 for a join on a track that is not open.
+/// The 404 for a `track=` the server neither has open nor holds pieces of.
 fn unknown_track(id: &str) -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
-        format!("no open track {id}; open a session with frames and upload it"),
+        format!("no open or stored track {id}"),
     )
     .with_code("unknown_separation")
+}
+
+/// The stored grid of track `id` for `output`, and the claim a session on its pieces opens with.
+async fn stored_claim(
+    state: &Arc<AppState>,
+    params: &OpenParams,
+    output: &Output,
+    id: &str,
+) -> Result<(TrackInfo, Claim), ApiError> {
+    if crate::stem_http::check_id(id).is_err() {
+        return Err(unknown_track(id));
+    }
+    let (cache, model_id) = (Arc::clone(&state.cache), state.switcher.cache_id());
+    let (output, claimed, gain) = (output.clone(), id.to_owned(), output.gain(params.peak));
+    let found = tokio::task::spawn_blocking(move || {
+        crate::held::claimable(&cache, &model_id, &output, &claimed, gain)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("looking up the stored pieces: {e}")))?
+    .ok_or_else(|| unknown_track(id))?;
+    if params.frames.is_some_and(|f| f != found.info.frames) {
+        return Err(ApiError::bad_request(format!(
+            "track {id} is {} samples long",
+            found.info.frames
+        )));
+    }
+    let claim = Claim {
+        id: id.to_owned(),
+        gain: found.gain,
+    };
+    Ok((found.info, claim))
 }
 
 /// Open a session on the open track `id`, which needs no upload.
