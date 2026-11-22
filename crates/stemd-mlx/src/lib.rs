@@ -1,8 +1,8 @@
 //! demucs v4 on Apple's MLX, in Rust.
 //!
-//! The model is built here rather than loaded as a traced graph, because MLX has
-//! no equivalent of TorchScript. Every layer is therefore a place this can differ
-//! from the original, which is why each stage is nulled against the reference.
+//! The model is built here layer by layer, because MLX has no equivalent of TorchScript for loading
+//! a traced graph. Every layer can therefore differ from the original, so each stage is nulled
+//! against the reference.
 //!
 //! MLX cannot be driven from two threads at once; callers must serialise.
 

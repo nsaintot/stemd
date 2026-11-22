@@ -1,4 +1,4 @@
-//! Time left on a separation, plus 15%.
+//! Estimates the time left on a separation, with a 15% margin.
 //!
 //! With the server's median segment time, the estimate is the segments left
 //! times that median, or times this job's own time per segment over the last
@@ -27,13 +27,13 @@ const SETTLE_SECS: f64 = 3.0;
 /// Progress a job must have made while watched before an estimate shows.
 const SETTLE_FRACTION: f32 = 0.02;
 
-/// Progress steps the recent rate spans.
+/// The number of progress steps that the recent rate spans.
 const RECENT_STEPS: usize = 4;
 
-/// Factor applied to the estimate.
+/// The factor applied to the estimate.
 const MARGIN: f64 = 1.15;
 
-/// Seconds between two estimates, the 5 s the shortest text rounds to.
+/// Seconds between two estimates, matching the 5 s rounding of the shortest label.
 const RECALC_SECS: f64 = 5.0;
 
 /// How far a new estimate must exceed the countdown to replace it, as a factor
@@ -45,20 +45,20 @@ const RISE_SECS: f64 = 10.0;
 #[derive(Default)]
 pub struct Eta {
     job: Option<u64>,
-    /// Time and fraction when the job was first seen separating.
+    /// The time and fraction when the job was first seen separating.
     first: (f64, f32),
-    /// Time and fraction at each of the last steps, oldest first.
+    /// The time and fraction at each of the last steps, oldest first.
     steps: VecDeque<(f64, f32)>,
-    /// Time and segments done at each of the last steps, oldest first.
+    /// The time and the number of segments done at each of the last steps, oldest first.
     segments: VecDeque<(f64, u32)>,
-    /// When the shown value was computed, and the value.
+    /// The time the shown value was computed, and the value.
     shown: Option<(f64, f64)>,
 }
 
 impl Eta {
-    /// Seconds left on job `key` at `progress`, `now` being the window's clock
-    /// and `segment_secs` the server's median segment time. `None` outside
-    /// [`Stage::Separating`]. Starts over when `key` changes.
+    /// Seconds left on job `key` at `progress`, where `now` is the window's clock and
+    /// `segment_secs` is the server's median segment time. `None` outside [`Stage::Separating`].
+    /// Starts over when `key` changes.
     pub fn update(
         &mut self,
         key: u64,
@@ -119,9 +119,9 @@ fn next_shown(countdown: f64, estimate: f64) -> f64 {
     }
 }
 
-/// Seconds left at time `now` from the segments left in `progress`, at
-/// `median` seconds each or at the pace over `segments`, the time and segments
-/// done at each of the last steps, when that pace is slower.
+/// Seconds left at time `now`, from the segments left in `progress` at `median` seconds each, or at
+/// the pace over `segments` when that pace is slower. `segments` holds the time and the number of
+/// segments done at each of the last steps.
 fn by_segments(progress: &Progress, median: f64, segments: &[(f64, u32)], now: f64) -> f64 {
     let left = progress.total.saturating_sub(progress.completed);
     let pace = match (segments.first(), segments.last()) {
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn with_the_median_the_estimate_shows_at_once() {
+    fn the_first_estimate_uses_the_median_segment_time() {
         let mut eta = Eta::default();
         let progress = Progress::counted(Stage::Separating, 2, 10);
         let secs = eta.update(1, 0.0, &progress, Some(3.0)).unwrap();

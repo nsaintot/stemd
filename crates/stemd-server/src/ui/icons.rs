@@ -1,6 +1,6 @@
 //! Stroke icons, painted from SVG paths in a 10 by 10 box.
 //!
-//! Painted because a glyph missing from the bundled fonts draws nothing at all.
+//! The icons are painted because a glyph missing from the bundled fonts draws nothing.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, vec2};
 
@@ -80,7 +80,7 @@ pub fn cross(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     );
 }
 
-/// Three lines, the last short: the log.
+/// Three lines, the last one short, for the log.
 pub fn lines(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     paths(
         painter,
@@ -95,7 +95,7 @@ pub fn lines(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     );
 }
 
-/// A gear: settings.
+/// A gear, for settings.
 pub fn gear(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) / 2.0;
@@ -112,7 +112,7 @@ pub fn gear(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     }
 }
 
-/// A clock face: waiting.
+/// A clock face, for waiting.
 pub fn clock(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     let k = rect.width().min(rect.height()) / 12.0;
     painter.circle_stroke(rect.center(), 4.6 * k, Stroke::new(width, colour));
@@ -126,7 +126,7 @@ pub fn clock(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     );
 }
 
-/// A ring with two bars: idle.
+/// A ring with two bars, for idle.
 pub fn pause(painter: &egui::Painter, rect: Rect, colour: Color32, width: f32) {
     let k = rect.width().min(rect.height()) / 12.0;
     painter.circle_stroke(rect.center(), 4.6 * k, Stroke::new(width, colour));

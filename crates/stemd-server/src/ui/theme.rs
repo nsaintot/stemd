@@ -1,6 +1,6 @@
 //! Colour, type, the window backdrop and the glass surfaces everything sits on.
 //!
-//! One appearance: the navy backdrop is the design, so the window does not follow
+//! The window has one appearance: the navy backdrop is part of the design, so the window ignores
 //! the system's light mode.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use egui::epaint::{RectShape, Shadow};
 /// `resources/fonts/InstrumentSans-OFL.txt`.
 const INSTRUMENT_SANS: &[u8] = include_bytes!("../../../../resources/fonts/InstrumentSans.ttf");
 
-/// Separator inside a line of text.
+/// The separator inside a line of text.
 pub const DOT: &str = " · ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +72,9 @@ pub struct Palette {
     pub blue: Color32,
     pub good: Color32,
     pub danger: Color32,
-    /// Tooltip fill.
+    /// The tooltip fill.
     pub menu: Color32,
-    /// Fill over the blurred backdrop of a menu or dialog.
+    /// The fill over the blurred backdrop of a menu or dialog.
     pub frost: Color32,
     pub menu_outline: Color32,
     pub hairline: Color32,
@@ -132,12 +132,12 @@ fn unit(alpha: f32) -> u8 {
     (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// `from` to `to` by `t`, in gamma space like CSS.
+/// Interpolate from `from` to `to` by `t`, in gamma space as CSS does.
 pub fn mix(from: Color32, to: Color32, t: f32) -> Color32 {
     from.lerp_to_gamma(to, t.clamp(0.0, 1.0))
 }
 
-/// A glass surface: vertical white gradient, hairline, top highlight, soft shadow.
+/// A glass surface: a vertical white gradient, a hairline, a top highlight and a soft shadow.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Glass {
     /// Header controls and first-run rows.
@@ -179,8 +179,8 @@ impl Glass {
 
 /// Texture brushes and baked images, built once per context.
 ///
-/// `RectShape` fills with one colour; a texture sampled across it is how a rounded
-/// rectangle gets a gradient that follows its corners.
+/// `RectShape` fills with one colour, so a rounded rectangle gets a gradient that follows its
+/// corners from a texture sampled across it.
 pub struct Brushes {
     backdrop: TextureHandle,
     panel: TextureHandle,
@@ -432,7 +432,7 @@ pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
         let u = 1.0 - s;
         3.0 * u * u * s * a + 3.0 * u * s * s * b + s * s * s
     };
-    // Solve x(s) = t by bisection: monotone in s for valid CSS curves.
+    // Solve x(s) = t by bisection, which works because x is monotone in s for valid CSS curves.
     let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
     for _ in 0..24 {
         let mid = (lo + hi) / 2.0;
@@ -465,7 +465,7 @@ pub fn ease_in_out(t: f32) -> f32 {
     cubic_bezier(0.42, 0.0, 0.58, 1.0, t)
 }
 
-/// Frame interval for animation while a track separates: 60 fps.
+/// The animation frame interval while a track separates: 60 fps.
 const PROCESSING_FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
 
 fn processing_id() -> egui::Id {
@@ -576,7 +576,7 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Fonts once per context, style every frame.
+/// Install the fonts once per context and the style on every frame.
 pub fn install(ctx: &egui::Context) {
     let flag = egui::Id::new("stemd-fonts-installed");
     if !ctx.data(|d| d.get_temp::<bool>(flag).unwrap_or(false)) {
@@ -676,7 +676,7 @@ impl Rgba {
         }
     }
 
-    /// Source-over onto an opaque `below`.
+    /// Composite `self` source-over onto an opaque `below`.
     fn over(self, below: Self) -> Self {
         Self {
             r: self.r * self.a + below.r * (1.0 - self.a),
@@ -747,7 +747,7 @@ fn backdrop(size: usize) -> egui::ColorImage {
     egui::ColorImage::new([size, size], pixels)
 }
 
-/// Pastel red, green, blue and back to red, so it tiles.
+/// A pastel red, green and blue gradient that returns to red, so it tiles.
 fn sheen(width: usize) -> egui::ColorImage {
     let stops = [
         (0.0, Rgba::hex(0xF3B9B3, 1.0)),
@@ -811,7 +811,7 @@ fn phi(x: f32) -> f32 {
     0.5 * (1.0 + erf.copysign(z))
 }
 
-/// Fraction of the shadow image's half-size that the unblurred disc covers.
+/// The fraction of the shadow image's half-size that the unblurred disc covers.
 pub const SHADOW_DISC: f32 = 0.6;
 
 /// A black disc of radius `SHADOW_DISC` with a Gaussian edge filling the rest
@@ -831,11 +831,11 @@ fn shadow_disc(size: usize) -> egui::ColorImage {
     egui::ColorImage::new([size, size], pixels)
 }
 
-/// Fraction of the halo image's half-size that the unblurred disc covers.
+/// The fraction of the halo image's half-size that the unblurred disc covers.
 pub const HALO_DISC: f32 = 0.53;
 
-/// A conic red, green, blue gradient in a disc, blurred at the edge. Full
-/// alpha: the caller fades it.
+/// A conic red, green and blue gradient in a disc, blurred at the edge, at full alpha; the caller
+/// fades it.
 fn halo(size: usize) -> egui::ColorImage {
     let half = size as f32 / 2.0;
     let sigma = (1.0 - HALO_DISC) / 3.0;

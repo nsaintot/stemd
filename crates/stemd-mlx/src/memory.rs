@@ -1,19 +1,16 @@
-//! What MLX is holding, and how to make it let go.
+//! Reports the memory MLX holds, and releases its cache.
 //!
-//! MLX keeps freed buffers in an allocator cache instead of returning them to
-//! the system. That is the right trade while work is arriving, since a track is
-//! thousands of allocations of a handful of shapes, but the cache limit defaults
-//! to the device's recommended working set, so an idle server goes on holding
-//! most of the machine. One here sat on 14 GB, under half a gigabyte of which
-//! was model weights, and pushed the machine 16.7 GB into swap.
+//! MLX keeps freed buffers in an allocator cache and does not return them to the system. That suits
+//! a stream of work, since a track is thousands of allocations of a handful of shapes, but the
+//! cache limit defaults to the device's recommended working set, so an idle server can keep most of
+//! the machine's memory, almost none of it model weights, and push the machine into swap.
 //!
-//! [`release`] is meant for an idle timer, not for between tracks, and it is
-//! deliberately not a cache cap. A cap is worse than both: MLX evicts inside a
-//! separation and re-allocates what it just gave up, and it still holds the
-//! whole cap for ever. Releasing on idle costs nothing measurable, 38.29 s
-//! against 38.31 s alternated with an unmodified binary.
+//! Call [`release`] from an idle timer; between tracks it would slow the next track. A cache cap is
+//! worse than releasing between tracks or on idle: MLX evicts inside a separation and re-allocates
+//! what it just gave up, and it still holds the whole cap forever. Releasing on idle has no
+//! measurable cost on the next separation.
 
-/// Bytes MLX is holding for arrays that still exist.
+/// The bytes MLX holds for arrays that still exist.
 pub fn active() -> usize {
     let mut bytes = 0;
     // SAFETY: writes one `size_t` through a pointer to a live local.
@@ -21,8 +18,7 @@ pub fn active() -> usize {
     bytes
 }
 
-/// Bytes MLX is holding for arrays that no longer do. This is the number that
-/// reached 13 GB.
+/// The bytes MLX holds for arrays that no longer exist.
 pub fn cached() -> usize {
     let mut bytes = 0;
     // SAFETY: as above.

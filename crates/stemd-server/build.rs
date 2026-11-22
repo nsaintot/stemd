@@ -1,29 +1,24 @@
-//! Delay-load the CUDA runtime into this executable, so it starts without one.
+//! Delay-loads the CUDA runtime into this executable, so it starts on a machine without CUDA.
 //!
-//! `mlx-sys` emits these same flags, but `cargo:rustc-link-arg` applies only to the
-//! package that emits it, so none of them reaches a consuming binary. Four of the
-//! DLLs below would then be ordinary imports, bound before `main`, and a machine
-//! without CUDA would get `0xC0000135` instead of a program.
+//! `mlx-sys` emits the same flags, but `cargo:rustc-link-arg` applies only to the package that
+//! emits it. Without these flags, four of the DLLs below would be ordinary imports, bound before
+//! `main`, and a machine without CUDA would fail to start with `0xC0000135`.
 //!
-//! Delay-loaded, the same executable starts with none of them installed and reaches
-//! for one only when a code path needs it, so CUDA is a download rather than a
-//! precondition. Staged it is 134 MB: the exe, the MSVC runtime and OpenBLAS.
+//! With delay loading, the executable starts with none of them installed and loads one only when a
+//! code path needs it, so CUDA becomes an optional download. The staged program is 134 MB: the exe,
+//! the MSVC runtime and OpenBLAS.
 //!
-//! What makes that safe is `stemd_mlx::Accelerator::detect`, which looks for these
-//! libraries before MLX is asked anything and settles for the CPU when they are
-//! missing. Without it a missing DLL becomes a server that accepts work and dies
-//! doing it: the delay-load helper raises a structured exception nothing can
-//! usefully catch, so the only defence is not to make the call.
+//! `stemd_mlx::Accelerator::detect` makes this safe: it looks for these libraries before MLX is
+//! called and falls back to the CPU when they are missing. A call into a missing DLL raises a
+//! structured exception that nothing can catch, so the code must never make that call.
 //!
-//! The list has to match `mlx-sys`'s, which writes its own copy to
-//! `delayload_flags.txt` in its `OUT_DIR`. Cargo cannot hand it over without a
-//! `links` key, so this is a copy and a toolkit bump changes both.
+//! The list must match the copy that `mlx-sys` writes to `delayload_flags.txt` in its `OUT_DIR`.
+//! Cargo cannot pass it over without a `links` key, so a toolkit bump changes both copies.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // Delay loading is an MSVC linker feature. Everywhere else these are
-    // ordinary shared libraries, resolved before `main`, and a missing one is a
-    // process that does not start, which is already a clear failure.
+    // Delay loading is an MSVC linker feature. On other targets these are ordinary shared libraries
+    // resolved before `main`, and a missing one stops the process from starting with a clear error.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
@@ -37,10 +32,8 @@ fn main() {
 
 /// Give the executable its icon and its version tab.
 ///
-/// The window sets its own icon at run time, which covers the taskbar and the
-/// title bar. This is the other one: what Explorer, a Start menu shortcut and
-/// Add/Remove Programs read, and none of them ever run the program. Without it
-/// the installer's entry is a blank page beside every other application's mark.
+/// The window sets its own icon at run time for the taskbar and the title bar. Explorer, Start menu
+/// shortcuts and Add/Remove Programs read this embedded icon without running the program.
 #[cfg(windows)]
 fn icon_and_version() {
     println!("cargo:rerun-if-changed=../../resources/stemd.ico");
@@ -53,17 +46,16 @@ fn icon_and_version() {
         .expect("embedding the icon and version resource");
 }
 
-/// Nothing to embed: the resource compiler is a Windows tool, and a build script
-/// on another host has none. Reached only when cross-compiling to msvc, which
-/// this project does not do, so it is silent rather than a warning.
+/// Nothing to embed: the resource compiler is a Windows tool, and a build script on another host
+/// has none. This is reached only when cross-compiling to msvc, which this project does not do, so
+/// it prints no warning.
 #[cfg(not(windows))]
 fn icon_and_version() {}
 
-/// Every DLL `mlx-sys` delay-loads. The linker keeps the ones this binary imports
-/// and answers `LNK4199` for the rest, which on MLX v0.31.2 is four kept and
-/// thirty-two ignored. Trimming to those four would mean the next MLX to call
-/// cuBLAS directly quietly acquires a hard import, which is a release that no
-/// longer starts without CUDA.
+/// Every DLL `mlx-sys` delay-loads. The linker keeps the ones this binary imports and reports
+/// `LNK4199` for the others; on MLX v0.31.2, four are kept and thirty-two ignored. Keep the full
+/// list: if a later MLX calls cuBLAS directly, a trimmed list would give it a hard import, and the
+/// release would no longer start without CUDA.
 const DELAY_LOADED: &[&str] = &[
     "cublas64_13.dll",
     "cublasLt64_13.dll",

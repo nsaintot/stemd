@@ -1,5 +1,5 @@
-//! Separations by track id: what the server holds for one output, its stems,
-//! and every stem in one download.
+//! Lookups by track id: what the server holds for one output, each stored stem, and every stem in
+//! one download.
 //!
 //! ```text
 //! GET /v2/separations/{track id}?<output params>                state and stems
@@ -49,9 +49,9 @@ pub fn format_code(format: StemFormat) -> Option<u16> {
     }
 }
 
-/// Bytes before the first index entry.
+/// The number of bytes before the first index entry.
 pub const BUNDLE_HEADER: usize = 24;
-/// Bytes per index entry.
+/// The number of bytes per index entry.
 pub const BUNDLE_ENTRY: usize = 32;
 
 /// One stem of a bundle.
@@ -126,7 +126,8 @@ async fn view(
     answer_for(&state, id, &params).await
 }
 
-/// The lookup of the track a file key names; an unknown or ambiguous key is `unknown_separation`.
+/// The lookup for the track that a file key names; an unknown or ambiguous key gets
+/// `unknown_separation`.
 async fn view_by_file(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CreateParams>,
@@ -184,10 +185,7 @@ async fn resolve(
         match lookup(&cache, &sessions, &jobs, &model_id, &output, &id) {
             Some(held) => Err(ApiError::new(
                 StatusCode::CONFLICT,
-                format!(
-                    "{id} is {} for this output, not stored whole",
-                    held.state.as_str()
-                ),
+                format!("{id}: expected stored, got {}", held.state.as_str()),
             )),
             None => Err(unknown(&id)),
         }

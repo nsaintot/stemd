@@ -23,7 +23,7 @@ pub struct Polyphase {
     out_rate: u32,
     l: usize,
     m: usize,
-    /// Taps per branch, `B`.
+    /// The taps per branch, `B`.
     branch: usize,
     /// `L` branches of `B` reversed taps: `branches[r*B + i] = p[r + L*(B - 1 - i)]`.
     branches: Vec<f32>,
@@ -44,11 +44,11 @@ const fn gcd(a: usize, b: usize) -> usize {
 }
 
 impl Polyphase {
-    /// Most input samples one output frame reads. A session converts a range
-    /// with 8192 samples of context, which must cover it.
+    /// The most input samples one output frame reads. A session converts a range with 8192 samples
+    /// of context, which must be at least this long.
     pub const MAX_BRANCH: usize = 1024;
 
-    /// Most taps in one prototype.
+    /// The most taps in one prototype.
     pub const MAX_TAPS: usize = 1 << 20;
 
     /// A filter converting `in_rate` to `out_rate` through the prototype `taps`.
@@ -111,7 +111,7 @@ impl Polyphase {
         self.branch
     }
 
-    /// Output frames for `frames` input frames: `ceil(frames * L / M)`.
+    /// The output frame count for `frames` input frames: `ceil(frames * L / M)`.
     pub(crate) const fn out_frames(&self, frames: usize) -> usize {
         (frames * self.l).div_ceil(self.m)
     }
@@ -120,7 +120,7 @@ impl Polyphase {
     pub fn resample(&self, audio: &Audio) -> Result<Audio> {
         ensure!(
             audio.sample_rate == self.in_rate,
-            "this filter converts {} to {} Hz, not {}",
+            "filter input: expected {} Hz (output {} Hz), got {} Hz",
             self.in_rate,
             self.out_rate,
             audio.sample_rate
@@ -159,7 +159,7 @@ impl Polyphase {
         for o in dst.iter_mut() {
             let taps = &self.branches[r * b..(r + 1) * b];
 
-            // Accumulated in f64 and rounded once.
+            // Accumulate in f64 and round once.
             let acc: f64 = if newest + 1 >= b && newest < src.len() {
                 src[newest + 1 - b..=newest]
                     .iter()

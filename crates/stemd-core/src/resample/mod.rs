@@ -1,31 +1,28 @@
-//! Sample-rate conversion, on the way in and on the way out.
+//! Sample-rate conversion of uploads and of stems.
 //!
-//! Separation always runs at the model's own rate. An upload at any other rate is
-//! converted before the model sees it, and the stems are converted again to
-//! whatever the job asked for, so neither rate changes what the model saw.
+//! Separation always runs at the model's own rate. An upload at any other rate is converted before
+//! the model sees it, and the stems are converted again to the rate the job asked for, so neither
+//! rate changes the model's input.
 //!
 //! # Reconstructing at a converted rate
 //!
-//! Only the two shipped stems cross the wire, so a client rebuilding
-//! `mix - harmonics - vocals` must resample its own mix to the stems' rate first.
-//! That recovers the same signal, model residual included, because resampling is
-//! linear: converting the parts and converting the mix commute.
-//! `a_client_rebuilds_the_same_derived_part_at_any_rate` holds it at better than
-//! -100 dB.
+//! Only the two shipped stems are sent, so a client that rebuilds `mix - harmonics - vocals` must
+//! first resample its own mix to the stems' rate. That recovers the same signal, model residual
+//! included, because resampling is linear: converting the parts and converting the mix commute.
+//! `a_client_rebuilds_the_same_derived_part_at_any_rate` checks it to better than -100 dB.
 //!
-//! It is only exact if the client's filter matches this one. Against ffmpeg's
-//! `swresample` the two agree to about -77 dB of the mix, which on a derived part
-//! sitting 41 dB below the mix showed up as -36 dB of that part.
+//! The result is exact only if the client's filter matches this one. Against ffmpeg's `swresample`
+//! the two agree to about -77 dB of the mix. A derived part can sit 41 dB below the mix, so the
+//! error is then only 36 dB under that part.
 //!
 //! # DSP modes
 //!
 //! [`DspMode::General`], mode 0, is the default and handles any rate pair.
 //!
-//! A client that cannot match its filter to ours can ask for a mode that matches
-//! ours to its. [`DspMode::Mode1`] is one such: it reproduces a particular
-//! client's own 44.1 to 96 kHz converter, which turns the -36 dB above into
-//! -101 dB. It is that one rate pair and nothing else, and it is never selected
-//! unless a job names it.
+//! A client that cannot match its filter to the server's can ask for a mode that matches the
+//! client's. [`DspMode::Mode1`] reproduces one client's own 44.1 to 96 kHz converter, which turns
+//! the -36 dB above into -101 dB. It covers that one rate pair and is used only when a job names
+//! it.
 
 pub mod mode1;
 pub mod polyphase;
@@ -40,22 +37,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::pcm::Audio;
 
-/// Frames per processing chunk. Large enough that the FFT overhead is amortised,
-/// small enough that the intermediate buffers stay modest for a long track.
+/// The frames per processing chunk: large enough to amortise the FFT overhead, and small enough to
+/// keep the intermediate buffers modest for a long track.
 const CHUNK: usize = 4096;
 
-/// Which filter a conversion runs through.
-///
-/// Numbered rather than named. Mode 0 is a resampler; the rest are copies of
-/// somebody else's, and exist so that both sides of a client's subtraction can
-/// have gone through the same one. Naming them after what they sound like would
-/// suggest a quality ladder, which this is not.
+/// The filter a conversion runs through.
+// Modes are numbered. Mode 0 is a resampler; the others copy a client's own filter, so both sides
+// of the client's subtraction go through the same filter. Names describing their sound would
+// suggest a quality ranking, and there is none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DspMode {
-    /// General-purpose, any rate pair. The default.
+    /// The general-purpose filter for any rate pair, and the default.
     #[default]
     General,
-    /// 44.1 to 96 kHz only, and an error on any other pair. See [`mode1`].
+    /// 44.1 to 96 kHz only; any other pair is an error. See [`mode1`].
     Mode1,
 }
 
@@ -77,11 +72,10 @@ impl DspMode {
         }
     }
 
-    /// The numbered mode covering exactly this conversion, if there is one.
+    /// The numbered mode that covers exactly this conversion, if any.
     ///
-    /// For telling a client it is converting a pair somebody bothered to
-    /// reproduce a filter for, without deciding for it that it wants that
-    /// filter: most callers do not, and the ones that do have to say so.
+    /// It lets the server tell a client that a matching filter exists for the pair without choosing
+    /// that filter for it: most callers do not want it, and those that do must ask.
     pub fn for_pair(from: u32, to: u32) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -138,15 +132,15 @@ impl fmt::Display for DspMode {
     }
 }
 
-/// Output sample rates a client may ask for.
+/// The output sample rates a client may ask for.
 ///
-/// A closed set rather than an arbitrary integer: each one is a rate real
-/// hardware runs at, and refusing the rest keeps a typo from silently pitching a
-/// track. [`Self::Hz44100`] is the model's own rate and costs no conversion.
+/// The set is closed: each rate is one that real hardware runs at, and refusing other values keeps
+/// a typo from silently pitch-shifting a track. [`Self::Hz44100`] is the model's own rate and needs
+/// no conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputRate {
-    /// 24 kHz. Half-band; useful where bandwidth matters more than headroom.
+    /// 24 kHz, half-band, for when bandwidth matters more than headroom.
     #[serde(rename = "24000")]
     Hz24000,
     /// 44.1 kHz: the model's own rate, and the default. No conversion runs.
@@ -209,12 +203,10 @@ pub fn to_rate(audio: &Audio, target: u32) -> Result<Audio> {
 }
 
 /// Convert `audio` to `target` Hz through `mode`'s filter.
-///
-/// Returning the input unchanged at a matching rate keeps the default path free: a
-/// client that does not ask for a rate pays nothing, and the native path's
-/// bit-exactness is not spent on a round trip through a filter. A mode that only
-/// covers one pair is an error on any other, rather than a silent fall back to
-/// the general resampler, which would hand the client a filter it cannot match.
+// Returning the input unchanged at a matching rate keeps the default path free: a client that asks
+// for no rate pays nothing, and the native path stays bit-exact. A mode that covers one pair fails
+// on any other; falling back to the general resampler would give the client a filter it cannot
+// match.
 pub fn to_rate_with(audio: &Audio, target: u32, mode: DspMode) -> Result<Audio> {
     if audio.sample_rate == target || audio.frames() == 0 {
         return Ok(audio.clone());
@@ -226,7 +218,7 @@ pub fn to_rate_with(audio: &Audio, target: u32, mode: DspMode) -> Result<Audio> 
         DspMode::Mode1 => {
             anyhow::ensure!(
                 audio.sample_rate == mode1::IN_RATE && target == mode1::OUT_RATE,
-                "dsp mode 1 converts {} to {} Hz, not {} to {target}",
+                "dsp mode 1: expected {} to {} Hz, got {} to {target}",
                 mode1::IN_RATE,
                 mode1::OUT_RATE,
                 audio.sample_rate
@@ -284,8 +276,8 @@ mod tests {
         Audio::new(vec![plane.clone(), plane], rate)
     }
 
-    /// Dominant frequency, by picking the strongest bin of a naive DFT over a
-    /// window well inside the clip (so the resampler's edges do not skew it).
+    /// The dominant frequency: the strongest bin of a naive DFT over a window well inside the clip,
+    /// away from the resampler's edges.
     fn dominant_hz(audio: &Audio) -> f32 {
         let n = 8192.min(audio.frames());
         let start = (audio.frames() - n) / 2;
@@ -318,9 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_rate_is_refused_rather_than_approximated() {
-        // 22050 is a real rate, just not one this server offers; silently
-        // picking the nearest would pitch the track.
+    fn an_unsupported_rate_is_refused() {
+        // 22050 is a real rate, but this server does not offer it; picking the nearest would
+        // pitch-shift the track.
         assert!("22050".parse::<OutputRate>().is_err());
         assert!("".parse::<OutputRate>().is_err());
         assert!(OutputRate::from_hz(22_050).is_none());
@@ -341,7 +333,7 @@ mod tests {
             let out = to_rate(&audio, rate.hz()).unwrap();
             assert_eq!(out.sample_rate, rate.hz());
             assert_eq!(out.channels(), 2, "{rate} lost a channel");
-            // Duration is preserved, within a few frames of resampler edge.
+            // The duration is kept within a few frames, allowing for the resampler's edges.
             let want = audio.duration_secs();
             assert!(
                 (out.duration_secs() - want).abs() < 0.01,
@@ -353,8 +345,8 @@ mod tests {
 
     #[test]
     fn a_tone_keeps_its_pitch_through_every_conversion() {
-        // The failure this catches is a wrong ratio, which shifts pitch: the
-        // one resampling bug that is obvious by ear and invisible in geometry.
+        // A wrong ratio shifts the pitch, which is audible while the length and the channel count
+        // stay correct.
         let audio = tone(1000.0, 44_100, 1.0);
         for rate in OutputRate::ALL {
             let out = to_rate(&audio, rate.hz()).unwrap();
@@ -386,14 +378,13 @@ mod tests {
 
     /// The reconciliation a client performs at a converted rate.
     ///
-    /// It resamples its own mix, subtracts the two stems it was sent, and must end up
-    /// with the same `drums` it would have had at the native rate:
-    /// `R(mix - h - v) == R(mix) - R(h) - R(v)`, which holds because resampling is
-    /// linear.
+    /// The client resamples its own mix, subtracts the two stems it was sent, and must get the same
+    /// `drums` it would have at the native rate: `R(mix - h - v) == R(mix) - R(h) - R(v)`, which
+    /// holds because resampling is linear.
     #[test]
     fn a_client_rebuilds_the_same_derived_part_at_any_rate() {
-        // Parts that deliberately do not sum to the mix, so the model residual
-        // is real and has to survive the round trip onto the derived fader.
+        // The parts do not sum to the mix, so the model residual is real and must survive the round
+        // trip onto the derived fader.
         let mix = tone(220.0, 44_100, 1.0);
         let harmonics = Audio::new(
             mix.data
@@ -419,8 +410,8 @@ mod tests {
         for rate in OutputRate::ALL {
             let want = to_rate(&native_derived, rate.hz()).unwrap();
 
-            // What the client computes: convert the mix, subtract the two
-            // stems it was sent (converted independently, by the server).
+            // The client's computation: convert the mix, then subtract the two stems it was sent,
+            // which the server converted separately.
             let mix_r = to_rate(&mix, rate.hz()).unwrap();
             let h_r = to_rate(&harmonics, rate.hz()).unwrap();
             let v_r = to_rate(&vocals, rate.hz()).unwrap();
@@ -515,9 +506,8 @@ mod tests {
         }
     }
 
-    /// A mode that covers one pair refuses every other, so a client asking for a
-    /// filter it can match is never quietly handed a different one. A conversion
-    /// that does not run is not a filter, so the native rate stays free.
+    /// A mode that covers one pair refuses every other, so a client that asks for a filter it can
+    /// match never gets a different one. At the native rate no conversion runs.
     #[test]
     fn mode_1_converts_only_its_own_pair() {
         let at_44 = tone(440.0, 44_100, 0.2);
@@ -529,8 +519,7 @@ mod tests {
         assert!(to_rate_with(&at_48, 96_000, DspMode::Mode1).is_err());
     }
 
-    /// The two modes are different filters, not the same one behind two names,
-    /// and the general one is what a job gets when it does not ask.
+    /// The two modes are different filters, and a job that does not ask gets the general one.
     #[test]
     fn mode_1_is_a_different_filter_from_the_general_one() {
         let mix = tone(440.0, 44_100, 0.5);
@@ -549,14 +538,12 @@ mod tests {
         assert_eq!(default.data, general.data);
     }
 
-    /// Where a feature lands after conversion. Not a detail a client can absorb:
-    /// a stem late against the track is late under the fader.
-    ///
-    /// The general resampler is aligned, so an impulse comes out where the ratio
-    /// puts it. Mode 1 is 64 output samples later at 96 kHz, which is the
-    /// converter's own group delay (18880 taps, peak centred, so 29.5 input
-    /// samples) and is the point of the mode rather than a defect in it: the
-    /// client's mix went through the same filter and carries the same delay.
+    /// Where a feature lands after conversion. A client cannot correct for this delay, and the stem
+    /// plays late against the track.
+    // The general resampler is aligned, so an impulse comes out where the ratio puts it. Mode 1 is
+    // 64 output samples later at 96 kHz: the converter's own group delay (18880 taps, peak centred,
+    // so 29.5 input samples). The mode keeps that delay on purpose, since the client's mix went
+    // through the same filter and carries the same delay.
     #[test]
     fn a_conversion_puts_a_feature_where_its_own_filter_puts_it() {
         let at = 22_050;
@@ -589,18 +576,15 @@ mod tests {
         assert_eq!(peak(&one), want + 64, "mode 1's group delay moved");
     }
 
-    /// The two modes are not interchangeable on the one path that matters, and
-    /// this is what it costs to get it wrong.
-    ///
-    /// A client that rebuilds `drums = mix - harmonics - vocals` resamples its
-    /// own mix with its own filter. Serve it stems through the same filter and
-    /// the subtraction cancels. Serve it stems through the general one, which is
-    /// aligned where the other carries 64 samples of group delay, and the parts
-    /// do not line up: at 1.5 kHz that offset is a third of a cycle, so the
-    /// vocals are not removed from the mix, they are roughly doubled in it.
-    ///
-    /// Which is why `dsp_mode` is opt-in on the wire and a client that needs it
-    /// has to say so on every job.
+    /// The two modes are not interchangeable on the derived-part path. Serving the general filter
+    /// to a client that resamples with mode 1 roughly doubles the vocals in the part it rebuilds.
+    // A client that rebuilds `drums = mix - harmonics - vocals` resamples its own mix with its own
+    // filter, and stems served through the same filter make the subtraction cancel. The general
+    // filter is aligned where the other has 64 samples of group delay, so at 1.5 kHz the stems are
+    // a third of a cycle off.
+    //
+    // This is why `dsp_mode` is opt-in on the wire, and a client that needs it must name it on
+    // every job.
     #[test]
     fn a_client_that_does_not_ask_for_its_own_filter_gets_no_cancellation() {
         let rate = 44_100;
@@ -626,7 +610,7 @@ mod tests {
             rate,
         );
 
-        // The client's side is fixed: its own mix, through its own filter.
+        // The client's side is fixed: its own mix through its own filter.
         let mix96 = to_rate_with(&mix, 96_000, DspMode::Mode1).unwrap();
         let want = to_rate_with(&drums, 96_000, DspMode::Mode1).unwrap();
 
@@ -637,7 +621,7 @@ mod tests {
                 .into_iter()
                 .min()
                 .unwrap();
-            // The filters ramp at both ends; the question is the steady state.
+            // The filters ramp at both ends, so measure the steady state.
             let (lo, hi) = (n / 8, n - n / 8);
             let (mut err, mut sig) = (0.0f64, 0.0f64);
             for i in lo..hi {
@@ -656,8 +640,8 @@ mod tests {
             matched < -100.0,
             "the matched filter should cancel: {matched:.1} dB"
         );
-        // Not a near miss. The error is louder than the part it replaces, which
-        // is why this is audible as the vocals coming back rather than as noise.
+        // The error is louder than the part it replaces, so it is heard as the vocals coming back,
+        // and not as noise.
         assert!(
             general > 0.0,
             "the general filter should not cancel: {general:.1} dB"

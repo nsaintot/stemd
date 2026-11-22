@@ -1,8 +1,7 @@
 //! BS-RoFormer: band-split transformers over a spectrogram.
 //!
-//! No convolutions at all: linear layers, RMS norms and attention, so nothing has
-//! to be rearranged between channels-first and channels-last, and every piece has
-//! a fused kernel behind it.
+//! It has no convolutions: linear layers, RMS norms and attention, so nothing needs rearranging
+//! between channels-first and channels-last, and every piece has a fused kernel.
 //!
 //! ```text
 //! audio [B, 2, T]
@@ -14,9 +13,9 @@
 //!   -> multiply the spectrogram, inverse stft
 //! ```
 //!
-//! It emits one stem per mask estimator: vocals alone for the published
-//! checkpoints, bass, drums, other and vocals for stemd's own. See
-//! docs/evaluation.md for what that means for a server shipping `harmonics`.
+//! It emits one stem per mask estimator: vocals alone for the published checkpoints, and bass,
+//! drums, other and vocals for stemd's own. docs/evaluation.md explains what that means for a
+//! server shipping `harmonics`.
 
 use std::f32::consts::PI;
 
@@ -28,9 +27,8 @@ use crate::precision::Precision;
 use crate::spectral::Stft;
 use crate::weights::{Scope, Weights};
 
-/// Everything the artefact was trained with. Not configurable, for the same
-/// reason [`crate::htdemucs::Config`] is not: a different value here does not
-/// make a different model, it makes one the weights no longer fit.
+/// The values the artefact was trained with. They are fixed, for the same reason as
+/// [`crate::htdemucs::Config`]: a different value gives a model the weights no longer fit.
 pub struct Config {
     pub dim: i32,
     pub depth: i32,
@@ -40,19 +38,19 @@ pub struct Config {
     pub audio_channels: i32,
     pub n_fft: i32,
     pub hop: i32,
-    /// Frequency bins per band. Sums to `n_fft / 2 + 1`.
+    /// The frequency bins per band, summing to `n_fft / 2 + 1`.
     pub bands: Vec<i32>,
-    /// Hidden width of each band's mask MLP, as a multiple of `dim`.
+    /// The hidden width of each band's mask MLP, as a multiple of `dim`.
     pub mask_expansion: i32,
-    /// Samples in one chunk. Unlike htdemucs this is not a hard constraint:
-    /// position is rotary, so any length runs, but it is what the model was
-    /// trained at and what the overlap-add is sized around.
+    /// The samples in one chunk. Unlike htdemucs, this is not a hard limit: position is rotary, so
+    /// any length runs, but the model was trained at this length and the overlap-add is sized
+    /// around it.
     pub chunk: i32,
     pub sample_rate: i32,
-    /// Precision the transformer stack runs at.
+    /// The precision the transformer stack runs at.
     ///
-    /// [`Precision`] rather than a [`Dtype`] so a caller can ask for half
-    /// without linking mlx into its own signatures; see [`crate::precision`].
+    /// It is a [`Precision`], so a caller can ask for half without linking mlx into its own
+    /// signatures; see [`crate::precision`].
     pub precision: Precision,
     /// How position enters attention.
     pub positional: Positional,
@@ -60,14 +58,14 @@ pub struct Config {
     pub zero_dc: bool,
 }
 
-/// Which positional scheme the artefact was trained with.
+/// The positional scheme the artefact was trained with.
 ///
-/// Not a tuning knob: the weights were trained against one of these and the
-/// other produces plausible noise. The artefact says which: a PoPE checkpoint
-/// carries `pope_embed.*` tensors and no `rotary_embed.freqs`.
+/// The weights were trained with one of these, and the other produces plausible noise, so it is not
+/// a tunable setting. The artefact says which: a PoPE checkpoint carries `pope_embed.*` tensors and
+/// no `rotary_embed.freqs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Positional {
-    /// Rotary, interleaved, applied to q and k. The viperx checkpoints.
+    /// Rotary, interleaved, applied to q and k, as in the viperx checkpoints.
     Rope,
     /// Polar: q and k become magnitudes through softplus and are rotated into
     /// (cos, sin) pairs, with a learned per-head phase on the keys. See
@@ -111,11 +109,10 @@ impl Default for Config {
 
 impl Config {
     /// BS PolarFormer, which is this architecture at half the width.
-    ///
-    /// Same 62-band table summing to 1025, same depth, same eight heads of 64, same
-    /// `ff_mult`, same mask estimator shape. Four things move: the residual width,
-    /// the hop, the chunk, and rotary becoming polar. That is why this is a
-    /// constructor rather than a second model.
+    // It has the same 62-band table summing to 1025, the same depth, the same eight heads of 64,
+    // the same `ff_mult` and the same mask estimator shape. Four things change: the residual
+    // width, the hop, the chunk, and polar position in place of rotary. So PolarFormer needs only
+    // this `Config` constructor.
     pub fn polarformer() -> Self {
         Self {
             dim: 256,
@@ -136,7 +133,7 @@ impl Config {
         }
     }
 
-    /// Which variant an artefact is, asked of its tensors.
+    /// The variant an artefact holds, read from its tensors.
     ///
     /// `pope_embed` means PolarFormer; a rotary artefact of width 256 with more than
     /// one mask estimator is `stemd_roformer`; anything else is viperx.
@@ -165,13 +162,13 @@ impl Config {
         }
     }
 
-    /// Frequency bins the transform produces.
+    /// The number of frequency bins the transform produces.
     pub fn bins(&self) -> i32 {
         self.n_fft / 2 + 1
     }
 
-    /// Width of each band once complex parts and audio channels are unrolled
-    /// into it, which is what the band split actually projects from.
+    /// The width of each band once complex parts and audio channels are unrolled into it, which is
+    /// what the band split projects from.
     pub fn band_features(&self) -> Vec<i32> {
         self.bands
             .iter()
@@ -194,10 +191,10 @@ impl Config {
 
 /// `x / rms(x) * gamma`, over the last axis.
 ///
-/// The reference spells this `F.normalize(x, dim=-1) * sqrt(dim) * gamma`, which
-/// is the same thing: dividing by the L2 norm and multiplying by the root of the
-/// length is dividing by the root mean square. There is no bias, so reaching for a
-/// layer norm here would load without complaint and be wrong.
+/// The reference writes this as `F.normalize(x, dim=-1) * sqrt(dim) * gamma`, which is the same:
+/// dividing by the L2 norm and multiplying by the square root of the length divides by the root
+/// mean square. There is no bias, so a layer norm here would load without complaint and give wrong
+/// results.
 struct RmsNorm {
     gamma: Array,
 }
@@ -245,9 +242,8 @@ impl Linear {
 
 /// One projection per frequency band, from that band's bins to the model width.
 ///
-/// The bands are not equal: 2 bins wide at the bottom and 129 at the top, so each
-/// carries its own norm and its own matrix, and there are sixty-two. This is where
-/// the model's frequency resolution is decided.
+/// The bands differ in width, from 2 bins at the bottom to 129 at the top, so each of the sixty-two
+/// carries its own norm and matrix. This decides the model's frequency resolution.
 struct BandSplit {
     bands: Vec<(RmsNorm, Linear)>,
     widths: Vec<i32>,
@@ -282,9 +278,9 @@ impl BandSplit {
 
 /// Attention with a rotary position, and a gate per head.
 ///
-/// After attending, each head's output is scaled by `sigmoid(W x)` for that head:
-/// eight numbers per position, learned. It is not in the paper's diagram, and
-/// leaving it out would load fine and separate slightly worse.
+/// After attending, each head's output is scaled by `sigmoid(W x)` for that head: eight learned
+/// numbers per position. The paper's diagram omits it, and leaving it out would load fine and
+/// separate slightly worse.
 pub struct Attention {
     norm: RmsNorm,
     qkv: Linear,
@@ -296,12 +292,11 @@ pub struct Attention {
     pope: Option<Pope>,
 }
 
-/// Base of the rotary embedding. Checked against the artefact rather than
-/// assumed: the stored `rotary_embed.freqs` are exactly
-/// `1 / 10000^(arange(0, 64, 2) / 64)`.
+/// The base of the rotary embedding. It matches the artefact: the stored `rotary_embed.freqs` are
+/// exactly `1 / 10000^(arange(0, 64, 2) / 64)`.
 const ROPE_BASE: f32 = 10_000.0;
 
-/// Polar positional embedding: the one thing BS PolarFormer does differently.
+/// Polar positional embedding, the only code BS PolarFormer adds to this architecture.
 ///
 /// Rotary turns q and k as vectors by an angle that depends on position. Polar
 /// keeps only a magnitude, `softplus(q)`, and places it on the unit circle at the
@@ -318,13 +313,13 @@ const ROPE_BASE: f32 = 10_000.0;
 /// pair. `v` is untouched at 64, so this cannot go through a fused attention
 /// kernel that wants one head size for all three.
 ///
-/// The bias is on the keys only, learned per head and per frequency, and clamped
-/// to `[-2pi, 0]` on the way out: the clamp is in the reference, and a checkpoint
-/// is not a promise, so it is applied rather than assumed.
+/// The bias is on the keys only, learned per head and per frequency, and clamped to `[-2pi, 0]` on
+/// output. The reference clamps, and a checkpoint guarantees nothing, so the clamp is applied here
+/// too.
 struct Pope {
-    /// `[dim_head]`, stored rather than derived: the reference registers them
-    /// as a buffer, so a checkpoint could have been trained with something
-    /// other than the `theta ** -(arange(d) / d)` default.
+    /// `[dim_head]`, stored and never derived: the reference registers them as a buffer, so a
+    /// checkpoint could have been trained with values other than the `theta ** -(arange(d) / d)`
+    /// default.
     inv_freqs: Array,
     /// `[heads, dim_head]`, the learned phase offset on the keys.
     bias: Array,
@@ -341,9 +336,8 @@ impl Pope {
 
     /// `q, k: [B, heads, N, dim_head] -> [B, heads, N, 2 * dim_head]` each.
     fn apply(&self, q: &Array, k: &Array, positions: i32) -> Result<(Array, Array)> {
-        // Angles in float32 whatever the model runs at. This is the same
-        // lesson the normalisations taught: a cosine of a large position index
-        // in half precision is not the cosine of that index.
+        // Compute the angles in float32 whatever the model runs at, as with the normalisations: the
+        // cosine of a large position index in half precision is not the cosine of that index.
         let steps =
             ops::arange::<_, f32>(0.0, f64::from(positions), 1.0)?.reshape(&[positions, 1])?;
         let inv = self.inv_freqs.as_dtype(Dtype::Float32)?.reshape(&[1, -1])?;
@@ -381,9 +375,8 @@ impl Pope {
 
 /// `log(1 + exp(x))`, in the form that does not overflow.
 ///
-/// The direct spelling loses the whole tensor to `inf` for `x` past about 11 in
-/// half precision, and these are pre-activation attention inputs, which are not
-/// bounded.
+/// The direct form turns the whole tensor to `inf` for `x` past about 11 in half precision, and
+/// these pre-activation attention inputs are unbounded.
 fn softplus(x: &Array) -> Result<Array> {
     let zero = crate::layers::scalar_like(0.0, x)?;
     let positive = ops::maximum(x, &zero)?;
@@ -424,10 +417,9 @@ impl Attention {
         let qkv = ops::transpose_axes(&qkv, &[2, 0, 3, 1, 4][..])?;
         let part = |i: i32| qkv.index(i);
 
-        // Rotary over the whole head depth, interleaved rather than split-half
-        // -- `traditional` is mlx's name for the convention
-        // `rotary_embedding_torch` uses, and the other one would rotate pairs
-        // of dimensions that were never paired during training.
+        // Rotary over the whole head depth, interleaved: `traditional` is mlx's name for the
+        // convention `rotary_embedding_torch` uses, and the split-half convention would rotate
+        // pairs of dimensions that were never paired in training.
         let rope = |t: &Array| -> Result<Array> {
             Ok(mlx_rs::fast::rope(
                 t,
@@ -448,11 +440,12 @@ impl Attention {
                 let k = rope(&part(1))?;
                 mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None)?
             }
-            //  Polar doubles the depth of q and k and leaves v alone, so the fused kernel is
-            //  not available: it wants one head size for all three. Written out, which costs
-            //  an explicit N-by-N score matrix.
-            //  The scale is `dim_head ** -0.5` and not `(2 * dim_head) ** -0.5`, which is what
-            //  the weights were trained under.
+            // Polar doubles the depth of q and k and leaves v alone, so the fused kernel, which
+            // wants one head size for all three, cannot be used. The written-out form costs an
+            // explicit N-by-N score matrix.
+            //
+            // The weights were trained with a scale of `dim_head ** -0.5`, although q and k are `2
+            // * dim_head` deep.
             Some(pope) => {
                 let (q, k) = pope.apply(&part(0), &part(1), positions)?;
                 let scores = ops::matmul(&q, &ops::swap_axes(&k, -1, -2)?)?;
@@ -476,7 +469,7 @@ impl Attention {
     }
 }
 
-/// Norm, widen, gelu, narrow.
+/// A feed-forward block: norm, widen, gelu, narrow.
 pub struct FeedForward {
     norm: RmsNorm,
     up: Linear,
@@ -504,9 +497,9 @@ impl FeedForward {
 
 /// A stack of attention-then-feed-forward, each residual.
 ///
-/// No output norm, unlike the class it is ported from: these are built with
-/// `norm_output` off and only [`BsRoformer`] carries a final one. A norm here
-/// would need weights that are not in the artefact.
+/// It has no output norm, unlike the class it is ported from: these are built with `norm_output`
+/// off, and only [`BsRoformer`] has a final norm. A norm here would need weights that are not in
+/// the artefact.
 pub struct Transformer {
     layers: Vec<(Attention, FeedForward)>,
 }
@@ -541,9 +534,8 @@ impl Transformer {
 
 /// One block: attention across time, then attention across bands.
 ///
-/// Both are ordinary transformers; what differs is which axis is folded into the
-/// batch before they run. Every band sees the whole timeline, then every instant
-/// sees the whole spectrum.
+/// Both are ordinary transformers and differ in which axis is folded into the batch before they
+/// run. Every band sees the whole timeline, then every instant sees the whole spectrum.
 pub struct Block {
     pub time: Transformer,
     pub freq: Transformer,
@@ -552,10 +544,9 @@ pub struct Block {
 /// One small network per band, turning the model's features back into a complex
 /// mask over that band's bins.
 ///
-/// Each is `dim -> dim * 4 -> width * 2` with a tanh between, and a gated linear
-/// unit then halves the output: the first half is the mask, the second gates it.
-/// The tanh bounds the hidden layer, and the activation the rest of the model uses
-/// would load fine and mask differently.
+/// Each is `dim -> dim * 4 -> width * 2` with a tanh between, and a gated linear unit then halves
+/// the output: the first half is the mask, and the second gates it. The tanh bounds the hidden
+/// layer; the gelu used elsewhere in the model would load fine and mask differently.
 struct MaskEstimator {
     bands: Vec<(Linear, Linear)>,
 }
@@ -606,7 +597,7 @@ impl crate::apply::Chunked for BsRoformer {
     }
 }
 
-/// The model.
+/// The BS-RoFormer model.
 pub struct BsRoformer {
     stft: Stft,
     band_split: BandSplit,
@@ -671,8 +662,8 @@ impl BsRoformer {
     /// The spectrogram flattened the way the band split wants it.
     ///
     /// `[B, C, F, N] -> [B, N, F * C * 2]`, ordered by frequency, then audio channel,
-    /// then real and imaginary. Getting that order wrong produces exactly the right
-    /// shape and feeds every band a mixture of its neighbours' bins.
+    /// then real and imaginary. Getting that order wrong gives exactly the right shape and feeds
+    /// every band a mix of its neighbours' bins.
     pub fn interleave(&self, real: &Array, imag: &Array) -> Result<Array> {
         let shape = real.shape().to_vec();
         let (batch, channels, bins, frames) = (shape[0], shape[1], shape[2], shape[3]);
@@ -731,7 +722,7 @@ impl BsRoformer {
         let (channels, samples) = (shape[1], shape[2]);
         if channels != self.config.audio_channels {
             bail!(
-                "this model separates {}-channel audio, not {channels}",
+                "expected {}-channel audio, got {channels}",
                 self.config.audio_channels
             );
         }
@@ -752,13 +743,13 @@ impl BsRoformer {
     }
 
     /// Apply a mask to the spectrogram it was estimated from, and invert.
-    ///
-    /// Everything in [`Self::forward`] after one mask estimator: the complex
-    /// multiply, DC zeroing when `zero_dc` is set, and the inverse transform.
-    /// `[B, N, F * C * 2]` of mask and `[B, C, F, N]` of spectrogram in,
-    /// `[B, C, samples]` out.
-    ///
-    /// Split out so it can be measured directly; the stages do not sum to the forward.
+    // Everything in [`Self::forward`] after one mask estimator: the complex
+    // multiply, DC zeroing when `zero_dc` is set, and the inverse transform.
+    // `[B, N, F * C * 2]` of mask and `[B, C, F, N]` of spectrogram in,
+    // `[B, C, samples]` out.
+    //
+    // Split out so it can be measured on its own; the stage timings do not sum to the forward
+    // pass.
     pub fn apply(&self, mask: &Array, real: &Array, imag: &Array, samples: i32) -> Result<Array> {
         let shape = real.shape().to_vec();
         let batch = shape[0];

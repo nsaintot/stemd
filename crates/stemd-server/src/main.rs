@@ -1,4 +1,4 @@
-//! stemd: host-side stem separation service.
+//! stemd, a stem separation server with a desktop window.
 //!
 //! ```text
 //! cli       parse the command line
@@ -69,12 +69,12 @@ fn main() -> Result<()> {
     cuda::point_at_bundled_headers();
     let args = cli::Args::from_process();
     let logs = init_logging();
-    // After the subscriber exists, or the first panic is reported to nothing.
+    // Install after the subscriber exists, so the first panic is reported.
     panics::install();
     if args.install_cuda {
         return install_cuda();
     }
-    // Before `prepare`, which clears the cache root. Held until the process ends.
+    // Lock before `prepare`, which clears the cache root, and hold the lock until the process ends.
     let _instance = cache::lock(&args.cache_root()?)?;
     let settings = std::sync::Arc::new(startup::open_settings(&args)?);
     let (listener, taken) = match args.bind {
@@ -90,12 +90,11 @@ fn main() -> Result<()> {
 
 /// Fetch the CUDA runtime and stop, without loading a model or binding a port.
 ///
-/// Before `startup::prepare`: this runs on a machine where the GPU was refused, so
-/// preparing first would spend a minute loading a model at CPU speed for a process
-/// about to exit.
+/// This runs before `startup::prepare`: on a machine where the GPU was refused, preparing first
+/// would spend a minute loading a model at CPU speed for a process about to exit.
 ///
-/// The probe that decides the backend also decides whether there is anything to
-/// do: a working GPU wants nothing, and no card wants nothing either.
+/// The probe that picks the backend also decides whether there is anything to install: nothing is
+/// needed with a working GPU or with no NVIDIA card.
 #[cfg(windows)]
 fn install_cuda() -> Result<()> {
     use stemd_core::Accelerator;
@@ -139,19 +138,14 @@ fn install_cuda() -> Result<()> {
     )
 }
 
-/// Write to the terminal that launched us, if there was one.
-///
-/// The crate is built for the windows subsystem, because a windowed app that opens
-/// a console beside itself looks broken. That choice is made at link time, so
-/// `--headless` would otherwise be a server whose log goes nowhere.
-///
-/// `AttachConsole` gives both: launched from a terminal it adopts that one;
-/// double-clicked there is no parent console, the call fails, and the window's own
-/// log view is the answer. The failure needs no handling because it is the
-/// ordinary case.
-///
-/// The shell does not wait on a windows-subsystem process, so its prompt returns
-/// immediately and the log interleaves with it.
+/// Write to the terminal that launched the process, if there is one. Without this, `--headless`
+/// would send its log nowhere, because the crate is built for the windows subsystem.
+// `AttachConsole` adopts the console of the terminal that launched the process. When the app is
+// started by a double click, there is no parent console and the call fails; the window's log view
+// then shows the log, and the failure needs no handling.
+//
+// The shell does not wait for a windows-subsystem process, so its prompt returns at once and the
+// log interleaves with it.
 #[cfg(windows)]
 fn adopt_parent_console() {
     const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
@@ -164,27 +158,24 @@ fn adopt_parent_console() {
 #[cfg(not(windows))]
 fn adopt_parent_console() {}
 
-/// Install the tracing subscriber, returning the buffer the window and
-/// `GET /v2/logs` both read from.
+/// Install the tracing subscriber and return the buffer that the window and `GET /v2/logs` read.
 ///
-/// Four levels:
+/// Levels:
 ///
 /// * `error`: work that was asked for did not happen.
-/// * `warn`: it happened, but not the way it was asked for.
-/// * `info`: the server's own life, and the record of what it did to somebody's
-///   audio.
-/// * `debug`: mechanics. Timings, bookkeeping, and paths that did no work.
+/// * `warn`: the work happened differently than asked.
+/// * `info`: the server's lifecycle, and what it did to a client's audio.
+/// * `debug`: mechanics, such as timings, bookkeeping, and code paths that did no work.
 ///
-/// The two sinks are filtered apart. The console takes `info` and up; the buffer
-/// keeps `debug` as well, so the window's level dropdown has something to reveal.
-/// `RUST_LOG` overrides both at once.
+/// The two sinks filter separately: the console shows `info` and above, and the buffer also keeps
+/// `debug` for the window's level dropdown. `RUST_LOG` overrides both.
 fn init_logging() -> LogBuffer {
     let logs = LogBuffer::new(logbuf::CAPACITY);
     let filter = |default: &str| {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default.into())
     };
-    // Colour only on a terminal: the installer streams --install-cuda's
-    // progress into its own window, and a redirected log is read by people.
+    // Use colour only on a terminal: the installer shows --install-cuda's progress in its own
+    // window, and people read redirected logs as plain text.
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::registry()
         .with(

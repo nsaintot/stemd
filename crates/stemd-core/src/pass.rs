@@ -1,4 +1,4 @@
-//! Separating a track one segment at a time, in any order.
+//! Separates a track one segment at a time, in any order.
 //!
 //! A [`Pass`] holds the crossfaded output of every model a separator runs. Each
 //! segment reads only its own input window, so segments can run in any order and
@@ -59,7 +59,7 @@ impl Pass {
         self.parts
     }
 
-    /// Number of segments.
+    /// The number of segments.
     pub const fn segments(&self) -> usize {
         self.grid.len()
     }
@@ -77,7 +77,7 @@ impl Pass {
         self.halves.iter().all(|half| half.is_final(from, to))
     }
 
-    /// Track samples segment `k` reads.
+    /// The track samples that segment `k` reads.
     pub fn window(&self, k: usize) -> std::ops::Range<usize> {
         let window = self.grid.window(k);
         window.from.unsigned_abs() as usize..window.to.unsigned_abs() as usize
@@ -153,8 +153,8 @@ pub(crate) fn source_planes(
 
 /// Separate a whole track through `separator`'s segments, in order.
 ///
-/// `between` runs before each segment, with the separator, so a caller can
-/// slip other work in.
+/// `between` runs before each segment and receives the separator, so a caller can run other work
+/// between segments.
 pub fn whole_track<S: Separate + ?Sized>(
     separator: &mut S,
     mix: &Audio,
@@ -172,7 +172,7 @@ pub fn whole_track<S: Separate + ?Sized>(
     let total = pass.segments();
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     for k in 0..total {
-        // Checked before each segment, so cancelling costs at most one.
+        // Check before each segment, so a cancel waits for at most one segment.
         if sink.cancelled() {
             return Err(Cancelled.into());
         }

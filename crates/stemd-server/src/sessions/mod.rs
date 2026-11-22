@@ -1,18 +1,17 @@
-//! Sessions: tracks separated in pieces, in the order their clients ask for.
+//! Sessions separate tracks in pieces, in the order their clients ask for.
 //!
-//! A [`Track`] holds one track's audio and what has been separated of it. A
-//! [`Session`] is one client's view of a track, a deck: its output format, its
-//! window around the playhead and its idle timer.
+//! A [`Track`] holds one track's audio and the parts separated so far. A [`Session`] is one
+//! client's (one deck's) view of a track: its output format, its window around the playhead and its
+//! idle timer.
 //!
-//! A session starts on a track of its own. When its whole upload has arrived the
-//! server hashes it into a [`track_id`]; if another session's track already has
-//! that id, the session moves onto it, so two decks playing one song share the
-//! work and the memory from then on.
+//! A session starts on a track of its own. When its whole upload has arrived, the server hashes it
+//! into a [`track_id`]. If another session's track already has that id, the session moves onto that
+//! track, so two decks playing one song share the work and the memory from then on.
 //!
 //! | Track field | Meaning                                                  |
 //! |-------------|----------------------------------------------------------|
 //! | `arrived`   | track samples uploaded so far                            |
-//! | `ready`     | samples whose every covering segment has run             |
+//! | `ready`     | samples for which every covering segment has run         |
 //! | `verdict`   | the track id, once the whole upload has been hashed      |
 //!
 //! Samples are counted at the model's rate throughout. Piece `k` is the samples
@@ -41,10 +40,10 @@ pub use spans::Spans;
 pub use track::{Track, TrackSpec, UploadError, Verdict};
 pub use view::{Activity, Ended, GridView, StemView, TrackView, View};
 
-/// Samples of context resampled either side of a range read at another rate.
+/// Samples of context resampled on each side of a range that is read at another rate.
 pub const RESAMPLE_CONTEXT: usize = 8192;
 
-/// Ended sessions kept for the window.
+/// The number of ended sessions kept for the window.
 const ENDED_KEPT: usize = 8;
 
 /// Where [`Sessions::read_stored`] takes a run of samples from.
@@ -57,7 +56,7 @@ enum Source {
 /// A range read back from a track, at the output rate.
 pub struct Excerpt {
     pub audio: Audio,
-    /// First output-rate sample.
+    /// The first sample, at the output rate.
     pub from: usize,
 }
 
@@ -71,7 +70,7 @@ struct SessionState {
 
 pub struct Session {
     pub id: String,
-    /// Counts sessions from 1 since the server started.
+    /// The session's number, counting from 1 since the server started.
     pub number: u64,
     pub output: Output,
     pub in_format: PcmFormat,
@@ -134,8 +133,8 @@ impl Session {
             .collect();
     }
 
-    /// True when every piece segment `k` feeds is on disk. At another output rate,
-    /// a piece also needs the segments within [`RESAMPLE_CONTEXT`] of it.
+    /// True when every piece that segment `k` feeds is on disk. At another output rate, a piece
+    /// also needs the segments within [`RESAMPLE_CONTEXT`] of it.
     fn covered(&self, k: usize) -> bool {
         let cached = self.cached.lock();
         let track = self.track();
@@ -181,7 +180,7 @@ impl Session {
         self.state.lock().last_seen = Instant::now();
     }
 
-    /// Replace the plan with what `request` asks for, less what has run.
+    /// Replace the plan with the segments `request` asks for, minus those that have run.
     pub fn set_window(&self, request: &WindowRequest) -> Result<()> {
         self.ensure_open()?;
         let track = self.track();
@@ -381,11 +380,11 @@ pub struct Request {
     pub norm: Option<Normalisation>,
     pub peak: Option<f32>,
     pub model_id: String,
-    /// The stored track the open names with `track=`, when it named one.
+    /// The stored track that the open names with `track=`, if any.
     pub claim: Option<Claim>,
 }
 
-/// A track id an open names, and the gain its stored pieces were written at.
+/// A track id that an open names, and the gain its stored pieces were written at.
 pub struct Claim {
     pub id: String,
     pub gain: f32,
@@ -394,9 +393,9 @@ pub struct Claim {
 /// Every open session and the tracks they play.
 pub struct Sessions {
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
-    /// By [`Track::uid`].
+    /// Tracks keyed by [`Track::uid`].
     tracks: Mutex<BTreeMap<u64, Arc<Track>>>,
-    /// Tracks whose whole upload has been hashed, by id and part set.
+    /// The uids of tracks whose whole upload has been hashed, keyed by track id and part set.
     by_id: Mutex<BTreeMap<String, u64>>,
     limits: Mutex<(Duration, usize)>,
     /// Bytes the open tracks may hold together, by [`TrackSpec::memory`].
@@ -405,12 +404,12 @@ pub struct Sessions {
     /// The last [`ENDED_KEPT`] sessions to end, oldest first.
     ended: Mutex<VecDeque<Ended>>,
     seq: AtomicU64,
-    /// Counts changes any view can show, for long polls.
+    /// Counts the changes that any view can show, for long polls.
     changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Sessions {
-    /// Sessions on `cache`, which keeps the tracks they play from eviction.
+    /// Create the sessions on `cache`, which keeps the tracks they play from eviction.
     pub fn new(idle: Duration, max: usize, cache: Arc<Cache>) -> Arc<Self> {
         let sessions = Arc::new(Self {
             sessions: Mutex::new(BTreeMap::new()),
@@ -478,7 +477,7 @@ impl Sessions {
         self.limits.lock().0
     }
 
-    /// The ids of the verified or claimed tracks open sessions play.
+    /// The ids of the verified or claimed tracks that open sessions play.
     fn open_track_ids(&self) -> HashSet<String> {
         let tracks: Vec<Arc<Track>> = self.tracks.lock().values().cloned().collect();
         tracks.iter().filter_map(|t| t.stored_id()).collect()
@@ -576,7 +575,7 @@ impl Sessions {
         ));
         sessions.insert(session.id.clone(), Arc::clone(&session));
         drop(sessions);
-        // Writes this output's pieces of what is ready already.
+        // Write this output's pieces for the samples that are already ready.
         self.store_pieces(&track, 0..track.spec.frames);
         session.set_cached(self.cached_for(&session));
         self.changed();
@@ -585,8 +584,8 @@ impl Sessions {
 
     /// Place `audio` at `offset` in `session`'s track.
     ///
-    /// The upload that completes the track hashes it (a few hundred ms) and files it under that id,
-    /// merging it into an open track with the same audio if there is one.
+    /// The upload that completes the track hashes it, which takes a few hundred ms, and files it
+    /// under that id, merging it into an open track with the same audio.
     pub fn upload(
         &self,
         session: &Session,
@@ -614,7 +613,8 @@ impl Sessions {
         Ok(())
     }
 
-    /// End every session on `track`, whose upload hashed to `actual`, and record their file keys against `actual`.
+    /// End every session on `track`, whose upload hashed to `actual`, and record their file keys
+    /// against `actual`.
     fn refute(&self, track: &Track, actual: &str) {
         let claim = track.claim.as_deref().unwrap_or_default();
         let reason = format!("upload is not track {claim}");
@@ -649,8 +649,8 @@ impl Sessions {
     /// File `track`, whose whole upload hashed to `id`, under that id.
     ///
     /// When another open track already holds the same audio and parts, every
-    /// session on `track` moves onto that one and `track` closes. Returns the
-    /// track the sessions play now.
+    /// When another open track already holds the same audio and parts, every session on `track`
+    /// moves onto that track and `track` closes. Returns the track the sessions play now.
     pub fn settle(&self, track: &Arc<Track>, id: &str) -> Arc<Track> {
         let key = format!("{id}-{}", track.spec.parts);
         let sessions = self.sessions.lock();
@@ -804,7 +804,7 @@ impl Sessions {
 
     /// Drop the tracks no session plays.
     fn drop_orphans(&self) {
-        // Held throughout, so a `join` cannot attach to a track while it is dropped.
+        // Hold the lock throughout, so a `join` cannot attach to a track while it is being dropped.
         let sessions = self.sessions.lock();
         let used: HashSet<u64> = sessions.values().map(|s| s.track().uid).collect();
         let mut tracks = self.tracks.lock();

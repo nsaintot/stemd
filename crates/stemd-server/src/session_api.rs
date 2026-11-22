@@ -1,4 +1,4 @@
-//! HTTP surface for sessions. See [`crate::sessions`] and [`crate::cache`].
+//! The HTTP routes for sessions. See [`crate::sessions`] and [`crate::cache`].
 //!
 //! ```text
 //! POST   /v2/sessions                          open: track length and output;
@@ -9,7 +9,7 @@
 //!                                              ?wait= with If-None-Match long-polls
 //! GET    /v2/sessions/{id}/stems/{name}        ?from=&to= in track samples, or the whole track
 //! GET    /v2/sessions/{id}/pieces/{name}/{k}   piece k, encoded, as stored
-//! DELETE /v2/sessions/{id}                     end it
+//! DELETE /v2/sessions/{id}                     end the session
 //! ```
 
 use std::sync::Arc;
@@ -47,10 +47,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 #[derive(Debug, Deserialize)]
 struct OpenParams {
-    /// Track length in samples, at `sample_rate`. Required unless `track` is set.
+    /// The track length in samples, at `sample_rate`. Required unless `track` is set.
     #[serde(default)]
     frames: Option<usize>,
-    /// A track id: an open track is joined, a stored one opens on its pieces.
+    /// A track id. An open track is joined; for a stored track, the session opens on its pieces.
     #[serde(default)]
     track: Option<String>,
     /// The client's key for the file the audio came from; see `GET /v2/separations?file=`.
@@ -75,13 +75,13 @@ struct OpenParams {
     dsp_mode: Option<String>,
     #[serde(default)]
     dsp_filter: Option<String>,
-    /// Mean of the mono mixdown over the whole track.
+    /// The mean of the mono mixdown over the whole track.
     #[serde(default)]
     mean: Option<f32>,
-    /// Standard deviation of the same.
+    /// The standard deviation of the mono mixdown over the whole track.
     #[serde(default)]
     std: Option<f32>,
-    /// Largest absolute sample of the mix.
+    /// The largest absolute sample of the mix.
     #[serde(default)]
     peak: Option<f32>,
 }
@@ -261,13 +261,13 @@ fn check_shape(
     }
     if params.sample_rate != model_rate {
         return Err(ApiError::bad_request(format!(
-            "a session takes the model's rate, {model_rate} Hz, not {}",
+            "sample_rate: expected {model_rate} Hz, got {}",
             params.sample_rate
         )));
     }
     if params.channels != info.channels {
         return Err(ApiError::bad_request(format!(
-            "{} takes {} channels, not {}",
+            "{}: expected {} channels, got {}",
             info.model, info.channels, params.channels
         )));
     }
@@ -319,7 +319,7 @@ fn parse_levels(params: &OpenParams) -> Result<Option<Normalisation>, ApiError> 
     Ok(norm)
 }
 
-/// The status for a session the server has no room for.
+/// The error for a session that the server has no room for.
 fn open_error(e: OpenError) -> ApiError {
     let status = match e {
         OpenError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -328,7 +328,7 @@ fn open_error(e: OpenError) -> ApiError {
     ApiError::new(status, format!("{e}"))
 }
 
-/// The 404 for a `track=` the server neither has open nor holds pieces of.
+/// The 404 for a `track=` id that the server neither has open nor holds pieces of.
 fn unknown_track(id: &str) -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
@@ -337,7 +337,8 @@ fn unknown_track(id: &str) -> ApiError {
     .with_code("unknown_separation")
 }
 
-/// The stored grid of track `id` for `output`, and the claim a session on its pieces opens with.
+/// The stored grid of track `id` for `output`, and the claim that a session on its pieces opens
+/// with.
 async fn stored_claim(
     state: &Arc<AppState>,
     params: &OpenParams,
@@ -467,7 +468,7 @@ async fn view(
         .get(http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    // Half the idle timeout at most, so a client that only polls is not reaped mid-poll.
+    // Wait at most half the idle timeout, so a client that only polls is not reaped during a poll.
     let idle = state.queue.sessions().idle_timeout();
     let wait = Duration::from_secs(params.wait.unwrap_or(0))
         .min(MAX_WAIT)
@@ -499,7 +500,7 @@ async fn end(
     if !state.queue.sessions().remove(&id, "ended by the client") {
         return Err(ApiError::not_found());
     }
-    // Lets the worker drop what the track held on the device.
+    // Wake the worker so it drops what the track held on the device.
     state.queue.wake();
     tracing::info!(session = %id, "ended by the client");
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -588,7 +589,7 @@ async fn piece(
     if !session.output.served().contains(&name.as_str()) {
         return Err(ApiError::not_found());
     }
-    // A stem stored whole: the client can fetch it in one read.
+    // The stem is stored whole, so the client can fetch it in one read.
     let whole = state
         .queue
         .sessions()
@@ -619,13 +620,13 @@ async fn piece_of(
     let span = output_span(&samples, model, out);
     let (from, frames) = (span.start, span.len());
 
-    // Stored: sent as it is. Otherwise encoded from what is ready in memory.
+    // Send a stored piece as it is; otherwise encode the piece from what is ready in memory.
     let stored = state
         .queue
         .sessions()
         .track_dir(&session)
         .and_then(|dir| Cache::lookup(&dir, &name, k, session.output.format.extension()));
-    // A piece stored whole since the lookup is cut from the whole file below.
+    // A piece whose stem was stored whole after the lookup is cut from the whole file below.
     let bytes = match stored {
         Some(path) => match tokio::fs::read(&path).await {
             Ok(bytes) => Some(bytes),

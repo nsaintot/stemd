@@ -1,6 +1,6 @@
-//! stemd-cli: send a track to a stemd server and write the stems out.
+//! stemd-cli sends a track to a stemd server and writes out the stems.
 //!
-//! Exists so the separation can be judged by ear on real music.
+//! It lets the separation be judged by ear on real music.
 //!
 //! ```text
 //! discovery  find a server over mDNS
@@ -41,50 +41,50 @@ struct Args {
     #[arg(long)]
     out: Option<PathBuf>,
 
-    /// Upload and receive float samples instead of 16-bit. Doubles the
-    /// transfer; only worth it to see the exact reconstruction null.
+    /// Upload and receive float32 samples, twice the size of the default 16-bit samples.
+    /// Use it to see the exact reconstruction null.
     #[arg(long)]
     f32: bool,
 
-    /// Write float32 wavs instead of FLAC. Unscaled and four times the size;
-    /// use it when the output is going into a DAW and headroom matters more
-    /// than disk.
+    /// Write unscaled float32 WAV files, four times the size of the default FLAC. Use it
+    /// when the output goes into a DAW and headroom matters more than disk space.
     #[arg(long)]
     wav_f32: bool,
 
     /// Ask the server to convert the stems to this rate in Hz (24000, 44100,
     /// 48000, 96000). Defaults to the model's own rate.
     ///
-    /// The reconstruction below only nulls at the native rate: the mix is not
-    /// resampled with it, so `drums` is derived from buffers at two rates.
+    /// The reconstruction check runs only at the native rate, because this client does not
+    /// resample the mix. At another rate, `drums` is left out unless --include-derived is
+    /// set.
     #[arg(long)]
     output_sample_rate: Option<u32>,
 
-    /// Ask the server to send the derived part instead of rebuilding it here.
+    /// Ask the server to send the derived part, which this client otherwise rebuilds from
+    /// the mix.
     ///
-    /// Costs a third of the transfer again. Worth it when the mix is not at the
-    /// stems' rate, since rebuilding then needs the mix resampled to match.
+    /// This adds one more part to the download. Use it when the stems are at another rate
+    /// than the mix, since rebuilding then needs the mix resampled to match.
     #[arg(long)]
     include_derived: bool,
 
-    /// Parts to ask for, comma-separated, such as `bass,other,vocals`. Defaults
-    /// to the server's `harmonics,vocals`. Whatever the list leaves out is
-    /// rebuilt here from the mix; `/v2/health` lists what a server offers.
+    /// Parts to ask for, comma-separated, such as `bass,other,vocals`. Defaults to the
+    /// server's `harmonics,vocals`. Parts the list leaves out are rebuilt here from the
+    /// mix; `/v2/health` lists what a server offers.
     #[arg(long)]
     parts: Option<String>,
 
-    /// Filter the server converts the stems with. 0, the default, converts any
-    /// rate pair; a numbered mode covers one pair and is refused on any other.
+    /// Filter the server converts the stems with. Mode 0, the default, converts any rate
+    /// pair; a numbered mode covers one pair and is refused for any other.
     ///
-    /// Deprecated: use --dsp-filter. Only ask for one if you are subtracting the
-    /// stems from a mix converted by that same filter. `/v2/health` lists what a
-    /// server offers.
+    /// Deprecated: use --dsp-filter. Ask for a numbered mode only to subtract the stems
+    /// from a mix that the same filter converted. `/v2/health` lists what a server offers.
     #[arg(long, conflicts_with = "dsp_filter")]
     dsp_mode: Option<u8>,
 
-    /// Filter file (`.fir`) the server converts the stems with. Uploaded first
-    /// if the server does not hold it. Needs --output-sample-rate set to the
-    /// filter's output rate; see `dsp_filter` in docs/api.md for the format.
+    /// Filter file (`.fir`) the server converts the stems with. It is uploaded first if the
+    /// server does not hold it. Needs --output-sample-rate set to the filter's output rate;
+    /// `dsp_filter` in docs/api.md describes the format.
     #[arg(long)]
     dsp_filter: Option<PathBuf>,
 
@@ -141,19 +141,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Refuse a rate or a mode this server does not offer, before the upload is
-/// spent.
+/// Refuse a rate or a mode this server does not offer, before spending the upload.
 ///
-/// Each check is skipped when the server does not advertise the field at all, so
-/// an older one is left to answer for itself rather than being second-guessed
-/// here.
+/// Each check is skipped when the server does not advertise the field, so an older server validates
+/// the value itself.
 fn check_rate(args: &Args, health: &Health) -> Result<()> {
     if let Some(rate) = args.output_sample_rate
         && !health.output_sample_rates.is_empty()
         && !health.output_sample_rates.contains(&rate)
     {
         bail!(
-            "this server converts to {} Hz, not {rate}",
+            "output rate: expected {} Hz, got {rate}",
             health
                 .output_sample_rates
                 .iter()
@@ -168,7 +166,7 @@ fn check_rate(args: &Args, health: &Health) -> Result<()> {
         && !health.dsp_modes.contains(&mode)
     {
         bail!(
-            "this server offers dsp mode {}, not {mode}",
+            "dsp mode: expected {}, got {mode}",
             health
                 .dsp_modes
                 .iter()
@@ -224,10 +222,9 @@ fn report_server(health: &Health) {
 }
 
 /// Decode the input and refuse anything this server cannot take.
-///
-/// Refused locally rather than spending the upload to be told to take it back.
-/// The limit comes from the server so the two cannot disagree. The rate does not:
-/// the server converts whatever arrives to the rate its model runs at.
+// Refusing here saves an upload that the server would reject. The limit comes from the server, so
+// the two cannot disagree. The rate is not checked: the server converts any upload to the rate its
+// model runs at.
 fn load_input(args: &Args, health: &Health) -> Result<Decoded> {
     print!("decoding     : {} ... ", args.input.display());
     let audio = stemd_audio::decode(&args.input)?;
@@ -274,9 +271,8 @@ fn separate(server: &Server, audio: &Decoded, formats: Formats<'_>) -> Result<Jo
 
 /// Download the shipped stems and rebuild the derived part from the mix.
 ///
-/// Deriving it here is exactly what a player does, so these files are what the
-/// three faders control, but only two of them came off the wire, and the labels
-/// say which.
+/// A player rebuilds this part the same way, so the three files match the three faders. The labels
+/// show which two were downloaded.
 fn assemble(
     server: &Server,
     audio: &Decoded,
@@ -313,11 +309,9 @@ fn assemble(
         return Ok(parts);
     }
 
-    // `mix - stems` only lines up when both sides share a rate. Rebuilding the
-    // derived part at a converted rate means resampling this mix with the same
-    // filter the server used, which this client does not carry, so it is left
-    // out rather than computed from buffers that do not correspond. Pass
-    // --include-derived to have the server send it instead.
+    // `mix - stems` lines up only when both sides share a rate. Rebuilding the derived part at a
+    // converted rate means resampling this mix with the server's filter, which this client does not
+    // carry, so the part is left out. Pass --include-derived to have the server send it.
     if result.output.sample_rate != audio.sample_rate {
         println!(
             "note         : stems at {} Hz, so `{derived_name}` is not rebuilt — pass \
@@ -367,11 +361,10 @@ fn write_parts(args: &Args, result: &JobResult, parts: &[Part]) -> Result<()> {
     Ok(())
 }
 
-/// The claim the whole topology rests on: the parts add back up to the track.
-/// Checked against the mix we decoded rather than asserted.
+/// Check that the parts sum back to the decoded mix.
 fn report_reconstruction(audio: &Decoded, parts: &[Part], result: &JobResult, elapsed: f64) {
-    // Only when every part is present and at the mix's rate; otherwise the
-    // number would describe two buffers that do not line up.
+    // Report only when every part is present and at the mix's rate; otherwise the number would
+    // describe two buffers that do not line up.
     if result.output.sample_rate == audio.sample_rate {
         let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
         println!(
@@ -421,8 +414,8 @@ fn deinterleave(raw: &[u8], f32_format: bool, gain: f32) -> Planar {
     out
 }
 
-/// `1.0 / gain`, treating a nonsensical gain as unity rather than dividing by
-/// zero and filling a stem with infinities.
+/// Return `1.0 / gain`, or 1.0 when `gain` is not positive, so a zero gain cannot fill a stem with
+/// infinities.
 fn inverse(gain: f32) -> f32 {
     if gain > 0.0 { 1.0 / gain } else { 1.0 }
 }

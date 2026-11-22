@@ -23,7 +23,7 @@ pub struct Setup {
     sha256: String,
 }
 
-/// Where downloads go.
+/// The directory that downloads go to.
 fn download_dir() -> PathBuf {
     std::env::temp_dir().join("stemd-update")
 }

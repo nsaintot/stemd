@@ -1,14 +1,12 @@
 //! Files dropped on the window.
 //!
-//! A drop is the same job a `POST /v2/jobs` makes: identified by the same track
-//! id, claimed in the same job table, separated by the same worker, kept in the same
-//! cache. Dropping a track a deck already asked for joins that separation, and
-//! dropping the same file twice is a cache hit. What differs is the two ends:
-//! the audio comes from a file, and the stems are written to a folder.
+//! A drop becomes the same job that `POST /v2/jobs` makes, with the same track id, job table,
+//! worker and cache. Dropping a track that a deck already asked for joins that separation, and
+//! dropping the same file twice is a cache hit. The two ends differ: the audio comes from a file,
+//! and the stems are written to a folder.
 //!
-//! Local output always includes the derived part. Over the wire it is left out
-//! because a client holding the mix can rebuild it for free; a folder of stems has
-//! no such context.
+//! Local output always includes the derived part. An API client holding the mix can rebuild that
+//! part, but a folder of stems has no mix to rebuild it from.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,28 +28,28 @@ use crate::state::AppState;
 /// Where a drop records the scale of parts written below unity.
 const GAINS_FILE: &str = "stems.json";
 
-/// Recent drops kept for the window's list. Older ones fall off the end.
+/// The number of recent drops kept for the window's list; older drops fall off the end.
 pub const REMEMBERED: usize = 12;
 
-/// Finished drops kept in memory to answer a repeat drop without separating.
-/// Independent of [`REMEMBERED`]: taking a row off the list keeps its entry.
+/// The number of finished drops kept in memory to answer a repeat drop without separating. It is
+/// independent of [`REMEMBERED`]: removing a row from the list keeps its entry here.
 pub const HISTORY: usize = 25;
 
-/// What a stems folder is called, after the track. Named once because the
-/// window's delete control checks it before removing anything recursively.
+/// The suffix of a stems folder's name, after the track's name. It is defined once because the
+/// window's delete control checks it before deleting anything recursively.
 const STEMS_SUFFIX: &str = "-stems";
 
 /// How often the watcher rechecks a job it is waiting on.
 ///
-/// The window repaints four times a second, so anything finer than this is
-/// invisible. It only paces the copy-out; progress itself comes from the job.
+/// The window repaints four times a second, so a shorter interval would not show. It paces only the
+/// copy-out; progress comes from the job itself.
 const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Extensions offered to whoever is dropping. Not a gate: symphonia probes the
-/// content, but a drop of a text file should be refused before it is decoded.
+/// The file extensions a drop accepts. Symphonia probes the content anyway, but a text file should
+/// be refused before it is decoded.
 ///
-/// The window's file picker is built from this same list, so what can be dropped
-/// and what can be chosen cannot drift apart.
+/// The window's file picker is built from this same list, so the files that can be dropped and the
+/// files that can be chosen always match.
 pub const AUDIO_EXTENSIONS: [&str; 9] = [
     "wav", "flac", "mp3", "m4a", "aac", "aif", "aiff", "mp4", "ogg",
 ];
@@ -62,7 +60,7 @@ pub fn looks_like_audio(path: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-/// Where one drop has got to.
+/// The state of one drop.
 #[derive(Debug, Clone)]
 pub enum State {
     Reading,
@@ -75,8 +73,8 @@ pub enum State {
 pub struct Finished {
     pub dir: PathBuf,
     pub parts: Vec<String>,
-    /// What the separation cost when it ran, which is preserved across cache
-    /// hits, so this is what it cost, not what this drop waited.
+    /// The time the separation took when it ran. Cache hits keep this value, so it is not the time
+    /// this drop waited.
     pub secs: f64,
     /// The stems were already on disk and nothing was separated.
     pub cached: bool,
@@ -87,10 +85,11 @@ pub struct Finished {
 /// One dropped file, from the moment it lands until its stems are written.
 pub struct Dropped {
     pub source: PathBuf,
-    /// File name without the extension, which is what the window shows.
+    /// The file name without the extension, as the window shows it.
     pub title: String,
     state: Mutex<State>,
-    /// The job this drop waits on, once claimed. Whoever takes it releases it.
+    /// The job this drop waits on, once claimed. Whoever takes the job out of this field must
+    /// release it.
     job: Mutex<Option<Arc<Job>>>,
     /// Set by [`Drops::stop`].
     stopped: AtomicBool,
@@ -101,9 +100,8 @@ impl Dropped {
         self.state.lock().clone()
     }
 
-    /// A finished drop, for tests that need a list without running a model.
-    /// `state` is private to this module, so the window's own tests cannot build
-    /// one of these for themselves.
+    /// A finished drop, for tests that need a list without running a model. `state` is private to
+    /// this module, so the window's tests cannot build one themselves.
     #[cfg(test)]
     pub fn finished(title: &str, dir: &Path, parts: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -240,8 +238,8 @@ impl History {
     }
 }
 
-/// SHA-256 of the file's bytes, the output settings and the model: what a
-/// drop's result depends on. The path and title play no part.
+/// The SHA-256 of the file's bytes, the output settings and the model, which together decide a
+/// drop's result. The path and the title play no part.
 fn history_key(source: &Path, settings: &Settings, model: &str) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut file = std::fs::File::open(source)?;
@@ -348,9 +346,8 @@ impl Drops {
 
     /// Take a file and start working on it. Returns the entry the window draws.
     ///
-    /// Everything after this happens on its own thread: decoding a five-minute
-    /// track takes long enough to drop frames, and the window has to keep
-    /// painting the progress of the job this creates.
+    /// Decoding and separation run on their own thread: decoding a five-minute track takes long
+    /// enough to drop frames, and the window must keep painting the job's progress.
     pub fn accept(self: &Arc<Self>, state: &Arc<AppState>, path: PathBuf) -> Arc<Dropped> {
         // A second drop of a track still in progress would write the same folder.
         if let Some(running) = self
@@ -390,7 +387,7 @@ impl Drops {
                         crate::panics::message(&*payload)
                     )),
                 };
-                // Marked failed before the turn is handed on, which may wait.
+                // Mark the drop failed before handing on the turn, which may wait.
                 if let Some(why) = failure {
                     if started.stopped() {
                         tracing::info!("{}: stopped", started.title);
@@ -417,8 +414,8 @@ impl Drops {
 
     /// Take a drop out of the list, leaving its stems on disk.
     ///
-    /// By identity rather than by name: two files with the same title in
-    /// different folders are two drops.
+    /// The drop is matched by identity, since two files with the same title in different folders
+    /// are two drops.
     pub fn forget(&self, item: &Arc<Dropped>) {
         self.recent.lock().retain(|other| !Arc::ptr_eq(other, item));
     }
@@ -433,8 +430,8 @@ impl Drops {
 
     /// Forget a drop and delete the stems it wrote.
     ///
-    /// The folder is deleted outright. Moving it to the Trash needs Finder
-    /// automation and a permission prompt inside an `.app`.
+    /// The folder is deleted at once. Moving it to the Trash would need Finder automation and a
+    /// permission prompt inside an `.app`.
     pub fn discard(&self, item: &Arc<Dropped>) {
         if let State::Done(finished) = item.state() {
             remove_stems(&finished.dir);
@@ -445,9 +442,8 @@ impl Drops {
 
 /// Delete a folder this wrote, and nothing else.
 ///
-/// The name check is not defensive programming for its own sake: this is a
-/// recursive delete of a path taken from a struct field, and the cost of the
-/// check is one string comparison against the cost of being wrong.
+/// The name check costs one string comparison and guards a recursive delete of a path taken from a
+/// struct field.
 fn remove_stems(dir: &Path) {
     if !dir
         .file_name()
@@ -458,7 +454,7 @@ fn remove_stems(dir: &Path) {
     }
     match std::fs::remove_dir_all(dir) {
         Ok(()) => tracing::info!("deleted {}", dir.display()),
-        // Already gone is the outcome that was wanted.
+        // A folder that is already gone is fine.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => tracing::warn!("could not delete {}: {err}", dir.display()),
     }
@@ -499,7 +495,7 @@ fn run(
         format: settings.format,
         rate: settings.rate,
         derived: true,
-        // A drop writes files, it does not feed a client's subtraction.
+        // A drop writes files and feeds no client's subtraction, so the general resampler suffices.
         dsp: DspMode::General.into(),
         parts: settings.drop_parts.request(),
     };
@@ -530,15 +526,12 @@ fn run(
 
 /// Decode the file, and bring it to the rate the model works at.
 ///
-/// The command-line client refuses anything that is not already the model's rate.
-/// A drop has no such conversation available, and the resampler that runs on the
-/// way out is the same one.
+/// The command-line client refuses any rate other than the model's, but a drop cannot ask the user,
+/// so it converts with the same resampler that runs on the way out.
 fn read(state: &AppState, path: &Path) -> Result<Audio> {
     let decoded = stemd_audio::decode(path)?;
-    // The only mix in the server that is not built from a shape this process
-    // chose: the upload path lays its channels out from one frame count in
-    // `Audio::from_interleaved`, while this one is whatever came back off a
-    // file. See `Audio::checked`.
+    // This is the only mix whose shape comes from a decoded file; the upload path builds its
+    // channels from one frame count in `Audio::from_interleaved`. See `Audio::checked`.
     let audio = Audio::checked(decoded.data, decoded.sample_rate)
         .with_context(|| format!("decoding {}", path.display()))?;
 
@@ -590,11 +583,10 @@ fn separate(
     let id = crate::ident::track_id(&mix);
     let key = crate::jobs::job_key(&id, &output, &cache_id);
 
-    // Ahead of the turn: a cache hit queues nothing, so it need not wait for
-    // the drops before it. It still passes its turn when it ends.
+    // Check the cache before taking the turn: a cache hit queues nothing, so it need not wait for
+    // earlier drops. It still passes its turn when it ends.
     if let Some(entry) = crate::held::cached_entry(&state.cache, &cache_id, &output, &id) {
-        // The row in the window already says "already separated"; this is only
-        // for reading afterwards.
+        // The window's row already says "already separated"; this line is for the log.
         tracing::debug!("{}: already separated, reusing it", item.title);
         return Ok((entry, Origin::Cached));
     }
@@ -604,12 +596,12 @@ fn separate(
         anyhow::bail!("stopped");
     }
 
-    // Claim before enqueuing, exactly as the HTTP path does: it is the same
-    // table, so a drop can join a separation a deck already started.
+    // Claim before enqueuing, as the HTTP path does: it is the same table, so a drop can join a
+    // separation that a deck already started.
     let job = match state.jobs.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Ok(job) => {
-            // The stems are stored in the cache first. The folder beside the
-            // track is checked for the stems' own size once they exist.
+            // The stems go into the cache first. Free space in the folder next to the track is
+            // checked against the stems' size once they exist.
             state.queue_claimed(QueuedWork {
                 job: Arc::clone(&job),
                 mix,
@@ -680,7 +672,7 @@ fn write_out(source: &Path, entry: &Entry, cached: bool, wanted: DropParts) -> R
     let mut files = Vec::new();
     let mut scaled = Vec::new();
     for stem in &entry.stems {
-        // Not ticked: counts as fetched, so the cache stops holding it.
+        // A part that is not ticked counts as fetched, so the cache stops holding it.
         if !wanted.has(&stem.name) {
             entry.mark_fetched(&stem.name);
             continue;
@@ -768,10 +760,9 @@ fn output_dir(source: &Path) -> PathBuf {
 
 /// Record the scale a part was written at, when it is not unity.
 ///
-/// A stem that peaks past full scale cannot be stored in a 16-bit container
-/// without clipping, so it is written quieter. That is the right file, but it
-/// means the parts no longer sum back to the mix, and nothing in a folder of
-/// audio can say so. This can.
+/// A stem that peaks past full scale cannot be stored in a 16-bit container without clipping, so it
+/// is written quieter. The parts then no longer sum to the mix, and this file records the scale so
+/// a reader can undo it.
 fn write_gains(dir: &Path, scaled: &[(String, f32)]) -> Result<()> {
     let gains: serde_json::Map<String, serde_json::Value> = scaled
         .iter()
@@ -851,8 +842,8 @@ mod tests {
         }
     }
 
-    /// The folder goes beside the file, not into the working directory: an
-    /// `.app` is launched with its cwd set to `/`.
+    /// The folder goes next to the file, because an `.app` is launched with its working directory
+    /// set to `/`.
     #[test]
     fn a_part_stored_below_unity_is_written_at_unity() {
         let cache = crate::testkit::cache(1 << 30, std::time::Duration::from_secs(60));
@@ -899,8 +890,7 @@ mod tests {
         crate::scratch::dir(&format!("drops-{name}"))
     }
 
-    /// The cross deletes a directory recursively, so what it will delete is
-    /// worth a test rather than a reading of the code that produces the path.
+    /// The cross deletes a directory recursively, so this test checks which directory it deletes.
     #[test]
     fn discarding_takes_the_stems_and_the_row() {
         let root = scratch("discard");
@@ -917,8 +907,8 @@ mod tests {
         assert!(drops.recent().is_empty(), "the row survived");
     }
 
-    /// And nothing else. `Finished::dir` is always a folder this wrote, but a
-    /// recursive delete is not the place to rely on that staying true.
+    /// The cross deletes nothing else. `Finished::dir` is always a folder this module wrote, and
+    /// the delete checks that again.
     #[test]
     fn nothing_but_a_stems_folder_is_ever_deleted() {
         let root = scratch("guard");
@@ -939,10 +929,10 @@ mod tests {
         assert!(drops.recent().is_empty());
     }
 
-    /// Two drops of files with the same name in different folders are two rows,
-    /// and dismissing one must not take the other.
+    /// Two drops of files with the same name in different folders are two rows, and dismissing one
+    /// does not remove the other.
     #[test]
-    fn forgetting_is_by_identity_not_by_title() {
+    fn forgetting_a_drop_keeps_another_with_the_same_title() {
         let drops = Arc::new(Drops::default());
         let first = finished_drop(Path::new("/a/track-stems"));
         let second = finished_drop(Path::new("/b/track-stems"));
@@ -964,7 +954,7 @@ mod tests {
     /// adding a second row for it; this is also what keeps two rows from ever
     /// sharing the window's per-row egui id, which is derived from the source.
     #[test]
-    fn re_dropping_a_track_replaces_its_row_instead_of_duplicating() {
+    fn dropping_a_track_again_replaces_its_row() {
         let drops = Drops::default();
         let other = finished_drop(Path::new("/b"));
         drops.remember(Arc::clone(&other));

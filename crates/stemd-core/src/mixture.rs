@@ -1,10 +1,9 @@
-//! What a backend does around the model, whichever runtime runs the weights.
+//! The processing around the model that every backend shares, whatever runtime runs the weights.
 //!
-//! demucs normalises the whole track by the mean and standard deviation of its
-//! mono mixdown before the model sees it, and undoes that afterwards: skipping it
-//! measurably changes the output, so it is part of the model's contract even
-//! though it sits outside the graph. And the four sources a model produces have to
-//! be folded into the two stems that cross the wire.
+//! demucs normalises the whole track by the mean and standard deviation of its mono mixdown before
+//! the model sees it, and undoes that afterwards. Skipping it changes the output measurably, so it
+//! is part of the model's contract although it sits outside the graph. The four sources a model
+//! produces must also be folded into the two stems sent to the client.
 
 use anyhow::{Context, Result};
 
@@ -57,9 +56,8 @@ impl Normalisation {
 
 /// Fold the model's sources into the stems that ship.
 ///
-/// Summing `bass` and `other` before the wire rather than after is what keeps
-/// the transfer at two stems. `names` is the source order the model produces,
-/// which is what makes this independent of any one backend's manifest.
+/// Summing `bass` and `other` before sending keeps the transfer at two stems. `names` is the
+/// model's source order, so this works with any backend's manifest.
 pub(crate) fn fold_into_shipped(
     sources: &[Audio],
     names: &[String],
@@ -112,8 +110,8 @@ fn mono_mean_std(mix: &Audio) -> (f32, f32) {
     if frames == 0 {
         return (0.0, 1.0);
     }
-    // Two passes rather than one buffered mixdown: the mixdown of a ten-minute
-    // track is hundreds of megabytes, and the sums are cheap beside a forward.
+    // Make two passes over the mix and buffer no mixdown: the mixdown of a ten-minute track is
+    // hundreds of megabytes, and the sums are cheap next to a forward pass.
     let mean = (0..frames).map(|i| mono_at(mix, i)).sum::<f64>() / frames as f64;
     let var = (0..frames)
         .map(|i| (mono_at(mix, i) - mean).powi(2))
@@ -127,15 +125,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mono_stats_match_a_hand_computation() {
+    fn the_mono_statistics_match_a_hand_computation() {
         let a = Audio::new(vec![vec![1.0, -1.0], vec![1.0, -1.0]], 44100);
         let (mean, std) = mono_mean_std(&a);
         assert!(mean.abs() < 1e-6);
         assert!((std - 1.0).abs() < 1e-6);
     }
 
-    /// Normalising and restoring has to be a round trip, or the backend hands
-    /// back audio at the wrong level and nothing downstream would notice.
+    /// Normalising then restoring returns the input. A broken round trip would return audio at the
+    /// wrong level, and nothing downstream would notice.
     #[test]
     fn normalisation_round_trips() {
         let a = Audio::new(vec![vec![0.5, -0.25, 0.75], vec![0.1, 0.2, -0.3]], 44100);
@@ -148,9 +146,8 @@ mod tests {
         }
     }
 
-    /// `harmonics` is `bass + other` summed, and `vocals` is passed through. A
-    /// backend whose source order differs would otherwise fold the wrong planes
-    /// together and produce two plausible, wrong stems.
+    /// `harmonics` is `bass + other`, and `vocals` passes through. Folding by name keeps a backend
+    /// with another source order from producing two plausible, wrong stems.
     #[test]
     fn folding_sums_bass_and_other_and_leaves_vocals_alone() {
         let plane = |v: f32| Audio::new(vec![vec![v; 4], vec![v; 4]], 44100);
@@ -173,9 +170,9 @@ mod tests {
         assert!((of("vocals") - 8.0).abs() < 1e-6, "vocals alone");
     }
 
-    /// A model that does not produce a source a stem needs has to say which
-    /// one, because the two ways this fails look identical from the outside: a
-    /// source the model never had, and a source it has a name for but no plane.
+    /// When a model lacks a source that a stem needs, the error names that source, because two
+    /// failures look identical from outside: a source the model never had, and a source it names
+    /// but has no plane for.
     #[test]
     fn a_missing_source_names_itself() {
         let plane = Audio::new(vec![vec![0.0; 2]], 44100);

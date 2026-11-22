@@ -1,12 +1,12 @@
-//! Job queue and the single separation worker.
+//! The job queue and the single separation worker.
 //!
-//! Separation is serialised: one segment at a time on one worker. Whole-track jobs
-//! run FIFO, with a position to report, backpressure when saturated, and
-//! cancellation that covers the running job as well as the waiting ones.
+//! One worker runs one segment at a time. Whole-track jobs run in FIFO order, with a reported
+//! position, backpressure when the queue is full, and cancellation of the running job and the
+//! waiting ones.
 //!
-//! Between segments the worker takes session work, in this order:
+//! Between segments, the worker takes work in this order:
 //!
-//! 1. a staged model, when no job is mid-track;
+//! 1. a staged model, when no job is in the middle of a track;
 //! 2. a high-priority session segment, also between two segments of a running job;
 //! 3. the next waiting job;
 //! 4. a normal-priority session segment.
@@ -33,12 +33,13 @@ pub use crate::models::BuildSeparator;
 pub struct QueuedWork {
     pub job: Arc<Job>,
     pub mix: Audio,
-    /// Format, rate and part set the client asked for.
+    /// The format, rate and part set the client asked for.
     pub output: Output,
     /// The cache id the job was submitted under, which names the model's
     /// directory in the cache.
     pub model_id: String,
-    /// Submitted over the API: turning the server off cancels it. Off for a drop.
+    /// True for a job submitted over the API, which turning the server off cancels; false for a
+    /// drop.
     pub from_api: bool,
 }
 
@@ -50,9 +51,8 @@ pub struct QueueFull {
 
 /// The job the worker has in flight, and the switch that stops it.
 ///
-/// The flag is created fresh per job rather than reset between them, so a
-/// `cancel` that raced the end of one job cannot leak onto the next: it sets a
-/// flag on a `Running` the worker has already dropped.
+/// Each job gets a new cancel flag, so a `cancel` that races the end of one job sets the flag of a
+/// `Running` the worker has already dropped and cannot cancel the next job.
 struct Running {
     id: String,
     from_api: bool,
@@ -63,7 +63,7 @@ struct Running {
     cancel: Arc<AtomicBool>,
 }
 
-/// Segment times [`Queue::segment_run_seconds`] takes the median of.
+/// The number of recent segment times that [`Queue::segment_run_seconds`] takes the median of.
 pub const SPEED_KEPT: usize = 16;
 
 /// The last [`SPEED_KEPT`] segment times.
@@ -98,23 +98,23 @@ impl Speed {
 /// A job waiting for the worker.
 struct Pending {
     work: QueuedWork,
-    /// Counts API jobs from 1 since the server started; `None` for a drop.
+    /// The API job's number, counting from 1 since the server started; `None` for a drop.
     number: Option<u64>,
 }
 
-/// An API job as the window shows it: no id, since a job id carries a prefix
-/// of the track's hash.
+/// An API job as the window shows it. It has no id, because a job id contains a prefix of the
+/// track's hash.
 #[derive(Clone, Debug)]
 pub struct ClientJob {
     pub number: u64,
     pub running: bool,
     pub progress: Progress,
-    /// A protocol 1 client waits on it.
+    /// True when a protocol 1 client waits on the job.
     pub protocol_1: bool,
 }
 
 impl ClientJob {
-    /// API job `number` as it stands in `job`.
+    /// API job `number` with the current state of `job`.
     fn of(number: u64, running: bool, job: &Job) -> Self {
         Self {
             number,
@@ -138,9 +138,8 @@ fn running_first(running: Option<ClientJob>, waiting: Vec<ClientJob>) -> Vec<Cli
 /// A model waiting to be built, and the caller waiting to hear how it went.
 struct Staged {
     build: BuildSeparator,
-    /// What the installed model says about itself, or why it never loaded.
-    /// Dropping this without sending is how a caller learns the worker went
-    /// away underneath it.
+    /// Receives the installed model's info, or the reason it did not load. Dropping it without a
+    /// send tells the caller that the worker stopped.
     reply: mpsc::SyncSender<Result<BackendInfo>>,
 }
 
@@ -152,15 +151,15 @@ struct Inner {
     running: Mutex<Option<Running>>,
     max_depth: usize,
     shutdown: AtomicBool,
-    /// A separator waiting to be built and to replace the live one, collected between
-    /// jobs. The worker owns its separator outright, so a switch requested
-    /// mid-separation takes effect on the next track.
+    /// A separator waiting to be built and to replace the live one, taken between jobs. The worker
+    /// owns its separator, so a switch requested during a separation takes effect on the next
+    /// track.
     incoming: Mutex<Option<Staged>>,
-    /// What the separator the worker holds says about itself. Written by the worker
-    /// as it installs, so it can never describe a model the worker has not got.
+    /// The info of the separator the worker holds. The worker writes it when it installs a
+    /// separator, so it never describes a model the worker does not have.
     ///
-    /// `None` only between spawning the worker and its first build; [`Queue::start`]
-    /// does not return until it is `Some`.
+    /// `None` only between spawning the worker and its first build; [`Queue::start`] returns only
+    /// once it is `Some`.
     info: Mutex<Option<BackendInfo>>,
     /// How the loaded separator cuts a track, written with `info`.
     segmenting: Mutex<Option<Segmenting>>,
@@ -183,22 +182,20 @@ pub struct Queue {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// How often [`Queue::stop`] checks whether the worker is out yet.
+/// How often [`Queue::stop`] checks whether the worker has left the separator.
 pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// How long [`Queue::stop`] waits for the worker to leave the separator.
 ///
-/// The check is at segment boundaries, so it has to cover one segment on the
-/// slowest preset with room for a loaded machine, and a model build already under
-/// way when the quit arrives.
+/// The worker checks for a stop between segments, so the grace covers one segment on the slowest
+/// preset on a loaded machine, or a model build already under way when the quit arrives.
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Queue {
     /// Spawn the worker thread and have it build the first separator.
     ///
-    /// Blocks until it has, so a model that will not load is still a synchronous error
-    /// at the call site. See [`BuildSeparator`] for why the worker allocates the
-    /// weights.
+    /// Blocks until the build finishes, so a model that does not load is a synchronous error at the
+    /// call site. [`BuildSeparator`] explains why the worker allocates the weights.
     pub fn start(
         build: BuildSeparator,
         max_depth: usize,
@@ -226,8 +223,7 @@ impl Queue {
         let worker = thread::Builder::new()
             .name("stemd-worker".into())
             .spawn(move || {
-                // The first thing this thread does, and the reason it is handed
-                // a recipe rather than a model.
+                // Build the separator first, on this thread; see `BuildSeparator`.
                 if let Some(separator) = worker_inner.build_here(build, &reply) {
                     worker_loop(&worker_inner, separator);
                 }
@@ -255,7 +251,7 @@ impl Queue {
         }
     }
 
-    /// What the separator the worker currently holds says about itself.
+    /// The info of the separator the worker holds now.
     pub fn info(&self) -> BackendInfo {
         self.inner
             .info
@@ -279,7 +275,8 @@ impl Queue {
         &self.inner.sessions
     }
 
-    /// Median seconds of the last [`SPEED_KEPT`] segments, `None` until one ran.
+    /// The median run time in seconds of the last [`SPEED_KEPT`] segments; `None` until a segment
+    /// has run.
     pub fn segment_run_seconds(&self) -> Option<f64> {
         self.inner.speed.lock().median()
     }
@@ -291,7 +288,8 @@ impl Queue {
             .view_of(session, self.segment_run_seconds())
     }
 
-    /// When background consolidation may run: always on a GPU, on a CPU while the worker idles.
+    /// The gate for background consolidation: always open on a GPU, and open on a CPU while the
+    /// worker is idle.
     pub fn consolidation_gate(&self) -> crate::cache::Gate {
         let inner = Arc::downgrade(&self.inner);
         Box::new(move || {
@@ -316,34 +314,30 @@ impl Queue {
         self.inner.ready.notify_all();
     }
 
-    /// Stop the worker: refuse new jobs, cancel the one in flight, and wait for it to
-    /// come out of the separator. Returns false if it was still inside when `grace`
-    /// ran out.
-    ///
-    /// Every exit path has to call this and wait for true. Ending the process with a
-    /// forward pass running tears the GPU allocator down underneath it, from a
-    /// destructor, where nothing catches the abort. The wait is one segment.
+    /// Stop the worker: refuse new jobs, cancel the running job, and wait for the worker to leave
+    /// the separator. Returns false if the worker was still inside when `grace` ran out.
+    // Every exit path must call this and wait for true: ending the process during a forward pass
+    // tears down the GPU allocator from a destructor, and nothing catches that abort. The wait is
+    // one segment.
     pub fn stop(&self, grace: std::time::Duration) -> bool {
         {
-            // Same reasoning as `Drop`: the worker checks `shutdown` while
-            // holding `pending` and only then parks, so a notify sent inside
-            // that window would reach nobody.
+            // Notify under `pending`, as in `Drop`: the worker checks `shutdown` while holding
+            // `pending` and only then parks, so a notify sent without the lock could be missed.
             let _parked = self.inner.pending.lock();
             self.inner.shutdown.store(true, Ordering::SeqCst);
         }
-        // A switch blocked in `install` has to be let go too. Its reply channel
-        // sits in `incoming`, which outlives the worker, so leaving it there
-        // would park the switch thread for as long as the queue exists.
+        // Release a switch blocked in `install`. Its reply channel sits in `incoming`, which
+        // outlives the worker, so the switch thread would otherwise wait for as long as the queue
+        // exists.
         if let Some(staged) = self.inner.incoming.lock().take() {
             let _ = staged
                 .reply
                 .send(Err(anyhow::anyhow!("the server is shutting down")));
         }
-        // Released first: the worker takes `running` while holding `pending`, so
-        // holding them in the other order here would deadlock.
+        // `pending` is released before taking `running`: the worker takes `running` while holding
+        // `pending`, so holding both here in the other order would deadlock.
         if let Some(running) = self.inner.running.lock().as_ref() {
-            // How it stops, not that it stopped: the line worth reading is the
-            // one the worker writes when it actually comes out of the model.
+            // The worker logs its own line when it leaves the model.
             tracing::debug!("stopping {} at its next segment", running.id);
             running.cancel.store(true, Ordering::Relaxed);
         }
@@ -352,9 +346,8 @@ impl Queue {
         let Some(worker) = self.worker.lock().take() else {
             return true;
         };
-        // `JoinHandle` has no timed join, and an untimed one is exactly what
-        // must not happen here: a worker wedged in the model would hang the quit
-        // instead of crashing it, which is not an improvement.
+        // `JoinHandle` has no timed join, and an untimed join would hang the quit when the worker
+        // is stuck in the model.
         let deadline = std::time::Instant::now() + grace;
         // The thread only finishes if it panicked.
         while !self.inner.left.load(Ordering::SeqCst) && !worker.is_finished() {
@@ -386,11 +379,10 @@ impl Queue {
         Ok(position)
     }
 
-    /// Stop a job, whether it is waiting or already under way. Returns false only if
-    /// it is neither: finished, or never here.
-    ///
-    /// A waiting job is dropped outright. A running one stops at its next segment
-    /// boundary, so this returns before the worker is free.
+    /// Stop a job, whether it is waiting or running. Returns false when the job is neither, because
+    /// it finished or was never queued.
+    // A waiting job is dropped at once. A running job stops at its next segment boundary, so this
+    // returns before the worker is free.
     pub fn cancel(&self, id: &str) -> bool {
         {
             let mut pending = self.inner.pending.lock();
@@ -400,8 +392,8 @@ impl Queue {
                 return true;
             }
         }
-        // Lock released first. The worker holds `pending` while it takes
-        // `running`, so holding them in the opposite order here would deadlock.
+        // `pending` is released first: the worker holds `pending` while it takes `running`, so
+        // holding both here in the other order would deadlock.
         let running = self.inner.running.lock();
         match running.as_ref() {
             Some(job) if job.id == id => {
@@ -412,8 +404,8 @@ impl Queue {
         }
     }
 
-    /// Cancel every job submitted over the API, waiting or running, and return
-    /// how many. Drops keep their place.
+    /// Cancel every job submitted over the API, waiting or running, and return the number
+    /// cancelled. Drops keep their place.
     pub fn cancel_api_jobs(&self) -> usize {
         let dropped = {
             let mut pending = self.inner.pending.lock();
@@ -446,9 +438,9 @@ impl Queue {
 
     /// API jobs, the running one first, then the waiting ones in queue order.
     pub fn client_jobs(&self) -> Vec<ClientJob> {
-        // `pending` before `running`, never both held: the worker holds `pending`
-        // while it takes `running`. A job taken in between shows up twice and
-        // keeps its running entry.
+        // Lock `pending`, then `running`, never both at once: the worker holds `pending` while it
+        // takes `running`. A job taken in between shows up in both lists and keeps its running
+        // entry.
         let waiting: Vec<ClientJob> = self
             .inner
             .pending
@@ -470,27 +462,25 @@ impl Queue {
 
     /// Have the worker build a new separator and run on it from now on.
     ///
-    /// Blocks until the swap has happened: the track in flight first, then the build,
-    /// so the caller learns what loaded. The old separator keeps running until the new
-    /// one is in hand.
+    /// Blocks until the swap has happened, after the running track and the build, so the caller
+    /// learns what loaded. The old separator keeps running until the new one is built.
     pub fn install(&self, build: BuildSeparator) -> Result<BackendInfo> {
         let (reply, done) = mpsc::sync_channel(1);
         let superseded = {
-            // Under `pending` for the reason `stop` gives: the worker checks
-            // `incoming` while holding it and only then parks, so a notify sent
-            // without this lock could reach nobody, and an idle worker parks
-            // until a *job* arrives, which on a server nobody is using is never.
+            // Notify under `pending`, as in `stop`. Without the lock the notify could be missed,
+            // and an idle worker would then wait until the next job arrives, which may never
+            // happen.
             let _parked = self.inner.pending.lock();
-            // Read under that same lock, so a switch cannot slip in behind a
-            // `stop` and then wait for a worker that has already gone.
+            // Read `shutdown` under the same lock, so a switch cannot start after a `stop` and wait
+            // for a worker that has already left.
             if self.inner.shutdown.load(Ordering::SeqCst) {
                 anyhow::bail!("the server is shutting down");
             }
             self.inner.incoming.lock().replace(Staged { build, reply })
         };
-        // Only reachable if two switches are requested faster than the worker
-        // can take one, which `Switcher::request` refuses. Told, not dropped:
-        // the caller is blocked on that channel.
+        // Reached only when two switches arrive faster than the worker can take one, which
+        // `Switcher::request` refuses. Answer the superseded switch, because its caller is blocked
+        // on that channel.
         if let Some(staged) = superseded {
             let _ = staged
                 .reply
@@ -500,18 +490,15 @@ impl Queue {
 
         match done.recv() {
             Ok(result) => result,
-            // The sender goes with the worker, so this is the queue stopping
-            // underneath a switch: on the way out, where there is nothing left
-            // to switch to.
+            // The worker held the sender, so the queue stopped during the switch, on the way out.
             Err(_) => anyhow::bail!("the separation worker stopped before the model could load"),
         }
     }
 
     /// Progress for a waiting job, with its live queue position filled in.
     ///
-    /// Computed on read rather than pushed on every dequeue: positions shift for
-    /// every waiter each time one is taken, and the queue is short enough that a
-    /// scan on poll is cheaper than fanning out updates.
+    /// The position is computed on read: every waiter's position shifts each time the worker takes
+    /// a job, and the queue is short enough that a scan per poll costs less than pushing updates.
     pub fn queued_progress_for(&self, id: &str) -> Option<Progress> {
         let pending = self.inner.pending.lock();
         let position = pending.iter().position(|p| p.work.job.id == id)?;
@@ -520,9 +507,9 @@ impl Queue {
 }
 
 impl Drop for Queue {
-    /// A no-op once [`Queue::stop`] has run, which is the ordinary path. This
-    /// covers a queue dropped without one: every test, and any early return
-    /// between `start` and a server that can shut itself down.
+    /// Does nothing once [`Queue::stop`] has run, which is the normal path. It stops a queue
+    /// dropped without a `stop`: in every test, and on any early return between `start` and a
+    /// running server.
     fn drop(&mut self) {
         self.stop(STOP_GRACE);
     }
@@ -547,25 +534,22 @@ enum Next {
     Install(Staged),
     Job(Claimed),
     Segment(Arc<Track>, usize),
-    /// Woken with nothing to run: a chance to drop what closed sessions held.
+    /// Woken with nothing to run, so the worker can drop what closed sessions held.
     Tidy,
 }
 
 impl Inner {
     /// Block until there is something to do. `None` means shutdown.
-    ///
-    /// A staged model is taken ahead of a waiting job, because between jobs is the only
-    /// safe point to swap, and while idle too, which is what lets [`Queue::install`]
-    /// return on a server nobody is using. Registering as running happens under the
-    /// same lock that took the job out of `pending`.
+    // A staged model is taken ahead of a waiting job, because a swap is safe only between jobs. It
+    // is also taken while idle, so [`Queue::install`] returns on an unused server. A job is
+    // registered as running under the same lock that took it out of `pending`.
     fn next(&self) -> Option<Next> {
         let mut pending = self.pending.lock();
         let mut woken = false;
         loop {
-            // Ahead of the swap as well as the job: building a model while the
-            // process is tearing down puts a fresh allocation in front of the C
-            // runtime's destructors, which is the crash `Queue::stop` exists to
-            // prevent.
+            // Check for shutdown before the swap and the job: a model built during teardown would
+            // allocate in front of the C runtime's destructors, which is the crash `Queue::stop`
+            // prevents.
             if self.shutdown.load(Ordering::SeqCst) {
                 return None;
             }
@@ -598,11 +582,10 @@ impl Inner {
         }
     }
 
-    /// Build a separator on this thread and publish what it says about itself.
-    /// Called only from the worker; see [`BuildSeparator`].
+    /// Build a separator on this thread and publish its info. Called only from the worker; see
+    /// [`BuildSeparator`].
     ///
-    /// `None` means the build failed, and whatever the worker already holds is still
-    /// good.
+    /// Returns `None` when the build failed; the separator the worker already holds stays valid.
     fn build_here(
         &self,
         build: BuildSeparator,
@@ -611,8 +594,8 @@ impl Inner {
         match build() {
             Ok(separator) => {
                 let info = separator.info();
-                // Published before the reply, so a caller reading it the instant
-                // `install` returns sees the model it just installed.
+                // Publish before replying, so a caller that reads `info` as soon as `install`
+                // returns sees the new model.
                 *self.info.lock() = Some(info.clone());
                 // Open sessions hold output from the old model. Close them before the
                 // reply, so `install` returns with them closed.
@@ -621,9 +604,8 @@ impl Inner {
                 *self.segmenting.lock() = separator.segmenting();
                 self.normalises
                     .store(separator.normalises(), Ordering::SeqCst);
-                // The send may find nobody there: a switch superseded between
-                // the build starting and finishing. Keep the model anyway: it is
-                // the newer of the two, and `info` already says so.
+                // The receiver may be gone if the switch was superseded during the build. Keep the
+                // model anyway: it is the newer one, and `info` already names it.
                 let _ = reply.send(Ok(info));
                 Some(separator)
             }

@@ -1,9 +1,8 @@
 //! HTTP client for a stemd server.
 //!
-//! The response types are declared here rather than shared with the server:
-//! depending on `stemd-core` would pull the whole model stack into a client that
-//! is HTTP plus audio I/O. They mirror `stemd_server::jobs` and must be kept in
-//! step with it.
+//! The response types are declared here and not shared with the server: depending on `stemd-core`
+//! would pull the whole model stack into a client that needs only HTTP and audio I/O. They mirror
+//! `stemd_server::jobs` and must be kept in step with it.
 
 use std::io::Read;
 use std::time::Duration;
@@ -26,17 +25,17 @@ pub struct Health {
     pub default_output: DefaultOutput,
     #[serde(default = "unbounded")]
     pub max_track_seconds: f64,
-    /// Output rates this server offers. Empty when it is too old to say.
+    /// The output rates this server offers; empty for a server too old to report them.
     #[serde(default)]
     pub output_sample_rates: Vec<u32>,
-    /// DSP modes this server offers. Empty when it is too old to say.
+    /// The DSP modes this server offers; empty for a server too old to report them.
     #[serde(default)]
     pub dsp_modes: Vec<u8>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DefaultOutput {
-    /// Parts a job that names none gets.
+    /// The parts a job gets when it names none.
     #[serde(default)]
     pub parts: Vec<String>,
     /// The part rebuilt client-side from the mix.
@@ -64,10 +63,10 @@ const fn unbounded() -> f64 {
 #[derive(Debug, Deserialize)]
 pub struct StemRef {
     pub name: String,
-    /// Path on this server, relative to its base URL.
+    /// The path on this server, relative to its base URL.
     pub url: String,
-    /// Scale already applied to the samples. Multiply by `1.0 / gain` to
-    /// restore the original level.
+    /// The scale already applied to the samples. Multiply by `1.0 / gain` to restore the original
+    /// level.
     #[serde(default = "unity")]
     pub gain: f32,
 }
@@ -80,8 +79,8 @@ const fn unity() -> f32 {
 #[derive(Debug, Deserialize)]
 pub struct Output {
     pub format: String,
-    /// Rate the stems are at, which is the requested output rate rather than
-    /// the rate of the mix that was uploaded.
+    /// The rate the stems are at: the requested output rate, which can differ from the rate of the
+    /// uploaded mix.
     pub sample_rate: u32,
     /// The part to rebuild as `mix` minus the stems, when one is left out.
     pub derived: Option<String>,
@@ -125,25 +124,25 @@ struct Created {
 /// How the samples are encoded in each direction.
 #[derive(Debug, Clone, Copy)]
 pub struct Formats<'a> {
-    /// Encoding of the uploaded PCM.
+    /// The encoding of the uploaded PCM.
     pub upload: &'static str,
-    /// Container the stems come back in.
+    /// The container the stems come back in.
     pub download: &'static str,
-    /// Rate the server converts the stems to, when not its native one.
+    /// The rate the server converts the stems to, when it is not the native rate.
     pub rate: Option<u32>,
-    /// Ask the server for the derived part rather than rebuilding it.
+    /// Ask the server for the derived part, so the client does not rebuild it.
     pub derived: bool,
-    /// Comma-separated parts to ship, when not the server's default.
+    /// The comma-separated parts to ship, when not the server's default.
     pub parts: Option<&'a str>,
-    /// Numbered filter the server converts the stems with, when not its default.
+    /// The numbered filter the server converts the stems with, when not its default.
     pub dsp: Option<u8>,
-    /// Id of an uploaded filter the server converts the stems with.
+    /// The id of an uploaded filter the server converts the stems with.
     pub dsp_filter: Option<&'a str>,
 }
 
 impl<'a> Formats<'a> {
-    /// Stems come back as FLAC by default: the same 16-bit samples, half the
-    /// wire. `--f32` swaps both directions to float for an exact null.
+    /// Stems come back as FLAC by default: the same 16-bit samples in half the transfer. `--f32`
+    /// switches both directions to float for an exact null.
     pub const fn new(f32_everywhere: bool) -> Self {
         if f32_everywhere {
             Self {
@@ -252,8 +251,8 @@ impl Server {
         Ok(created.id)
     }
 
-    /// Make sure the server holds the filter file `bytes`, uploading it if not.
-    /// `true` in the second field when it was uploaded.
+    /// Make sure the server holds the filter file `bytes`, uploading it if needed. The second field
+    /// is `true` when it was uploaded.
     pub fn ensure_filter(&self, bytes: &[u8]) -> Result<(FilterSummary, bool)> {
         use sha2::{Digest, Sha256};
         let id = format!("{:x}", Sha256::digest(bytes));
@@ -302,10 +301,10 @@ impl Server {
                     "server reported failure: {}",
                     job.error.as_deref().unwrap_or("unknown")
                 ),
-                // Not reachable from here, this client never cancels, and a job
-                // it is waiting on holds a reference that stops anyone else's
-                // DELETE from stopping it. Handled anyway, because the arm below
-                // would wait forever on a terminal stage it does not recognise.
+                // This client never cancels, and a job it waits on holds a reference that keeps
+                // another client's DELETE from stopping it, so this arm is unreachable. It is
+                // handled anyway, because the arm below would wait forever on a terminal stage it
+                // does not recognise.
                 "cancelled" => bail!("the job was cancelled"),
                 _ => std::thread::sleep(POLL_INTERVAL),
             }
@@ -427,8 +426,8 @@ mod tests {
 
     #[test]
     fn a_health_response_survives_fields_this_client_ignores() {
-        // The server sends a good deal more than this; a client that broke on
-        // an unknown field would break on every server-side addition.
+        // The server sends many more fields; a client that failed on an unknown field would break
+        // with every server-side addition.
         let health: Health = serde_json::from_str(
             r#"{"model":"htdemucs","sample_rate":44100,
                 "default_output":{"format":"flac","sample_rate":44100,"parts":["harmonics","vocals"],"derived":"drums"},

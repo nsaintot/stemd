@@ -1,8 +1,7 @@
 //! In-memory ring buffer of recent log lines.
 //!
-//! Exposed at `GET /v2/logs` so a headless server is still debuggable, and so
-//! the optional desktop window is a thin client over the same buffer rather
-//! than a second logging path.
+//! `GET /v2/logs` serves it, so a headless server can still be debugged, and the window reads the
+//! same buffer.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -30,10 +29,10 @@ pub struct LogBuffer {
     capacity: usize,
 }
 
-/// Lines held in memory, and the most the window asks for.
+/// The number of lines held in memory, and the most the window asks for.
 ///
-/// One constant because the two must agree: a window showing fewer than the
-/// buffer holds would hide lines that `GET /v2/logs` still serves.
+/// One constant keeps the two equal, so the window never hides lines that `GET /v2/logs` still
+/// serves.
 pub const CAPACITY: usize = 2000;
 
 impl LogBuffer {
@@ -52,19 +51,16 @@ impl LogBuffer {
         lines.push_back(line);
     }
 
-    /// Most recent `limit` lines, oldest first.
+    /// The most recent `limit` lines, oldest first.
     pub fn recent(&self, limit: usize) -> Vec<LogLine> {
         let lines = self.lines.lock();
         let skip = lines.len().saturating_sub(limit);
         lines.iter().skip(skip).cloned().collect()
     }
 
-    /// Drop everything buffered. Returns how many lines went.
+    /// Drop every buffered line and return the number dropped.
     ///
-    /// This is the buffer `GET /v2/logs` reads, so clearing it in the window
-    /// clears it for a client too. That is the right behaviour for what it is:
-    /// a shared tail of what just happened, not a record, but it does mean the
-    /// button is not local to the window.
+    /// `GET /v2/logs` reads this buffer, so clearing it in the window also clears it for clients.
     pub fn clear(&self) -> usize {
         let mut lines = self.lines.lock();
         let dropped = lines.len();
@@ -135,7 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_buffer_drops_oldest() {
+    fn the_buffer_drops_the_oldest_lines() {
         let buf = LogBuffer::new(2);
         for i in 0..5 {
             buf.push(LogLine {

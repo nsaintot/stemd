@@ -1,7 +1,7 @@
-//! The bottom bar: the server switch and port, and the ways to the settings
-//! and the log. On Linux, also a newer release.
+//! The bottom bar: the server switch and port, and the buttons for the settings and the log. On
+//! Linux, it also shows a newer release.
 //!
-//! It shows the state `/v2/health` reports.
+//! The bar shows the state that `/v2/health` reports.
 
 use eframe::egui::{self, Sense, pos2, vec2};
 
@@ -10,7 +10,7 @@ use crate::state::AppState;
 use super::icons;
 use super::theme::{self, Palette, Weight, white};
 
-/// Height of the bar.
+/// The height of the bar.
 pub const HEIGHT: f32 = 20.0;
 
 const TEXT: f32 = 12.0;
@@ -143,7 +143,7 @@ pub fn bar(
         action = Some(Action::ToggleServer);
     }
 
-    // Right to left: the log button, the settings button.
+    // From right to left: the log button, then the settings button.
     let logs = icons::square(pos2(rect.right() + 5.0 - 12.0, y), 24.0);
     let gear = icons::square(pos2(logs.left() - 4.0 - 12.0, y), 24.0);
     for (pane, button, hint) in [

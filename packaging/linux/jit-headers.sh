@@ -45,9 +45,9 @@ EOF
 gcc "$work/nvrtc.c" -I"$cuda/include" -L"$cuda/lib64" -lnvrtc -o "$work/nvrtc"
 
 # One translation unit per header, as MLX's kernels include them. A header
-# compiled on its own can fail; only the files opened matter.
-# MLX compiles for the device it finds, as sm_<cc> with an `a` suffix from
-# compute capability 9.0 on, and passes no other option but include paths.
+# compiled on its own can fail; only the files it opens matter. MLX compiles for
+# the device it finds, as sm_<cc> with an `a` suffix from compute capability 9.0
+# on, and passes no options besides include paths.
 dev="$work/mlx/mlx/backend/cuda/device"
 for h in "$dev"/*.cuh "$dev"/*.h; do
     printf '#include "mlx/backend/cuda/device/%s"\n#include <cooperative_groups.h>\n' \

@@ -9,7 +9,7 @@ use crate::api::error::ApiError;
 use crate::ident::TRACK_ID_LEN;
 use crate::whole::Whole;
 
-/// Headers every range and piece carries.
+/// A response with the headers that every range and piece carries.
 pub fn audio_response(
     format: StemFormat,
     body: Body,
@@ -33,7 +33,7 @@ pub fn audio_response(
         .expect("response builder inputs are valid")
 }
 
-/// Open a stored whole file and give its length; one deleted since its lookup is `410`.
+/// Open a stored whole file and return its length; a file deleted since its lookup gets `410`.
 pub async fn open_whole(whole: &Whole) -> Result<(tokio::fs::File, u64), ApiError> {
     let path = whole.path.display();
     let file = tokio::fs::File::open(&whole.path).await.map_err(|e| {

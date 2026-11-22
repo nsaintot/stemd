@@ -1,7 +1,7 @@
 # Building, packaging and flags
 
-Everything a contributor needs. The [README](../README.md) is for people who
-want to use the program.
+This page is for contributors. The [README](../README.md) is for people who use
+the program.
 
 ## Clone
 
@@ -10,63 +10,62 @@ git clone --recurse-submodules https://github.com/nsaintot/stemd
 cargo build --release
 ```
 
-The submodule is `vendor/mlx-rs-stemd`: MLX's Rust bindings, forked to build off
-Apple silicon. Nothing resolves without it, and `git submodule update --init` is
-the fix for a clone that forgot. It is a fork rather than a version because
-0.25.3 and 0.2.0 are the newest published `mlx-rs` and `mlx-sys`, and neither
-declares a CUDA feature.
+The submodule is `vendor/mlx-rs-stemd`, a fork of MLX's Rust bindings that
+builds on platforms other than Apple silicon. Nothing resolves without it; for a
+clone made without `--recurse-submodules`, run `git submodule update --init`.
+The newest published `mlx-rs` and `mlx-sys` (0.25.3 and 0.2.0) declare no CUDA
+feature, so the build uses the fork.
 
-Everywhere: `cmake` on `PATH`, and Rust 1.89 or later. MLX builds from source on
-the first `cargo build`.
+Every platform needs `cmake` on `PATH` and Rust 1.89 or later. MLX builds from
+source on the first `cargo build`.
 
 ## Per platform
 
-**macOS** 14 or later, Apple silicon, Metal. The Xcode command line tools,
-`brew install cmake`, and the Metal shader compiler. About four minutes, which
-is what those are for.
+**macOS** 14 or later, Apple silicon, Metal. The build needs the Xcode command
+line tools, `brew install cmake` and the Metal shader compiler, and takes about
+four minutes.
 
-`metal` is the one that catches people out. MLX compiles its kernels during the
-build, and the compiler no longer comes with the command line tools: it is a
-separate component installed under an Xcode, so a machine can carry Xcode and a
-current SDK and still not have it. `xcrun --find metal` says whether this one
-does, and
+The Metal shader compiler is the requirement most often missing. MLX compiles
+its kernels during the build, and the compiler is not part of the command line
+tools: it is a separate component installed under an Xcode, so a machine
+can have Xcode and a current SDK and still lack it. `xcrun --find metal` shows
+whether it is installed, and
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-installs it if not. `scripts/bundle-app.sh` looks for it before building and
-says this if it cannot find one.
+installs it. `scripts/bundle-app.sh` checks for the compiler before building and
+prints this command if it cannot find one.
 
-The bundle is built against macOS 14 rather than against whatever SDK is to
-hand. That is not tidiness: MLX bakes its Metal shaders in at build time and
-does not compile them at runtime, so a floor taken from the build machine ships
-an artefact that launches on an older Mac and then fails the first time it
-wants the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
-`MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` are the two
-halves of saying it, and they have to agree. The script passes its half
-as a linker flag under `--target`; exported as `MACOSX_DEPLOYMENT_TARGET` it
-would also reach proc-macro dylibs, which this toolchain links in a form dyld
-refuses.
+The bundle is built for macOS 14, whatever the SDK on the build machine. MLX
+compiles its Metal shaders at build time and never at run time, so a bundle
+built for a newer macOS launches on an older Mac and then fails the first time
+it uses the GPU. `MACOS_MIN` in `scripts/bundle-app.sh` and
+`MACOS_DEPLOYMENT_TARGET` in `vendor/mlx-rs-stemd/mlx-sys/build.rs` set this
+floor and must agree. The script passes `MACOS_MIN` as a linker flag under
+`--target`. Do not export it as `MACOSX_DEPLOYMENT_TARGET`: that also reaches
+proc-macro dylibs, which this toolchain then links in a form that dyld refuses.
 
-The kernels are a separate `mlx.metallib`, looked up beside the executable and
-then at the build tree's absolute path. The bundle ships it in `Resources` with
-a symlink from `MacOS`; without it the app only runs on the machine that built
-it.
+The kernels are in a separate `mlx.metallib`, looked up next to the executable
+and then at the build tree's absolute path. The bundle ships it in `Resources`
+with a symlink from `MacOS`; without it, the app runs only on the machine that
+built it.
 
-**Windows**, x86-64, CUDA or CPU. MSVC, the CUDA toolkit, cuDNN, and LLVM for
-`libclang`. Use `scripts/bundle-windows.ps1` rather than setting the
-environment by hand: it sets `MLX_BUILD_CUDA`, finds cuDNN, and then checks the
-binary it produced actually carries the CUDA imports. That check exists because
-a CPU-only build is silent. It links, starts, reports `device: cpu`, separates
-correctly, and takes 610 seconds over a clip the card does in three.
+**Windows**, x86-64, CUDA or CPU. The build needs MSVC, the CUDA toolkit, cuDNN,
+and LLVM for `libclang`. Use `scripts/bundle-windows.ps1` instead of setting the
+environment by hand: it sets `MLX_BUILD_CUDA`, finds cuDNN, and checks that the
+binary it produced carries the CUDA imports. A CPU-only build gives no sign of
+the problem: it links, starts, reports `device: cpu`, separates correctly, and
+takes 610 seconds on a 64-second clip that the GPU separates in a few seconds.
 
 Keep those variables identical between builds. cargo re-runs the MLX build
-script when any of them moves, and that is forty minutes rather than four.
+script when any of them changes, which takes forty minutes instead of four.
 
 **Linux**, x86_64 or aarch64, CUDA. Build in the image from
-`packaging/linux/Dockerfile`: CUDA 13.3 with cuDNN on Ubuntu 22.04, libclang
-18, CMake 3.31, and the BLAS and avahi-compat headers. It needs no GPU.
+`packaging/linux/Dockerfile`, which has CUDA 13.3 with cuDNN on Ubuntu 22.04,
+libclang 18, CMake 3.31, and the BLAS and avahi-compat headers. The build needs
+no GPU.
 
 ```bash
 docker build --platform linux/arm64 -t stemd-linux packaging/linux
@@ -75,15 +74,15 @@ docker run --rm -v "$PWD:/work" -e MLX_CUDA_ARCHITECTURES=121 \
     'cargo build --release -p stemd-server -p stemd-cli'
 ```
 
-nvcc wants several GB per kernel, so the job count is capped: unbounded, it
-runs a 32 GB machine out of memory. cmake-rs passes cargo's job count to the
-build, so both are set.
+nvcc needs several GB of memory per kernel, so the job count is capped: without
+a cap, the build runs a 32 GB machine out of memory. cmake-rs passes cargo's job
+count to the build, so the command sets both.
 
-On a machine of your own instead: `libavahi-compat-libdnssd-dev`,
-`liblapacke-dev`, the CUDA toolkit, cuDNN 9.5 or later in `CUDNN_PATH`, and
-`MLX_BUILD_CUDA=1`. cuDNN must be 9.5 or later: the cudnn-frontend MLX builds
-against calls `cudnnBackendPopulateCudaGraph`, which was added there. An older
-one compiles and then finds no execution plan for any graph at run time.
+To build on your own machine instead, install `libavahi-compat-libdnssd-dev`,
+`liblapacke-dev`, the CUDA toolkit and cuDNN 9.5 or later, set `CUDNN_PATH` to
+cuDNN, and set `MLX_BUILD_CUDA=1`. The cudnn-frontend that MLX builds against
+calls `cudnnBackendPopulateCudaGraph`, which first appeared in cuDNN 9.5. An
+older cuDNN compiles, then finds no execution plan for any graph at run time.
 
 ## Packaging
 
@@ -96,34 +95,35 @@ packaging/linux/stage.sh         # Linux: dist/linux, in the image
 packaging/linux/build.sh         # Linux: .deb, .rpm and .AppImage from it
 ```
 
-`MLX_CUDA_ARCHITECTURES` decides which cards the result runs on, and it is the
-single largest thing in the size and the build time. Unset, MLX builds for the
-card in the machine, which is a package that will not start anywhere else. The
+`MLX_CUDA_ARCHITECTURES` sets which GPUs the result runs on, and it has the
+largest effect on package size and build time. When it is unset, MLX builds only
+for the GPU in the build machine, and the package starts nowhere else. The
 released artefacts use the lists in `packaging/mlx-prebuilt.env`; five
 architectures take about two and a half hours on sixteen cores.
 
-The Windows installer offers both modes. Just for me, into
-`%LOCALAPPDATA%\Programs\Stemd`, is the default; for all users goes to Program
-Files. It is under `Programs` because `%LOCALAPPDATA%\stemd` is where the
-program keeps its weights and its cache, and an uninstaller pointed at that
-directory would take a gigabyte of downloads with it.
+The Windows installer offers two modes. The default, Just for me, installs into
+`%LOCALAPPDATA%\Programs\Stemd`; the all-users mode installs into Program Files.
+The per-user install goes under `Programs` because `%LOCALAPPDATA%\stemd` holds
+the program's weights and cache, and an uninstaller pointed at that directory
+would delete a gigabyte of downloads.
 
-CUDA is what the two modes actually differ in. `install-cuda.cmd` writes about
-1.2 GB beside the executable, which a per-user install can do and Program Files
-cannot, so the all-users install replaces that script with one that asks for an
-administrator rather than failing on a permission error a gigabyte in.
+The two modes differ in how they install CUDA. `install-cuda.cmd` writes about
+1.2 GB next to the executable, which a per-user install can do and a Program
+Files install cannot. The all-users install therefore replaces that script with
+one that asks for administrator rights, so it does not fail on a permission
+error after a gigabyte of download.
 
-Elevation is at launch, not mid-run: stock NSIS cannot raise its own token, and
-the plugin that can is not part of NSIS. So the installer manifest asks for the
+Elevation happens at launch: stock NSIS cannot raise its own token during a run,
+and the plugin that can is not part of NSIS. The installer manifest asks for the
 highest token available, which on an administrator account means one consent
-prompt even for a per-user install. The installer needs NSIS, which
+prompt even for a per-user install. Building the installer needs NSIS, which
 `winget install NSIS.NSIS` provides.
 
 ### Release builds
 
 `.github/workflows/cd.yml` builds every artefact on GitHub's runners and checks
-that each installs and starts. A `v<version>` tag on main uploads them all to a
-draft release, which is published by hand.
+that each one installs and starts. A `v<version>` tag on main uploads them all
+to a draft release, which is published by hand.
 
 | | runner | check |
 | --- | --- | --- |
@@ -131,20 +131,20 @@ draft release, which is published by hand.
 | macOS `.dmg`, arm64 | `macos-26` | signed, notarized, `--version` |
 | Windows installer and `.zip`, x86_64 | `windows-2022` | silent install, `--version` without CUDA |
 
-The runners have no GPU, so a separation on a card is still checked by hand
-before publishing.
+The runners have no GPU, so a GPU separation is checked by hand before
+publishing.
 
 macOS signing reads these repository secrets:
 
 | secret | |
 | --- | --- |
 | `MACOS_CERT_P12` | base64 of the Developer ID Application certificate and key, as `.p12` |
-| `MACOS_CERT_PASSWORD` | its password |
+| `MACOS_CERT_PASSWORD` | the password of the `.p12` |
 | `NOTARY_KEY_P8` | base64 of an App Store Connect API key (`.p8`), Developer role |
 | `NOTARY_KEY_ID`, `NOTARY_ISSUER` | that key's ID, and for a team key its issuer ID (a UUID) |
 
-Without them a pull request builds an ad hoc signed app and no `.dmg`, and a
-release tag fails.
+Without these secrets, a pull request builds an ad hoc signed app and no `.dmg`,
+and a release tag fails.
 
 A release is an annotated tag whose message holds the release notes for users,
 in Markdown, with `## Added`, `## Modified` and `## Fixed` sections:
@@ -154,8 +154,8 @@ git tag -a --cleanup=whitespace -F notes.md v0.2.0 origin/main
 git push origin v0.2.0
 ```
 
-`--cleanup=whitespace` keeps the Markdown headings: the default cleanup drops
-every line that starts with `#`.
+`--cleanup=whitespace` keeps the Markdown headings, because the default cleanup
+drops every line that starts with `#`.
 
 `.github/scripts/release-draft.sh` fills the draft:
 
@@ -165,8 +165,8 @@ every line that starts with `#`.
 | `appcast.xml` | the macOS app's Sparkle feed, with the notes as HTML |
 | `SHA256SUMS.txt` | one line per package |
 
-A lightweight tag or an empty message gives GitHub's generated list as the
-notes. To correct the notes of a draft without a new build:
+With a lightweight tag or an empty message, the notes are GitHub's generated
+list. To correct the notes of a draft without a new build:
 
 ```bash
 gh workflow run release-notes.yml -f tag=v0.2.0 -F notes=@notes.md
@@ -180,9 +180,9 @@ the feed under GitHub's "latest" release, so publish model releases
 | --- | --- |
 | `UPDATE_SIGNING_KEY` | base64 of the 32-byte Ed25519 seed that signs the `.dmg` in the feed; the public half is `packaging/update-ed25519.pub` |
 
-Windows installs CUDA 13.3.1 and cuDNN 9.14 from NVIDIA's redistributable
-archives with `.github/scripts/windows-cuda.ps1`, the versions stemd fetches
-at run time.
+The Windows runner installs CUDA 13.3.1 and cuDNN 9.14 from NVIDIA's
+redistributable archives with `.github/scripts/windows-cuda.ps1`. These are the
+versions stemd fetches at run time.
 
 ### Linux packages
 
@@ -190,92 +190,97 @@ at run time.
 | --- | --- |
 | `stage.sh` | `dist/linux/opt/stemd`: binaries, vendored libraries, the run-time headers |
 | `build.sh` | nfpm writes the `.deb` and `.rpm`, appimagetool the `.AppImage`, from that one tree |
-| `nfpm.yaml.in` | dependencies: the display stack and D-Bus only |
+| `nfpm.yaml.in` | the package dependencies, which are only the display stack and D-Bus |
 | `THIRD-PARTY` | notices for the vendored NVIDIA, BLAS and avahi libraries |
-| `jit-headers.sh` | writes `jit-headers.txt`, the toolkit headers MLX's run-time compiler reads; rerun after an MLX or CUDA update |
+| `jit-headers.sh` | writes `jit-headers.txt`, the list of toolkit headers that MLX's run-time compiler reads; rerun it after an MLX or CUDA update |
 
 Every package carries CUDA, cuDNN, BLAS and avahi-compat in `/opt/stemd/lib`,
-about 1.7 GB unpacked. The driver (`libcuda.so.1`), the display stack and the C++
-runtime come from the machine. NVIDIA's libraries are copied unmodified, as
-their licences require; the executables find them through `DT_RPATH`
-(`$ORIGIN/../lib`), which also covers what cuDNN opens at run time.
+about 1.7 GB unpacked. The driver (`libcuda.so.1`), the display stack and the
+C++ runtime come from the machine. NVIDIA's libraries are copied unmodified, as
+their licences require. The executables find them through `DT_RPATH`
+(`$ORIGIN/../lib`), which also covers the libraries cuDNN opens at run time.
 
 `/usr/bin/stemd-server` is a symlink to `/opt/stemd/stemd`, a launcher that sets
 `CUDA_HOME` to the bundled headers and execs `bin/stemd-server` by absolute
 path. MLX locates its CCCL headers from argv[0] without resolving symlinks, so
-the server must never be started through a symlink or by name.
+never start the server binary through a symlink or by name.
 
-The glibc floor is the image's: 2.35.
+The minimum glibc version is the image's, 2.35.
 
 ### Prebuilt MLX
 
-Compiling MLX's CUDA kernels is most of a Linux or Windows build: about two and
-a half hours on sixteen cores for five GPU architectures. The packages link a
-prebuilt copy instead.
+Compiling MLX's CUDA kernels takes most of a Linux or Windows build: about two
+and a half hours on sixteen cores for five GPU architectures. The packages link
+a prebuilt copy of MLX instead.
 
 | | |
 | --- | --- |
-| `packaging/mlx-prebuilt.env` | release tag, GPU architectures per platform, SHA-256 per asset |
-| `packaging/prebuilt.sh` | `build OUT` packs one, `fetch DIR` downloads and checks one; Linux in the image, Windows in Git Bash |
-| `.github/workflows/mlx-prebuilt.yml` | builds all three on push of the `mlx-cuda-<n>` tag |
+| `packaging/mlx-prebuilt.env` | the release tag, the GPU architectures per platform and the SHA-256 of each asset |
+| `packaging/prebuilt.sh` | `build OUT` packs a prebuilt and `fetch DIR` downloads and checks one; it runs in the image on Linux and in Git Bash on Windows |
+| `.github/workflows/mlx-prebuilt.yml` | builds all three prebuilts when an `mlx-cuda-<n>` tag is pushed |
 | `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
-On Windows the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
+On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
 and `dl.lib`.
 
-`mlx-sys` patches MLX's CUDA allocator so a CUDA build also runs on the CPU of a
-machine without a CUDA device. CD checks this with a CPU separation on the Linux
-and Windows runners, which have no GPU.
+`mlx-sys` patches MLX's CUDA allocator so that a CUDA build also runs on the CPU
+of a machine without a CUDA device. CD checks this with a CPU separation on the
+Linux and Windows runners, which have no GPU.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
-compiler (only `msvc` on Windows, whose toolsets link older ones), nvcc,
-cuDNN, the GPU architectures and the RMSNorm patch, and `mlx-sys` refuses a
-prebuilt that does not match its own build. To make a new one: bump `MLX_PREBUILT_TAG`, push that
-tag, and copy the SHA-256 lines from the run summary into
-`mlx-prebuilt.env`. A runner can stop at its 6 h limit before the kernels are
-done; the compile goes through ccache, so re-running the failed job continues.
+compiler, nvcc, cuDNN, the GPU architectures and the RMSNorm patch. On Windows
+it records only `msvc` as the compiler, because newer MSVC toolsets link
+libraries built by older ones. `mlx-sys` refuses a prebuilt that does not match
+its own build.
 
-GPU architectures: Linux and Windows x86_64 `80;86;89;90a;120` (Ampere
-through Blackwell), Linux aarch64 `90a;100;121` (Grace Hopper, Grace
-Blackwell, DGX Spark). `90a` rather
-than `90`, because MLX builds its Hopper-only kernels for `90a` alone.
-Windows skips the Hopper quantized matmul kernels
-(`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile; Hopper uses the
-sm80 ones there.
+To make a new prebuilt, bump `MLX_PREBUILT_TAG`, push that tag, and copy the
+SHA-256 lines from the run summary into `mlx-prebuilt.env`. A runner can hit its
+6 h limit before the kernels are compiled. The compile goes through ccache, so
+re-running the failed job picks up where it stopped.
 
-On the macOS bundle: the icon is built from `resources/` with `sips` and
-`iconutil`, both part of macOS, so a clone needs nothing installed to produce a
-bundle with one. `scripts/make-icons.sh` re-derives the committed intermediates
-when the artwork changes and is the only part that wants ImageMagick. The bundle
+GPU architectures: Linux and Windows x86_64 use `80;86;89;90a;120` (Ampere
+through Blackwell), and Linux aarch64 uses `90a;100;121` (Grace Hopper, Grace
+Blackwell, DGX Spark). The list has `90a` in place of `90` because MLX builds
+its Hopper-only kernels for `90a` alone. Windows skips the Hopper quantized
+matmul kernels (`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile, so
+Hopper GPUs use the sm80 kernels there.
+
+### macOS bundle
+
+The icon is built from `resources/` with `sips` and `iconutil`, both part of
+macOS, so a clone needs nothing extra installed to produce a bundle with an
+icon. `scripts/make-icons.sh` regenerates the committed intermediate images when
+the artwork changes, and it is the only step that needs ImageMagick. The bundle
 carries no weights.
 
 `bundle-app.sh` signs with the first Developer ID in the keychain, under the
-hardened runtime, and falls back to ad-hoc when there is none. Ad-hoc launches
-on the machine that built it and nowhere else, so it is for development only.
-`bundle.sh` takes a Developer ID bundle the rest of the way: a disk image
-with a drag target, signed, notarized and stapled. Its window is drawn by
-`resources/stemd-dmg.png`, the 2x rendition of a 640 by 400 window with two
-placeholder squares on it; the icon positions at the top of the script are
-those squares' centres in points, and follow the artwork if it moves them.
-The image is laid out by Finder itself on a writable copy, which is what
-writes a `.DS_Store`, and then compressed. Stapling is the step that is
-easy to skip and the one that decides whether a Mac offline at first launch has
-to ask Apple.
+hardened runtime, and falls back to ad-hoc signing when there is none. An ad-hoc
+bundle launches only on the machine that built it, so it is for development
+only.
 
-Notarization credentials live in a keychain profile, made once and never read by
-anything here:
+`bundle.sh` turns a Developer ID bundle into a disk image with a drag target,
+then signs, notarizes and staples it. The disk image window is drawn by
+`resources/stemd-dmg.png`, the 2x rendition of a 640 by 400 window with two
+placeholder squares on it. The icon positions at the top of the script are the
+centres of those squares in points; update them if the artwork moves the
+squares. Finder itself lays out the image on a writable copy, which writes the
+`.DS_Store`, and the script then compresses it. Stapling is easy to skip, and it
+decides whether a Mac that is offline at first launch has to contact Apple.
+
+The notarization credentials live in a keychain profile, which is created once
+and which nothing in this repository reads:
 
 ```bash
 xcrun notarytool store-credentials stemd-notary \
     --apple-id <apple id> --team-id <team id>
 ```
 
-`STEMD_NOTARY_PROFILE` names a different one. CI uses an App Store Connect API
-key instead: `STEMD_NOTARY_KEY` (the `.p8` file), `STEMD_NOTARY_KEY_ID` and
-`STEMD_NOTARY_ISSUER`. Without a profile `bundle.sh`
-still produces a signed image and stops with what is missing, so an unnotarized
-release takes a deliberate act.
+`STEMD_NOTARY_PROFILE` names a different profile. CI uses an App Store Connect
+API key instead: `STEMD_NOTARY_KEY` (the `.p8` file), `STEMD_NOTARY_KEY_ID` and
+`STEMD_NOTARY_ISSUER`. Without a profile, `bundle.sh` still produces a signed
+image and then stops and names what is missing, so an unnotarized release cannot
+happen by accident.
 
 ```bash
 STEMD_LINK_MODELS=1 ./scripts/bundle-app.sh    # symlink local weights
@@ -284,52 +289,52 @@ STEMD_EMBED_MODELS=1 ./scripts/bundle-app.sh   # copy weights in, offline instal
 
 ## Flags
 
-Some settings live in the window and are remembered between
-launches: the model, the output format and sample rate a client gets when it
-does not ask for one, and, in the Settings sheet, the longest track, the port,
-and the cache's size and age. The flags below override them for one run without
-changing what is saved, and the window greys out a control a flag has taken
-over.
+The window sets some settings and remembers them between launches: the model,
+the output format and sample rate that a client gets when it does not ask for
+one, and, in the Settings sheet, the longest track, the port, and the cache size
+and age. The flags below override these settings for one run without changing
+what is saved, and the window greys out a control that a flag overrides.
 
-`settings.json` in the user data directory holds them. It is plain JSON and safe
-to edit or delete. Anything unreadable in it falls back to the default for that
-field, and a saved model that will not load falls back rather than failing the
-launch.
+The settings are saved in `settings.json` in the user data directory. It is
+plain JSON and safe to edit or delete. An unreadable field falls back to the
+default for that field, and a saved model that does not load falls back to the
+default model instead of failing the launch.
 
 | flag | default | |
 | --- | --- | --- |
-| `--bind` | `0.0.0.0` on the saved port | a saved port in use falls back to `8420`, then any free port; `--bind` in use fails the launch |
+| `--bind` | `0.0.0.0` on the saved port | when the saved port is in use, the server falls back to `8420`, then to any free port; when the `--bind` address is in use, the launch fails |
 | `--demucs-model` | saved, else `htdemucs` | any artefact in `--models` |
-| `--output-format` | saved, else `flac` | `wav`, `mp3`, `pcm16`, `pcm32` |
-| `--output-sample-rate` | saved, else `44100` | `24000`, `48000`, `96000` (not `mp3`) |
+| `--output-format` | saved, else `flac` | also `wav`, `mp3`, `pcm16`, `pcm32` |
+| `--output-sample-rate` | saved, else `44100` | also `24000`, `48000`, `96000` (not with `mp3`) |
 | `--settings` | user data directory | |
-| `--overlap` | `0.25` | segment overlap fraction |
-| `--full-precision` | off | float32 model, 1.3x slower |
-| `--cache-dir` | user cache directory | kept across restarts; alias `--pieces-dir` |
-| `--cache-max-gb` | saved, else `8` | about 200 six-minute tracks as 44.1 kHz flac; alias `--pieces-max-gb` |
-| `--partial-max-hours` | `24` | a track with a stem still in pieces, unused |
-| `--whole-max-days` | saved, else `30` | a track with every stem whole, unused; `0` keeps it until the cache is full |
-| `--ephemeral` | off | empty the cache at start and at quit |
+| `--overlap` | `0.25` | the fraction by which segments overlap |
+| `--full-precision` | off | runs the model at float32, 1.3x slower |
+| `--cache-dir` | user cache directory | kept across restarts; the alias is `--pieces-dir` |
+| `--cache-max-gb` | saved, else `8` | 8 GB holds about 200 six-minute tracks as 44.1 kHz flac; the alias is `--pieces-max-gb` |
+| `--partial-max-hours` | `24` | how long a track with a stem still in pieces is kept unused |
+| `--whole-max-days` | saved, else `30` | how long a track with every stem whole is kept unused; `0` keeps it until the cache is full |
+| `--ephemeral` | off | empties the cache at start and at quit |
 | `--unfetched-ttl` | `300` | seconds a job result is held for its client |
-| `--max-track-minutes` | saved, else `10` | the only size limit, body cap derived; capped by memory, `0` takes that cap |
-| `--queue-depth` | `16` | `429` past this |
+| `--max-track-minutes` | saved, else `10` | the only size limit; the body cap is derived from it. Memory caps it, and `0` takes that cap |
+| `--queue-depth` | `16` | jobs past this many get `429` |
 | `--models` | `models` | searched before the download cache |
-| `--instance` | `stemd` | mDNS name |
+| `--instance` | `stemd` | the mDNS name |
 | `--no-mdns`, `--offline`, `--headless` | off | |
 
-MP3's sample rates stop at 48 kHz: MPEG-1 Layer III has three and 96 is not one
-of them, so that pair is refused rather than quietly encoded at 48.
+MP3 sample rates stop at 48 kHz: MPEG-1 Layer III has three rates, and 96 kHz is
+not one of them. The server refuses `mp3` at 96 kHz instead of encoding it at 48
+kHz.
 
-`RUST_LOG` sets the level for both the console and the window's log. Without it
-the console shows `info` and the window's buffer keeps `debug`, which its level
-dropdown can reveal.
+`RUST_LOG` sets the level for both the console and the window's log. Without it,
+the console shows `info` and the window's buffer keeps `debug`, which the
+window's level dropdown can show.
 
 ## Layout
 
 ```
 crates/stemd-mlx/      demucs v4 on MLX: stft, layers, transformer, segmenting
 crates/stemd-core/     pcm, stem topology, progress, the backend around the model
-crates/stemd-audio/    file decoding, kept free of the model for the CLI's sake
+crates/stemd-audio/    file decoding, with no model dependency so the CLI stays small
 crates/stemd-server/   axum API, cache, queue, mDNS, drops, window
 crates/stemd-cli/      reference client: decode, upload, poll, rebuild, write
 scripts/               bundling and packaging, one per platform
@@ -338,37 +343,36 @@ tools/export/          PyTorch checkpoint to safetensors, run once per model
 tools/eval/            fixture generators and the MUSDB benchmark
 ```
 
-`stemd-mlx` is deliberately free of `stemd-core`: it is a model, and keeping it
-standalone means its tests need nothing but weights. Every stage of it is nulled
-against the reference implementation, and a whole track lands at -123.7 dB on
-Metal.
+`stemd-mlx` does not depend on `stemd-core`: it is a model, and as a standalone
+crate its tests need nothing but weights. Every stage of it is nulled against
+the reference implementation, and a whole track nulls at -123.7 dB on Metal.
 
-That figure names a backend as much as it names the port. Two implementations of
-the same arithmetic agree to their own floor rather than to a universal one, so
-it is quoted for the backend that ships and would have to be re-derived stage by
-stage for any other. `tests/model.rs` asserts -60 dB, which is the bar a port has
-to clear. The -123.7 is what this one happens to reach.
+That figure holds for Metal only. Two implementations of the same arithmetic
+agree down to the precision floor of their backend, so another backend must
+measure its own figures stage by stage. `tests/model.rs` asserts -60 dB, the bar
+every port must clear.
 
-`pyproject.toml` still exists and still lists torch. Nothing in it builds or runs
-stemd. It is there to open published PyTorch checkpoints when a new model is
-being converted, and to score models against MUSDB.
+`pyproject.toml` still lists torch. Nothing in it builds or runs stemd: it opens
+published PyTorch checkpoints when a new model is converted, and scores models
+against MUSDB.
 
-The repo tracks everything a clone needs to build and run. Gitignored: `models/`,
-fetched on first run, `dist/` and `target/`. `tools/` ships nothing but is
-tracked, because it is how the fixtures every null test reads were produced.
+The repository tracks everything a clone needs to build and run. `models/`
+(downloaded on first run), `dist/` and `target/` are gitignored. `tools/` ships
+nothing but is tracked, because it produced the fixtures that every null test
+reads.
 
 ## Models
 
-All three are served from
-[this project's own release](https://github.com/nsaintot/stemd/releases/tag/models-v2)
-and pinned by SHA-256. The demucs ones are
-[mlx-community's](https://huggingface.co/mlx-community/demucs-mlx) conversions
-byte for byte, mirrored so the app depends on one release rather than on an
-upstream that could move. Nobody publishes an MLX BS-RoFormer, so that one is
-converted here by `tools/export/convert_roformer.py`.
+All three models are served from [this project's own
+release](https://github.com/nsaintot/stemd/releases/tag/models-v2) and pinned by
+SHA-256. The demucs models are byte-for-byte copies of
+[mlx-community's](https://huggingface.co/mlx-community/demucs-mlx) conversions,
+mirrored so the app depends on one release that this project controls. Nobody
+publishes an MLX BS-RoFormer, so `tools/export/convert_roformer.py` converts
+that one here.
 
-No manifest travels with any of them: the architecture is compiled in and every
-layer checks the shape of the tensor it pulls, which catches the wrong artefact
-more precisely than a JSON file claiming otherwise.
+No manifest comes with the weights. The architecture is compiled in, and every
+layer checks the shape of each tensor it reads, which identifies a wrong
+artefact more precisely than a manifest file could.
 
 See [evaluation.md](evaluation.md) for why each preset is what it is.

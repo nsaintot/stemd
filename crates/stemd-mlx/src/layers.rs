@@ -2,15 +2,14 @@
 //!
 //! Two things here are easy to get wrong in ways nothing reports.
 //!
-//! **Layout.** demucs thinks in channels-first, `[B, C, T]` and `[B, C, F, T]`,
-//! and MLX convolutions are channels-last, so every convolution is wrapped in a
-//! transpose on the way in and out. A missed transpose does not fail: it convolves
-//! over the wrong axis and produces the right shape containing nothing useful.
+//! **Layout.** demucs works channels-first, `[B, C, T]` and `[B, C, F, T]`, and MLX convolutions
+//! are channels-last, so every convolution is wrapped in a transpose on the way in and out. A
+//! missed transpose does not fail: it convolves over the wrong axis and produces the right shape
+//! with useless contents.
 //!
-//! **Which norms exist.** htdemucs sets `norm_starts = 4` with `depth = 4`, so no
-//! encoder or decoder layer carries a `GroupNorm` at all. The only normalisation
-//! here is inside [`DConv`], at one group. Adding the norms the class could have
-//! would load fine and change every number.
+//! **Which norms exist.** htdemucs sets `norm_starts = 4` with `depth = 4`, so no encoder or
+//! decoder layer has a `GroupNorm`. The only normalisation here is inside [`DConv`], with one
+//! group. Adding the norms the class allows would load fine and change every number.
 
 use anyhow::Result;
 use mlx_rs::ops::indexing::IndexOp;
@@ -28,8 +27,7 @@ pub struct Conv1d {
 }
 
 impl Conv1d {
-    /// `weight` is `[out, kernel, in]`, which is what the converted artefacts
-    /// already hold.
+    /// `weight` is `[out, kernel, in]`, the layout the converted artefacts already hold.
     pub fn load(
         w: &Scope<'_>,
         chin: i32,
@@ -74,9 +72,7 @@ pub struct ConvTranspose1d {
 }
 
 impl ConvTranspose1d {
-    /// `weight` is `[out, kernel, in]`: the same layout as the forward
-    /// convolution, not the transpose of it. Worth stating because the obvious
-    /// guess is wrong and the shape check is what said so.
+    /// `weight` is `[out, kernel, in]`, the same layout as the forward convolution.
     pub fn load(w: &Scope<'_>, chin: i32, chout: i32, kernel: i32, stride: i32) -> Result<Self> {
         Ok(Self {
             weight: w.get_shaped("weight", &[chout, kernel, chin])?,
@@ -175,9 +171,8 @@ fn to_nchw(x: &Array) -> Result<Array> {
 
 /// Group normalisation over the channel axis of `[B, C, ...]`.
 ///
-/// Written out rather than taken from `nn::GroupNorm`, which normalises the
-/// *last* axis. Here the channels are axis 1 and everything after them is the
-/// spatial extent to average over.
+/// It is written out because `nn::GroupNorm` normalises the last axis. Here the channels are axis
+/// 1, and everything after them is the spatial extent to average over.
 pub struct GroupNorm {
     groups: i32,
     weight: Array,
@@ -195,13 +190,12 @@ impl GroupNorm {
         })
     }
 
-    /// Normalising a group is normalising a last axis, so this is `layer_norm`.
-    ///
-    /// Once the channels and the extent after them are folded into one axis a group
-    /// norm is exactly a layer norm over it, and mlx has that as a fused kernel
-    /// accumulating in full precision. Written out it is eleven passes plus two dtype
-    /// conversions, sixty-four times a forward pass. The affine is applied afterwards,
-    /// being per channel rather than per element of the normalised axis.
+    /// Normalising a group is normalising a last axis, so this uses `layer_norm`. mlx's fused
+    /// `layer_norm` accumulates in full precision.
+    // Once the channels and the extent after them are folded into one axis, a group norm equals a
+    // layer norm over it. Written out, it takes eleven passes plus two dtype conversions,
+    // sixty-four times per forward pass. The affine is applied afterwards, because it is per
+    // channel and not per element of the normalised axis.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let shape = x.shape().to_vec();
         let (b, c) = (shape[0], shape[1]);
@@ -220,18 +214,17 @@ impl GroupNorm {
 
 /// A scalar constant in the same precision as the tensor it will meet.
 ///
-/// `Array::from_f32` builds a float32 array, not a weak scalar, and mlx promotes,
-/// so a single epsilon inside a normalisation puts the whole network back into
-/// full precision one layer in.
+/// `Array::from_f32` builds a float32 array, which is not a weak scalar, and mlx promotes, so a
+/// single epsilon inside a normalisation would put the whole network back into full precision one
+/// layer in.
 pub fn scalar_like(value: f32, like: &Array) -> Result<Array> {
     Ok(Array::from_f32(value).as_dtype(like.dtype())?)
 }
 
 /// `x * (1 + erf(x / sqrt(2))) / 2`, the exact gelu mlx computes.
 ///
-/// Written out rather than calling `nn::gelu`, which builds its constants as
-/// float32 arrays, so a half-precision activation meeting it comes back float32.
-/// It sits inside every `DConv`.
+/// It is written out because `nn::gelu` builds its constants as float32 arrays, so a half-precision
+/// activation passed to it comes back float32. It runs inside every `DConv`.
 pub fn gelu(x: &Array) -> Result<Array> {
     let scaled = ops::divide(x, &scalar_like(std::f32::consts::SQRT_2, x)?)?;
     let gated = ops::add(&scalar_like(1.0, x)?, &ops::erf(&scaled)?)?;
@@ -241,8 +234,8 @@ pub fn gelu(x: &Array) -> Result<Array> {
     )?)
 }
 
-/// Gated linear unit over the channel axis: halve the channels, gate with the
-/// sigmoid of the other half.
+/// A gated linear unit over the channel axis: split the channels in half and gate one half with the
+/// sigmoid of the other.
 pub fn glu(x: &Array) -> Result<Array> {
     let channels = x.shape()[1];
     let half = channels / 2;
@@ -292,9 +285,9 @@ impl DConv {
         for d in 0..depth {
             let dilation = 1 << d;
             let padding = dilation; // kernel 3, so dilation * (3 / 2)
-            // `dconv.layers.<d>.layers.<i>`: the block is a Sequential, and the
-            // indices are the positions in it: 2 and 5 are the activations,
-            // which carry no weights but still occupy a slot.
+            // `dconv.layers.<d>.layers.<i>`: the block is a Sequential, and the indices are
+            // positions in it. 2 and 5 are the activations, which carry no weights but still occupy
+            // a slot.
             let b = w.child("layers").child(&d.to_string()).child("layers");
             blocks.push(DConvBlock {
                 conv1: Conv1d::load(
@@ -411,10 +404,9 @@ impl EncLayer {
             });
         }
         let rewrite = Some(match domain {
-            // Square: the reference passes `1 + 2 * context` as a scalar kernel,
-            // so it applies over frequency *and* time. The encoder's context is
-            // zero, which makes 1x1 square either way and hides the difference;
-            // the decoder's is one, and there it is a 3x3.
+            // Square: the reference passes `1 + 2 * context` as a scalar kernel, so it applies over
+            // both frequency and time. The encoder's context is zero, which gives a 1x1 kernel
+            // either way and hides the difference; the decoder's is one, which gives 3x3.
             Domain::Frequency => Conv::Freq(Conv2d::load(
                 &w.child("rewrite.conv"),
                 chout,
@@ -488,8 +480,8 @@ impl EncLayer {
         }
     }
 
-    /// The dilated branch is one-dimensional, so a frequency-domain tensor is
-    /// folded so each frequency bin becomes its own row before it runs.
+    /// The dilated branch is one-dimensional, so a frequency-domain tensor is folded to make each
+    /// frequency bin its own row before it runs.
     fn through_dconv(&self, dconv: &DConv, y: &Array) -> Result<Array> {
         if self.domain == Domain::Time {
             return dconv.forward(y);

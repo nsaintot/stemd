@@ -15,10 +15,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use stemd_core::{Audio, StemFormat};
 
-/// Bytes before the samples of a `wav` file `encode_stem` writes.
+/// The header size of a `wav` file that `encode_stem` writes.
 const WAV_HEADER: usize = 44;
 
-/// What a whole file holds, written beside it.
+/// The description of a whole file, written beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     /// Samples per channel, at the output rate.
@@ -387,7 +387,7 @@ pub fn decode(bytes: Vec<u8>, format: StemFormat, channels: usize, rate: u32) ->
             let decoded = stemd_audio::decode_flac(bytes)?;
             anyhow::ensure!(
                 decoded.data.len() == channels,
-                "a flac piece with {} channels, not {channels}",
+                "flac piece channels: expected {channels}, got {}",
                 decoded.data.len()
             );
             let data = decoded
@@ -575,7 +575,7 @@ mod tests {
             stemd_core::encode_stem(&noise(100, 1), StemFormat::Flac, 1.0).expect("encoding");
         let mono = decode(stereo, StemFormat::Flac, 1, 44_100).unwrap_err();
         assert!(
-            mono.to_string().contains("with 2 channels, not 1"),
+            mono.to_string().contains("channels: expected 1, got 2"),
             "{mono:#}"
         );
     }

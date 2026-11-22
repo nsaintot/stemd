@@ -35,7 +35,7 @@ enum Phase {
     UpToDate {
         until: Instant,
     },
-    /// `after` is what the slot returns to once the notice expires.
+    /// `after` is the status the slot returns to when the notice expires.
     Failed {
         title: &'static str,
         error: String,
@@ -68,7 +68,7 @@ enum Phase {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Launch {
-    /// Until nothing is running, queued or downloading.
+    /// Waiting until nothing is running, queued or downloading.
     Waiting,
     /// Hashing the file and waiting on the consent prompt, off the UI thread.
     Starting,
@@ -104,8 +104,8 @@ pub fn start() {
         .expect("spawning the update check");
 }
 
-/// Ask GitHub for the newest release. `user` is a click, which reports what
-/// it found; a background check stays silent unless there is an update.
+/// Ask GitHub for the newest release. With `user`, the check came from a click and reports what it
+/// found; a background check stays silent unless there is an update.
 fn check_now(user: bool) {
     let before = {
         let mut phase = PHASE.lock();

@@ -6,13 +6,12 @@
 //! sinusoidal position, two-dimensional over `[frequency, time]` for one and
 //! one-dimensional for the other.
 //!
-//! Everything here works channel-last, `[B, T, C]`, unlike [`crate::layers`],
-//! which is channel-first. That is the reference's arrangement, and it is why
-//! `LayerScale` appears again here rather than being reused: the one in `layers`
-//! broadcasts over axis 1.
+//! Everything here works channel-last, `[B, T, C]`, unlike the channel-first [`crate::layers`].
+//! That is the reference's arrangement, and it is why `LayerScale` is defined again here: the one
+//! in `layers` broadcasts over axis 1.
 //!
-//! The `cape` position embedding and the sparse-attention paths in the reference
-//! are dead for htdemucs and are not ported.
+//! The `cape` position embedding and the sparse-attention paths in the reference are unused by
+//! htdemucs and not ported.
 
 use anyhow::Result;
 use mlx_rs::{Array, ops};
@@ -44,8 +43,8 @@ fn sin_embedding(length: i32, dim: i32) -> Result<Array> {
 /// Two-dimensional sinusoidal position: `[1, d_model, height, width]`.
 ///
 /// Half the channels encode width and half encode height, and within each half
-/// sine and cosine alternate channel by channel. A version that concatenated
-/// instead of interleaving would have the right shape and the wrong meaning.
+/// sine and cosine alternate channel by channel. A version that concatenated the halves would have
+/// the right shape and the wrong meaning.
 fn sin_embedding_2d(d_model: i32, height: i32, width: i32) -> Result<Array> {
     let half = d_model / 2;
     let terms = half / 2;
@@ -125,9 +124,9 @@ impl OutNorm {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        // Statistics over time and channels together, so both axes fold into
-        // the one `layer_norm` normalises. The affine is per channel and is
-        // applied after, not by the kernel.
+        // Take statistics over time and channels together, so both axes fold into the one axis
+        // `layer_norm` normalises. The affine is per channel and is applied afterwards, outside the
+        // kernel.
         let shape = x.shape().to_vec();
         let (b, t, c) = (shape[0], shape[1], shape[2]);
         let flat = x.reshape(&[b, 1, t * c])?;
@@ -157,11 +156,11 @@ impl LayerScale {
 }
 
 struct Linear {
-    /// Stored `[chin, chout]`, which is the transpose of how it arrives.
+    /// Held as `[chin, chout]`, the transpose of the artefact's `[out, in]`.
     ///
-    /// Torch keeps a linear weight as `[out, in]` and matmul wants `[in, out]`. Doing
-    /// it once at load rather than inside `forward` measures the same, since mlx is
-    /// lazy, and puts the rearrangement on the weight rather than the pass.
+    /// Torch keeps a linear weight as `[out, in]` and matmul wants `[in, out]`. Transposing once at
+    /// load measures the same as inside `forward`, since mlx is lazy, and keeps the rearrangement
+    /// out of the pass.
     weight: Array,
     bias: Array,
 }
@@ -181,10 +180,9 @@ impl Linear {
     }
 }
 
-/// Multi-head attention: the projections and the head split written out, the
-/// attention itself handed to mlx. The projections stay explicit because their
-/// scaling and layout would have to be verified against a library's conventions
-/// anyway.
+/// Multi-head attention: the projections and the head split are written out, and the attention
+/// itself is mlx's. The projections stay explicit because their scaling and layout would need
+/// checking against a library's conventions anyway.
 struct Attention {
     query: Linear,
     key: Linear,
@@ -216,10 +214,9 @@ impl Attention {
         let kh = split(&self.key.forward(kv)?)?;
         let vh = split(&self.value.forward(kv)?)?;
 
-        //  mlx's own, rather than matmul/softmax/matmul written out. Tried as a speed fix
-        //  on the theory that materialising the scores, a 231 MB tensor twenty times a
-        //  forward pass, was worth avoiding. It measured identical, because the fused
-        //  Metal kernel engages only when the query length is one.
+        // mlx's own attention. Do not expect a speedup from it: the fused Metal kernel engages only
+        // when the query length is one, so the 231 MB score tensor, built twenty times per forward
+        // pass, costs the same either way.
         let head_dim = *qh.shape().last().expect("a last axis");
         let scale = 1.0 / (head_dim as f32).sqrt();
         let attended = mlx_rs::fast::scaled_dot_product_attention(&qh, &kh, &vh, scale, None)?;
@@ -274,8 +271,8 @@ impl Layer {
     /// `other` is `None` for self-attention. Norm-first throughout.
     fn forward(&self, x: &Array, other: Option<&Array>) -> Result<Array> {
         let (attended, feed_norm) = match (other, &self.norm3) {
-            // Cross: queries from this branch, keys and values from the other,
-            // and the feed-forward reads norm3 rather than norm2.
+            // Cross-attention: queries from this branch, keys and values from the other, and the
+            // feed-forward reads norm3.
             (Some(other), Some(norm3)) => {
                 let kv = self.norm2.forward(other)?;
                 (self.attn.forward(&self.norm1.forward(x)?, &kv)?, norm3)
@@ -347,8 +344,8 @@ impl CrossTransformer {
             Ok(ops::transpose_axes(a, &[0, 3, 2, 1][..])?.reshape(&[b, t1 * fr, c])?)
         };
         let pos2d = ops::broadcast_to(&sin_embedding_2d(c, fr, t1)?, &[b, c, fr, t1])?;
-        // Built in f32 from shapes alone, so it has to adopt the branch's
-        // precision rather than dictate it.
+        // The embedding is built in f32 from the shapes alone, so cast it to the branch's
+        // precision.
         let pos2d = flatten(&pos2d)?.as_dtype(x.dtype())?;
         let mut x = ops::add(&self.norm_in.forward(&flatten(x)?)?, &pos2d)?;
 
@@ -362,8 +359,8 @@ impl CrossTransformer {
                 x = layer.forward(&x, None)?;
                 xt = layer_t.forward(&xt, None)?;
             } else {
-                // The time branch reads the frequency branch's *previous*
-                // value, not the one this layer just produced.
+                // The time branch reads the frequency branch's previous value, from before this
+                // layer ran.
                 let previous = x.clone();
                 x = layer.forward(&x, Some(&xt))?;
                 xt = layer_t.forward(&xt, Some(&previous))?;
@@ -375,9 +372,8 @@ impl CrossTransformer {
     }
 }
 
-/// Exposed for the tests, which check the embeddings on their own: they are
-/// pure functions of the shape, so a mistake in one is easy to find here and
-/// very hard to find once it has been added to a tensor.
+/// Exposed for the tests, which check the embeddings alone: they are pure functions of the shape,
+/// so a mistake in one is easy to find here and hard to find once added to a tensor.
 pub mod embeddings {
     use super::{Result, sin_embedding, sin_embedding_2d};
     use mlx_rs::Array;

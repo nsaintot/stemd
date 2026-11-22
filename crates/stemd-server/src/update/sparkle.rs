@@ -156,8 +156,8 @@ pub fn start() {
             userDriverDelegate: Option::<&AnyObject>::None
         ]
     };
-    // Started here so a failure is seen: the initialiser would only show an
-    // alert, and an updater that did not start ignores every check.
+    // Start the updater here so a failure is logged: the initialiser would only show an alert, and
+    // an updater that did not start ignores every check.
     // SAFETY: SPUStandardUpdaterController's `updater`, and SPUUpdater's
     // `startUpdater:`, which takes a null error pointer.
     let started = controller.as_ref().is_some_and(|controller| unsafe {

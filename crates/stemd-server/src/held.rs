@@ -60,13 +60,13 @@ pub struct StemState {
 pub struct Lookup {
     pub track: String,
     pub model_id: String,
-    /// Track length at the model's rate.
+    /// The track length at the model's rate.
     pub frames: usize,
     pub sample_rate: u32,
     pub channels: usize,
     pub output: OutputView,
     pub state: Held,
-    /// The stored output a `derivable` one is converted from.
+    /// The stored output that a `derivable` output is converted from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<OutputView>,
     /// The running job, when `state` is `separating`.
@@ -126,7 +126,8 @@ impl TypeDir {
     }
 }
 
-/// `output`'s track directories for `id` at any gain: all whole, then all pieces, then the rest.
+/// `output`'s track directories for `id` at any gain: first those with every stem whole, then those
+/// holding only pieces, then the others.
 fn type_dirs(cache: &Cache, model_id: &str, output: &Output, id: &str) -> Vec<TypeDir> {
     let prefix = type_prefix(output);
     let mut out: Vec<TypeDir> = cache
@@ -171,7 +172,7 @@ fn sources_of(output: &Output) -> Vec<(Output, Option<f32>)> {
             .filter(|f| *f != output.format)
             .map(|f| (with(f), None))
             .collect();
-    // A 16-bit read of `pcm32` samples, as a session without `peak` makes it.
+    // A 16-bit read of `pcm32` samples, at the gain a session without `peak` uses.
     out.push((with(StemFormat::Pcm32), Some(output.gain(None))));
     out
 }
@@ -201,7 +202,8 @@ pub fn derivable(
     })
 }
 
-/// A track directory of `output` for `id` that holds a piece or a whole stem, at `gain` when one does.
+/// A track directory of `output` for `id` that holds a piece or a whole stem. The directory at
+/// `gain` is preferred when it holds one.
 pub fn claimable(
     cache: &Cache,
     model_id: &str,

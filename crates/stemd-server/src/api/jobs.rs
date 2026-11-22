@@ -23,11 +23,8 @@ use super::params::{CreateParams, Submission};
 
 /// Decode the upload to planar float at the model's rate, off the async runtime.
 ///
-/// The upload may be at any rate; the model works at exactly one, so anything
-/// else is converted here rather than carried to the worker to be refused there.
-/// The conversion is the general resampler: a client that wants a particular
-/// filter is asking about the stems on the way out, not about the mix on the way
-/// in, which the model consumes and never returns.
+/// An upload at another rate is converted here with the general resampler. A filter that a client
+/// names applies only to the output stems; the model consumes the mix and never returns it.
 pub(super) async fn decode_upload(body: Bytes, submission: Submission) -> Result<Audio, ApiError> {
     let model_rate = submission.model_rate;
     let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Audio> {
@@ -80,10 +77,8 @@ pub(super) async fn cached_result(
         .flatten()
 }
 
-/// A job as the client should see it right now.
-///
-/// Queue positions shift as the worker drains it, so the live one is resolved
-/// at read time rather than trusting what was stored at submit.
+/// A job as the client sees it now. The queue position is resolved at read time, because positions
+/// shift as the worker takes jobs.
 pub(crate) fn live_view(state: &AppState, job: &crate::jobs::Job) -> crate::jobs::JobView {
     let mut view = job.view();
     if view.progress.stage == Stage::Queued
@@ -115,7 +110,7 @@ pub(crate) async fn submit(
     let submission = Submission::parse(params, &body, state)?;
     let mix = decode_upload(body, submission.clone()).await?;
     let (mix, id) = identify(mix).await?;
-    // Before the claim, so a lookup by the file key finds the job while it runs.
+    // Record the file key before the claim, so a lookup by that key finds the job while it runs.
     if let Some(key) = &params.file
         && let Err(err) = state.cache.record_file(key, &id)
     {
@@ -124,9 +119,8 @@ pub(crate) async fn submit(
     let cache_id = state.switcher.cache_id();
     let key = crate::jobs::job_key(&id, &submission.output, &cache_id);
 
-    // Claim before the lookup: `claim` registers the job under the same lock
-    // that looks for one, so simultaneous requests for the same track collapse
-    // onto a single separation.
+    // Claim before the cache lookup: `claim` registers the job under the same lock that looks for
+    // one, so simultaneous requests for the same track share a single separation.
     let job = match state.jobs.claim(&key, crate::jobs::MixShape::of(&mix)) {
         Err(existing) => {
             tracing::debug!(
@@ -215,18 +209,15 @@ pub(crate) async fn delete_job(
 ) -> Result<Response, ApiError> {
     let job = state.jobs.get(&id).ok_or_else(ApiError::not_found)?;
 
-    // Two decks can share one job. Cancelling on the first `DELETE` would take
-    // the separation out from under the other one, so only the last waiter
-    // letting go actually stops the work.
+    // Two decks can share one job, so only the last waiter's `DELETE` stops the work.
     let remaining = job.release();
     if remaining > 0 {
         tracing::debug!(job = %id, "released, {remaining} waiter(s) still want it");
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    // Cancel before removing: `cancel` matches on the running job's id, and the
-    // worker reports what it actually stopped. Removing first would only widen
-    // the window in which a re-submission of the same track cannot join.
+    // Cancel before removing: `cancel` matches on the running job's id. Removing first would widen
+    // the gap in which a new submission of the same track cannot join.
     if state.stop_job(&id) {
         tracing::info!(job = %id, "cancelled");
     }
@@ -250,7 +241,7 @@ pub(crate) async fn get_stem(
 
     let file = tokio::fs::File::open(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            // Deleted from the cache between the lookup and the open.
+            // The stem was deleted from the cache between the lookup and the open.
             ApiError::new(
                 StatusCode::GONE,
                 "these stems have left the cache; resubmit the track",
@@ -265,8 +256,8 @@ pub(crate) async fn get_stem(
         .map(|m| m.len())
         .map_err(|e| ApiError::internal(format!("stat {}: {e}", path.display())))?;
 
-    // Only once the bytes are provably readable, so a failed fetch keeps the
-    // stems held.
+    // Mark the stem fetched only once its bytes are readable, so a failed fetch keeps the stems
+    // held.
     entry.mark_fetched(&name);
 
     Ok(Response::builder()

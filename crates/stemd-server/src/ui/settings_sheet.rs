@@ -1,8 +1,7 @@
 //! The settings sheet: the longest track accepted, the port, and the cache.
 //!
-//! Opens from the status bar over the dimmed window. A change applies at once
-//! and is saved, see [`crate::settings`]. A value a flag fixed for this run is
-//! greyed out.
+//! The sheet opens from the status bar over the dimmed window. A change applies at once and is
+//! saved (see [`crate::settings`]). A value that a flag fixed for this run is greyed out.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,20 +17,20 @@ use super::icons;
 use super::theme::{self, Brushes, Palette, Weight, white};
 use super::widgets::{self, Pill};
 
-/// Sizes the menu offers, in gigabytes.
+/// The sizes the menu offers, in gigabytes.
 const SIZES: [f64; 6] = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
 
-/// Ages the menu offers, in days; 0 keeps whole tracks until the cache is full.
+/// The ages the menu offers, in days; 0 keeps whole tracks until the cache is full.
 const AGES: [f64; 4] = [7.0, 30.0, 90.0, 0.0];
 
 const WIDTH: f32 = 452.0;
-/// Gap between the window's top and the sheet.
+/// The gap between the window's top and the sheet.
 const TOP: f32 = 40.0;
 const MARGIN: i8 = 18;
 const ROW: f32 = 56.0;
 const CONTROL: egui::Vec2 = vec2(120.0, 28.0);
 const MENU_WIDTH: f32 = 150.0;
-/// Height of the cache's usage block: two lines, a gap and the meter.
+/// The height of the cache's usage block: two lines, a gap and the meter.
 const USAGE: f32 = 76.0;
 
 /// Seconds the port's confirmation stays up.
@@ -39,7 +38,7 @@ const MOVED_SECS: f64 = 2.6;
 /// How long the note on what a lower limit deleted stays up.
 const NOTE_FOR: Duration = Duration::from_secs(4);
 
-/// Colours the sheet uses beyond the palette.
+/// Colours the sheet uses in addition to the palette.
 const FOCUS: Color32 = Color32::from_rgb(187, 206, 247);
 const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(91, 132, 216, 72);
 const BAD_RING: Color32 = Color32::from_rgba_unmultiplied_const(212, 104, 95, 64);
@@ -52,11 +51,11 @@ pub struct Sheet {
     minutes: String,
     /// The port as typed.
     port: String,
-    /// Why the server could not move to the port typed.
+    /// Why the server could not move to the typed port.
     port_failed: Option<String>,
     /// When the server last moved, for the confirmation under the port.
     moved_at: Option<f64>,
-    /// What the last lower limit deleted, and when. Set by the thread applying it.
+    /// What the last lowered limit deleted, and when. The thread that applies the limit sets it.
     note: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
@@ -65,7 +64,7 @@ impl Sheet {
         self.open
     }
 
-    /// Open with the fields showing what this run uses, or close.
+    /// Open the sheet with fields showing the values this run uses, or close it.
     pub fn toggle(&mut self, state: &AppState) {
         self.open = !self.open;
         if self.open {
@@ -95,7 +94,8 @@ fn minutes_text(minutes: f64) -> String {
     }
 }
 
-/// Why `text` is not a length up to `longest` minutes. Empty takes `longest`.
+/// Why `text` is not a valid length of up to `longest` minutes; `None` when it is. An empty text
+/// means `longest`.
 fn minutes_error(text: &str, longest: u32) -> Option<String> {
     if text.is_empty() {
         return None;
@@ -432,7 +432,7 @@ fn general(
     }
 }
 
-/// What the cache holds, the way to empty it, and its two limits.
+/// The cache section: what the cache holds, the button that empties it, and its two limits.
 fn cache(
     ui: &mut egui::Ui,
     sheet: &Sheet,
@@ -501,7 +501,7 @@ fn cache(
         ),
         vec2(pill_width, CONTROL.y),
     );
-    // No confirmation: every byte is re-computable from audio that still exists.
+    // No confirmation: every byte can be recomputed from audio that still exists.
     if widgets::pill(
         ui,
         button,
@@ -567,8 +567,8 @@ fn cache(
     }
 }
 
-/// Apply the saved size and age to the cache, off the window's thread: a lower
-/// limit deletes tracks. What it deleted goes in `note`.
+/// Apply the saved size and age to the cache off the window's thread, since a lower limit deletes
+/// tracks. The result goes in `note`.
 fn apply(state: &AppState, note: &Arc<Mutex<Option<(String, Instant)>>>) {
     let note = Arc::clone(note);
     state.apply_cache_limits(move |tracks, freed| {

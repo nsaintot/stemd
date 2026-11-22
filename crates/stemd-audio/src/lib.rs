@@ -1,9 +1,9 @@
 //! Decode an audio file to planar f32.
 //!
-//! Shared by both entrypoints: the window decodes what is dropped on it, and the
-//! command-line client decodes what it is pointed at. An AAC file carries encoder
-//! delay that has to come off the front, or every stem is offset against the mix
-//! and the client's reconstruction stops nulling.
+//! Both entry points use it: the window decodes files dropped on it, and the command-line client
+//! decodes the file it is given. An AAC file carries encoder delay that must be removed from the
+//! front; otherwise every stem is offset against the mix and the client's reconstruction stops
+//! nulling.
 
 use std::path::Path;
 
@@ -18,7 +18,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 pub struct Decoded {
-    /// `data[channel][sample]`
+    /// Planar samples, `data[channel][sample]`.
     pub data: Vec<Vec<f32>>,
     pub sample_rate: u32,
 }
@@ -108,7 +108,7 @@ fn decode_stream(mss: MediaSourceStream, hint: &Hint, label: &str) -> Result<Dec
         }
         match decoder.decode(&packet) {
             Ok(audio) => sink.append(audio),
-            // A corrupt packet is skipped rather than failing the whole file.
+            // Skip a corrupt packet and keep decoding the file.
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
             Err(e) => return Err(e).context("decoding"),
         }
@@ -119,8 +119,8 @@ fn decode_stream(mss: MediaSourceStream, hint: &Hint, label: &str) -> Result<Dec
 
 /// The next packet, or `None` at end of stream.
 ///
-/// Symphonia signals the end as an `UnexpectedEof` io error rather than a
-/// dedicated variant, so it is translated here instead of at the call site.
+/// Symphonia signals the end as an `UnexpectedEof` io error, with no dedicated variant, so it is
+/// translated here once for every call site.
 fn next_packet(
     format: &mut dyn symphonia::core::formats::FormatReader,
 ) -> Result<Option<symphonia::core::formats::Packet>> {
@@ -137,8 +137,7 @@ fn next_packet(
 
 /// Accumulates decoded buffers into planar channels.
 ///
-/// The channel count is not known until the first decoded buffer arrives, so it
-/// is established there rather than up front.
+/// The channel count is known only when the first decoded buffer arrives, so it is set there.
 struct PlanarSink {
     channels: Vec<Vec<f32>>,
     sample_rate: u32,
@@ -177,11 +176,10 @@ impl PlanarSink {
         if channels.is_empty() || channels[0].is_empty() {
             bail!("decoded no audio from {label}");
         }
-        // [`spread`] only ever writes whole frames, so this holds by
-        // construction. It is checked because everything downstream reads
-        // `frames()` off the first channel and indexes the rest with it, which
-        // turns any drift here into a panic several crates away rather than a
-        // decode that says what was wrong with the file.
+        // `spread` only writes whole frames, so every channel has the same length by construction.
+        // It is checked because everything downstream reads `frames()` from the first channel and
+        // indexes the rest with it, which would turn any drift here into a panic several crates
+        // away, with no message about the file.
         let frames = channels[0].len();
         if let Some((channel, found)) = channels
             .iter()
@@ -213,16 +211,13 @@ impl PlanarSink {
 }
 
 /// Deinterleave `samples` onto `channels`, round robin, whole frames only.
-///
-/// A packet carrying a partial frame is truncated rather than spread. Pushing
-/// the remainder would leave the earlier channels one sample longer than the
-/// rest, and since `frames()` is the first channel's length everywhere
-/// downstream, that one sample is the difference between a decode and an
-/// `index out of bounds` inside the model or the encoder.
-///
-/// No channels means nothing to spread onto, which is a file that declared none.
-/// `finish` reports it; the early return is here because `i % 0` would abort
-/// first.
+// A packet carrying a partial frame is truncated. Pushing the remainder would leave the earlier
+// channels one sample longer than the rest, and since `frames()` is the first channel's length
+// everywhere downstream, that one sample would cause an `index out of bounds` inside the model or
+// the encoder.
+//
+// No channels means a file that declared none, which `finish` reports. The early return is here
+// because `i % 0` would abort first.
 fn spread(channels: &mut [Vec<f32>], samples: &[f32]) {
     let n = channels.len();
     if n == 0 {
@@ -234,16 +229,12 @@ fn spread(channels: &mut [Vec<f32>], samples: &[f32]) {
     }
 }
 
-/// Leading samples an mp4/m4a edit list says to skip, i.e. AAC encoder delay.
-///
-/// Symphonia's `enable_gapless` only understands the iTunes `iTunSMPB` tag, and a
-/// file can declare the same delay through an `elst` edit list instead, as
-/// some exporters do. Missed, the decode carries about 2048 samples (46 ms) of
-/// priming that every other player strips, which puts the stems late against the
-/// original.
-///
-/// A shallow, allocation-free scan rather than a dependency: a malformed box must
-/// return `None` rather than fail the decode.
+/// The leading samples that an mp4/m4a edit list says to skip, which is the AAC encoder delay. A
+/// malformed box returns `None` and the decode continues.
+// Symphonia's `enable_gapless` reads only the iTunes `iTunSMPB` tag, and some exporters declare the
+// delay only in an `elst` edit list. If it is missed, the decode carries about 2048 samples (46 ms)
+// of priming that every other player strips, which puts the stems late against the original. The
+// scan is shallow, with no allocation and no dependency.
 fn mp4_encoder_delay(path: &Path) -> Option<usize> {
     let data = std::fs::read(path).ok()?;
     // `elst` is inside moov/trak/edts, always near the head of the file.
@@ -281,7 +272,6 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::{elst_media_time, spread};
 
-    /// The ordinary case: interleaved in, planar out, order preserved.
     /// FNV-1a over `bytes`, to pin encoder output in a test.
     fn fnv(bytes: &[u8]) -> u64 {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
@@ -336,10 +326,10 @@ mod tests {
         }
     }
 
-    /// A file declaring no channels is reported by `finish`, but only if this
-    /// returns rather than dividing by zero on the way there.
+    /// `finish` can report a file that declares no channels only if `spread` returns before
+    /// dividing by zero.
     #[test]
-    fn no_channels_is_not_a_division_by_zero() {
+    fn spreading_onto_no_channels_does_not_divide_by_zero() {
         spread(&mut [], &[1.0, 2.0]);
     }
 
@@ -364,7 +354,7 @@ mod tests {
 
     #[test]
     fn an_empty_edit_is_not_encoder_delay() {
-        // media_time -1 marks a silent lead-in, not priming to discard.
+        // media_time -1 marks a silent lead-in, which is not priming to discard.
         assert_eq!(elst_media_time(&elst_v0(1, -1)), None);
     }
 
@@ -383,7 +373,7 @@ mod tests {
 
     /// A 16-bit big-endian AIFF file.
     #[test]
-    fn decodes_aiff() {
+    fn an_aiff_file_decodes() {
         let samples: [i16; 6] = [0, 1000, -1000, 32767, -32768, 12345];
         let mut ssnd = vec![0u8; 8];
         for s in samples {

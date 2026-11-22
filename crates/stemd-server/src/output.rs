@@ -1,20 +1,20 @@
-//! What a request asks for on the way out.
+//! The output a request asks for: format, rate, parts and filter.
 
 use serde::Serialize;
 use stemd_core::{OutputRate, Parts, StemFormat};
 
 use crate::filters::Dsp;
 
-/// What a job asks for on the way out.
+/// The output a job asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub format: StemFormat,
     pub rate: OutputRate,
     /// Ship the derived part as well, so the client need not rebuild it from the mix.
     pub derived: bool,
-    /// Filter the conversion to `rate` runs through.
+    /// The filter for the conversion to `rate`.
     pub dsp: Dsp,
-    /// Parts to ship. The derived part is the one they leave out.
+    /// The parts to ship. The derived part is the one they leave out.
     pub parts: Parts,
 }
 
@@ -24,12 +24,13 @@ impl Output {
         self.parts.len() + usize::from(self.ships_derived())
     }
 
-    /// Whether the derived part ships: asked for, and something is left out.
+    /// Whether the derived part ships: it was asked for and some part is left out.
     pub fn ships_derived(&self) -> bool {
         self.derived && self.parts.derived().is_some()
     }
 
-    /// The transfer gain for every stem: 3 dB of headroom over the mix's peak, or over full scale when it is unknown.
+    /// The transfer gain for every stem: 3 dB of headroom over the mix's peak, or over full scale
+    /// when the peak is unknown.
     pub fn gain(&self, peak: Option<f32>) -> f32 {
         if self.format.has_headroom() {
             return 1.0;
@@ -44,22 +45,23 @@ impl Output {
         self.parts.names().chain(derived).collect()
     }
 
-    /// Every part a piece directory of this output holds: the parts, and the derived one.
+    /// Every part that a piece directory of this output holds: the parts and the derived one.
     pub fn stored_parts(&self) -> Vec<&'static str> {
         self.parts.names().chain(self.parts.derived()).collect()
     }
 }
 
-/// The output stems are in, as sessions, jobs and lookups report it.
+/// The output that stems are in, as sessions, jobs and lookups report it.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputView {
     pub format: String,
     pub sample_rate: u32,
-    /// Multiply by `1.0 / gain`; absent for an open track and for a job, whose stems carry it.
+    /// Multiply by `1.0 / gain` to restore the level; absent for an open track and for a job, whose
+    /// stems carry their own gain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain: Option<f32>,
     pub parts: Vec<String>,
-    /// The part the client rebuilds as `mix` minus the parts, when one is left out.
+    /// The part the client rebuilds as `mix` minus the shipped parts, when one is left out.
     pub derived: Option<&'static str>,
 }
 
@@ -84,7 +86,7 @@ pub enum Storage {
     None,
 }
 
-/// Bits of [`sources`]: `drums`, `bass`, `other`, `vocals`.
+/// The bits of [`sources`] for `drums`, `bass`, `other` and `vocals`.
 const SOURCE_BITS: [(&str, u16); 4] = [("drums", 1), ("bass", 2), ("other", 4), ("vocals", 8)];
 
 /// The sources a part holds, one bit each: `1` drums, `2` bass, `4` other,

@@ -25,7 +25,7 @@ const RADIUS: f32 = 52.0;
 /// What CSS `transform-origin: 50% 50%` resolves to for the whole globe.
 const GLOBE_ORIGIN: Pos2 = Pos2 { x: 60.0, y: 63.5 };
 
-/// Left and right edge of each slice.
+/// The left and right edges of each slice.
 const STRIPS: [(f32, f32); 3] = [(0.0, 43.0), (47.0, 73.0), (77.0, 120.0)];
 const PARALLELS: [f32; 6] = [21.0, 34.0, 47.0, 73.0, 86.0, 99.0];
 const BAND: (f32, f32) = (56.5, 63.5);
@@ -37,11 +37,11 @@ pub enum Fx {
     Start,
     /// The batch finished: a wobble and three coloured rings.
     Cheer,
-    /// Picked Fast: the meridians whip round and streaks fly past.
+    /// Fast was picked: the meridians whip round and streaks fly past.
     Fast,
-    /// Picked Balanced: the globe tilts back and forth.
+    /// Balanced was picked: the globe tilts back and forth.
     Balanced,
-    /// Picked Quality: the globe swells.
+    /// Quality was picked: the globe swells.
     Quality,
 }
 
@@ -58,7 +58,7 @@ impl Fx {
 
 /// What drives the motion this frame.
 pub struct Drive {
-    /// `Some` while separating: which of the five motions to play.
+    /// Which of the five motions to play; `Some` only while separating.
     pub variant: Option<u8>,
     /// How fast the motion runs: 1.6 on Fast, 1 on Balanced, 0.6 on Quality.
     pub speed: f32,
@@ -91,7 +91,7 @@ pub struct Motion {
     from: u8,
     to: u8,
     mix: f32,
-    /// Meridian position, in turns.
+    /// The meridian position, in turns.
     meridian: f32,
     /// Seconds of ambient time, which only runs while the window is live.
     /// Wraps at [`CLOCK_WRAP`].
@@ -236,7 +236,7 @@ impl Motion {
 pub struct Look {
     /// 0 at rest, 1 with the outer slices pushed apart.
     pub spread: f32,
-    /// Points the globe is raised by, under a hovering pointer.
+    /// How many points the globe is raised under a hovering pointer.
     pub lift: f32,
     /// Opacity of the Quality halo, 0 to 1.
     pub halo: f32,

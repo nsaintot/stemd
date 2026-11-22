@@ -8,20 +8,19 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Divisor turning an `i16` into `[-1.0, 1.0)`. The full negative magnitude, so
-/// `i16::MIN` maps to exactly `-1.0` and no input can exceed the range.
+/// The divisor that turns an `i16` into `[-1.0, 1.0)`. It is the full negative magnitude, so
+/// `i16::MIN` maps to exactly `-1.0` and no input exceeds the range.
 const S16_TO_FLOAT: f32 = 32768.0;
 
 /// Shared with the FLAC encoder, so a client gets the same integers whichever container it asked for.
 pub(crate) use stemd_audio::wire::quantise_s16;
 
-/// Sample encoding used on the wire and for stem output.
+/// The sample encoding used on the wire and for stem output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PcmFormat {
-    /// 16-bit signed little-endian. The default for stem output: the separation
-    /// residual sits far above a -96 dB noise floor, so float32 doubles the
-    /// transfer for nothing.
+    /// 16-bit signed little-endian, the default for stem output: the separation residual sits far
+    /// above a -96 dB noise floor, so float32 would double the transfer for no gain.
     S16le,
     /// 32-bit float little-endian.
     F32le,
@@ -63,8 +62,8 @@ pub enum PcmError {
     UnknownFormat(String),
     #[error("payload of {len} bytes is not a whole number of {channels}-channel frames")]
     Ragged { len: usize, channels: usize },
-    /// Channels of unequal length. Every reader takes the frame count from the
-    /// first channel, so this is a panic waiting for whichever one gets there.
+    /// Channels of unequal length. Every reader takes the frame count from the first channel, so a
+    /// shorter channel would make the first reader to reach its end panic.
     #[error("channel {channel} has {found} samples where channel 0 has {frames}")]
     RaggedChannels {
         channel: usize,
@@ -73,9 +72,9 @@ pub enum PcmError {
     },
     #[error("expected {expected} channels, got {got}")]
     ChannelCount { expected: usize, got: usize },
-    /// A sample that is NaN or infinite. See [`Audio::peak`] for why this is an
-    /// error rather than something to clamp away.
-    #[error("sample {frame} of channel {channel} is {value}, not a finite number")]
+    /// A sample that is NaN or infinite. See [`Audio::peak`] for why this is an error and is never
+    /// clamped.
+    #[error("sample {frame} of channel {channel}: expected a finite number, got {value}")]
     NotFinite {
         channel: usize,
         frame: usize,
@@ -91,15 +90,12 @@ pub struct Audio {
 }
 
 impl Audio {
-    /// For data whose geometry the caller already knows to be rectangular,
-    /// which is every internal producer: they build each channel from the same
-    /// frame count in the same loop.
-    ///
-    /// The assertion is not idle. `frames()` is the first channel's length and
-    /// the rest are indexed with it, so a shorter one is a panic rather than a
-    /// wrong answer, and it lands in whichever of the model, the resampler or
-    /// the encoder reaches it first. Untrusted data goes through
-    /// [`Self::checked`] instead.
+    /// For data known to be rectangular, as from every internal producer. Untrusted data goes
+    /// through [`Self::checked`].
+    // Each internal producer builds every channel from the same frame count in the same loop. The
+    // assertion matters: `frames()` is the first channel's length and indexes the others, so a
+    // shorter channel would cause a panic in whichever of the model, the resampler or the encoder
+    // reaches it first.
     pub fn new(data: Vec<Vec<f32>>, sample_rate: u32) -> Self {
         debug_assert!(
             data.iter()
@@ -110,12 +106,11 @@ impl Audio {
         Self { data, sample_rate }
     }
 
-    /// The same, for data that came from outside: a decoder, a file, a client.
+    /// The same as [`Self::new`], for data from outside: a decoder, a file or a client.
     ///
-    /// Refused rather than trimmed to the shortest channel. A decode that
-    /// disagrees with itself about how long the track is has already gone wrong,
-    /// and quietly dropping the difference would hand the model a track missing
-    /// a piece nobody chose to lose.
+    /// Unequal channels are refused, never trimmed to the shortest. A decode that disagrees with
+    /// itself about the track length has already failed, and dropping the difference would give the
+    /// model a track with a piece missing.
     pub fn checked(data: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, PcmError> {
         let frames = data.first().map_or(0, Vec::len);
         if let Some((channel, found)) = data
@@ -200,17 +195,13 @@ impl Audio {
         Ok(Self { data, sample_rate })
     }
 
-    /// Peak absolute sample value, or [`PcmError::NotFinite`] if any sample is NaN or
-    /// infinite.
-    ///
-    /// The check rides on this traversal because it is already the pass that reads
-    /// every sample of a finished stem.
-    ///
-    /// An error rather than a clamp, because the failure is silent in both
-    /// directions. `f32::max` returns the non-NaN operand, so a stem that is entirely
-    /// NaN peaks at `0.0` and quantises to digital silence, which nothing downstream
-    /// would question. One sample of `inf` peaks the whole stem at `inf`, and the
-    /// transfer gain `1.0 / inf` then scales every other sample to zero.
+    /// The peak absolute sample value, or [`PcmError::NotFinite`] if any sample is NaN or infinite.
+    /// It returns an error and never clamps, because both failures are otherwise silent.
+    // The finite check runs here because this pass already reads every sample of a finished stem.
+    // `f32::max` returns the non-NaN operand, so a stem that is entirely NaN peaks at `0.0` and
+    // quantises to digital silence, which nothing downstream would question. One `inf` sample peaks
+    // the whole stem at `inf`, and the transfer gain `1.0 / inf` then scales every other sample to
+    // zero.
     pub fn peak(&self) -> Result<f32, PcmError> {
         let mut peak = 0.0f32;
         for (channel, samples) in self.data.iter().enumerate() {
@@ -230,10 +221,9 @@ impl Audio {
 
     /// Encode to an interleaved wire payload, scaling by `gain` first.
     ///
-    /// One shared gain across all stems rather than a per-stem clamp: stems are not
-    /// individually bounded by the mix, and clamping each would destroy the exact-sum
-    /// property. Scaling is linear, so the sum survives; the client is handed `gain`
-    /// to undo.
+    /// One gain is shared across all stems, with no per-stem clamp: the mix does not bound each
+    /// stem, and clamping each would break the exact sum. Scaling is linear, so the sum survives,
+    /// and the client receives `gain` to undo it.
     pub(crate) fn to_interleaved_scaled(&self, format: PcmFormat, gain: f32) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(self.frames() * self.channels() * format.bytes_per_sample());
@@ -259,25 +249,22 @@ impl Audio {
 mod tests {
     use super::*;
 
-    /// Rectangular data is what almost everything is, and it must not become an
-    /// error on the way in.
+    /// Rectangular data, the common case, is accepted.
     #[test]
     fn checked_accepts_rectangular_channels() {
         let audio = Audio::checked(vec![vec![0.0, 0.5], vec![0.25, -0.25]], 44100)
             .expect("equal channels are not ragged");
         assert_eq!(audio.frames(), 2);
         assert_eq!(audio.channels(), 2);
-        // Nothing is a shape either, and the model refuses it by frame count
-        // rather than here.
+        // Empty audio has a valid shape too; the model refuses it later by frame count.
         assert!(Audio::checked(Vec::new(), 44100).is_ok());
         assert!(Audio::checked(vec![Vec::new(), Vec::new()], 44100).is_ok());
     }
 
-    /// The shape behind the first crash report against a release: channel 0 with
-    /// samples in it and channel 1 empty. `frames()` reads channel 0, so every
-    /// reader downstream indexes channel 1 at 0 and panics with "the len is 0
-    /// but the index is 0". It has to be an error here, where the file can be
-    /// named, not a panic three crates later.
+    /// Channel 0 with samples and channel 1 empty is refused. `frames()` reads channel 0, so every
+    /// downstream reader would index channel 1 at 0 and panic with "the len is 0 but the index is
+    /// 0". The error happens here, where the file can be named; the panic would happen three crates
+    /// later.
     #[test]
     fn checked_refuses_ragged_channels() {
         let err = Audio::checked(vec![vec![0.1; 4096], Vec::new()], 44100)
@@ -290,8 +277,7 @@ mod tests {
                 frames: 4096
             }
         ));
-        // The message names both lengths, because "ragged" alone does not tell
-        // anyone which channel came up short.
+        // The message names both lengths, since "ragged" alone does not say which channel is short.
         let text = err.to_string();
         assert!(text.contains("channel 1"), "{text}");
         assert!(text.contains("4096"), "{text}");
@@ -300,8 +286,8 @@ mod tests {
         assert!(Audio::checked(vec![vec![0.1; 100], vec![0.1; 99]], 44100).is_err());
     }
 
-    /// The reader that turned raggedness into a panic, held here so the
-    /// guarantee `checked` provides is the one the encoders rely on.
+    /// This tests `to_interleaved`, which the encoders use, so `checked` covers the case they rely
+    /// on.
     #[test]
     fn a_rectangular_buffer_interleaves_every_frame() {
         let audio = Audio::checked(vec![vec![0.0, 0.5], vec![0.25, -0.25]], 44100).unwrap();
@@ -310,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_round_trip_f32() {
+    fn an_f32_round_trip_is_exact() {
         let audio = Audio::new(vec![vec![0.0, 0.5, -0.5], vec![0.25, -0.25, 1.0]], 44100);
         let bytes = audio.to_interleaved(PcmFormat::F32le);
         let back = Audio::from_interleaved(&bytes, PcmFormat::F32le, 2, 44100).unwrap();
@@ -318,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_round_trip_s16_is_lossy_but_close() {
+    fn an_s16_round_trip_is_lossy_but_close() {
         let audio = Audio::new(vec![vec![0.0, 0.5, -0.5]], 44100);
         let bytes = audio.to_interleaved(PcmFormat::S16le);
         let back = Audio::from_interleaved(&bytes, PcmFormat::S16le, 1, 44100).unwrap();
@@ -328,29 +314,27 @@ mod tests {
     }
 
     #[test]
-    fn ragged_payload_is_rejected() {
+    fn a_ragged_payload_is_rejected() {
         let err = Audio::from_interleaved(&[0u8; 5], PcmFormat::F32le, 2, 44100);
         assert!(err.is_err());
     }
 
     #[test]
-    fn peak_is_the_largest_magnitude_either_way() {
+    fn the_peak_is_the_largest_magnitude_of_either_sign() {
         let audio = Audio::new(vec![vec![0.1, -0.9], vec![0.5, 0.2]], 44100);
         assert!((audio.peak().expect("finite") - 0.9).abs() < 1e-6);
         assert_eq!(Audio::new(vec![vec![]], 44100).peak().expect("finite"), 0.0);
     }
 
-    /// The failure this guard exists for, stated as the arithmetic that hides
-    /// it: fold `f32::max` over NaN and the answer is 0.0, because `max`
-    /// returns the operand that is not NaN. A stem of nothing but NaN therefore
-    /// *looks* like a stem of silence, and a silent stem is not a fault here.
+    /// `f32::max` folded over NaN gives 0.0, because `max` returns the operand that is not NaN. A
+    /// stem of only NaN therefore looks like a silent stem, and a silent stem is not a fault.
     #[test]
     fn an_all_nan_stem_would_otherwise_pass_for_silence() {
         let nan: Vec<f32> = vec![f32::NAN; 8];
         let unguarded = nan.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
         assert_eq!(unguarded, 0.0, "the premise of the guard no longer holds");
-        // And every one of those samples quantises to the middle of the scale,
-        // so what got published was digital silence rather than an error.
+        // Every one of those samples quantises to the middle of the scale, so the stem would be
+        // published as digital silence with no error.
         assert_eq!(quantise_s16(f32::NAN), 0);
 
         let err = Audio::new(vec![nan], 44100)
@@ -359,9 +343,8 @@ mod tests {
         assert!(matches!(err, PcmError::NotFinite { channel: 0, .. }));
     }
 
-    /// Infinity fails the opposite way and just as quietly: it peaks the stem
-    /// at `inf`, and a transfer gain of `1.0 / inf` scales everything else to
-    /// zero. Both are caught by asking for finite rather than for not-NaN.
+    /// An infinite sample peaks the stem at `inf`, and a transfer gain of `1.0 / inf` scales
+    /// everything else to zero. Checking for finite values catches both NaN and infinity.
     #[test]
     fn one_infinite_sample_is_caught_and_located() {
         let audio = Audio::new(
@@ -377,8 +360,8 @@ mod tests {
         else {
             panic!("wrong variant: {err}");
         };
-        // Located, not merely detected, which sample diverged is the first
-        // thing anyone debugging a model asks.
+        // The error locates the sample: which sample diverged is the first question when debugging
+        // a model.
         assert_eq!((channel, frame), (1, 1));
         assert_eq!(value, f32::NEG_INFINITY);
     }

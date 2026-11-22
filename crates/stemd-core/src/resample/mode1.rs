@@ -3,27 +3,24 @@
 //!
 //! # Why a second filter exists
 //!
-//! A client that rebuilds `drums = mix - harmonics - vocals` has to resample its
-//! mix to the stems' rate, and the subtraction only cancels if both sides went
-//! through the same filter. Two good resamplers are not enough: against ffmpeg's
-//! `swresample` ours agrees to about -77 dB of the mix, which lands as -36 dB of
-//! a derived part sitting 41 dB below it.
+//! A client that rebuilds `drums = mix - harmonics - vocals` must resample its mix to the stems'
+//! rate, and the subtraction cancels only if both sides went through the same filter. Two good
+//! resamplers are not enough: against ffmpeg's `swresample`, the general resampler agrees to about
+//! -77 dB of the mix. A derived part can sit 41 dB below the mix, so the error is then only 36 dB
+//! under that part.
 //!
-//! That client cannot be asked to use a different filter: it resamples the mix
-//! on ingest, and only ever sees the result. So the server carries this one and
-//! applies it when a job asks for mode 1.
+//! That client's filter cannot be changed: the client resamples the mix on ingest and keeps only
+//! the result. So the server carries the same filter and applies it when a job asks for mode 1.
 //!
 //! # Where the coefficients come from
 //!
-//! Measured, not disassembled. The converter was driven with synthetic impulses
-//! and shown to be exactly LTI: a half-scale impulse rescales to the float32
-//! floor, two disjoint impulses sum to an energy ratio of 2.000000000, the
-//! channels are independent to exactly zero, and the response is bit-identical
-//! under a shift of 147 input samples.
+//! The converter is exactly LTI, so impulse responses recover its coefficients: a half-scale
+//! impulse gives exactly half the response, to the float32 floor, two disjoint impulses sum to an
+//! energy ratio of 2.000000000, the channels are independent to exactly zero, and the response is
+//! bit-identical under a shift of 147 input samples.
 //!
-//! That last is the polyphase signature. `44100/96000 = 147/320`, so the
-//! converter is an `L = 320`, `M = 147` polyphase FIR with no state carried
-//! between blocks.
+//! The shift of 147 is the polyphase signature: `44100/96000 = 147/320`, so the converter is an `L
+//! = 320`, `M = 147` polyphase FIR that carries no state between blocks.
 //!
 //! An impulse at input index `k` produces `y[m] = p[m*147 - k*320]`, sampling the
 //! prototype at a stride of 147; stepping `k` by one steps the residue by -26 mod
@@ -32,14 +29,12 @@
 //! passband flat to 0.0026 dB out to 19 kHz, -6 dB at 21.156 kHz, stopband at
 //! -100.9 dB from 24 kHz up.
 //!
-//! Verified against that converter on full-band noise at -141.9 dB peak and
-//! -148.3 dB RMS. `matches_the_reference_exactly` holds that against a captured
-//! reference.
+//! Against that converter, the output matches on full-band noise to -141.9 dB peak and -148.3 dB
+//! RMS. `matches_the_reference_exactly` checks it against a captured reference.
 //!
-//! The delay comes with it. Output here sits 64 samples later at 96 kHz than the
-//! general resampler's, which puts a feature exactly where the ratio does. That
-//! is this converter's own group delay, and carrying it is why the two sides
-//! cancel: the client's mix went through the same taps.
+//! The filter's delay is kept. Output here sits 64 samples later at 96 kHz than the output of the
+//! general resampler, which has no delay. That is this converter's own group delay, and keeping it
+//! lets the two sides cancel, because the client's mix went through the same taps.
 //!
 //! The capture harness and the full derivation are not part of this repository.
 
@@ -51,9 +46,8 @@ use crate::pcm::Audio;
 pub(crate) const IN_RATE: u32 = 44_100;
 pub(crate) const OUT_RATE: u32 = 96_000;
 
-/// The prototype at its native 320 × 44100 = 14.112 MHz grid, little-endian f32,
-/// normalised so a unit impulse in gives the prototype out. 18880 taps: 320
-/// branches of 59.
+/// The prototype on its native grid of 320 × 44100 = 14.112 MHz, as little-endian f32, normalised
+/// so a unit impulse in gives the prototype out. It has 18880 taps: 320 branches of 59.
 static PROTO_LE: &[u8] = include_bytes!("../../data/mode1_proto_f32.bin");
 
 fn filter() -> &'static Polyphase {
@@ -77,7 +71,7 @@ pub fn out_frames(frames: usize) -> usize {
 
 /// Resample 44.1 kHz `audio` to 96 kHz exactly as the target player does.
 ///
-/// Panics unless `audio` is at [`IN_RATE`]; the caller checks the rate first.
+/// Panics unless `audio` is at 44.1 kHz; the caller checks the rate first.
 #[must_use]
 pub fn resample(audio: &Audio) -> Audio {
     filter()
@@ -103,12 +97,12 @@ mod tests {
         ]
     }
 
-    /// The reference: full-band uniform noise with the channels differing, captured
-    /// off the device itself. 2205 input frames is 15 full polyphase
-    /// cycles, so all 320 branches are exercised and both edges sit inside the vector.
+    /// The reference: full-band uniform noise with differing channels, captured from the device.
+    /// 2205 input frames are 15 full polyphase cycles, so all 320 branches run and both edges sit
+    /// inside the vector.
     ///
-    /// The bar is -120 rather than the -141.5 achieved, because the last few dB are
-    /// floating-point summation order and would be flaky across targets.
+    /// The threshold is -120 dB, well short of the roughly -141 dB achieved, because the last
+    /// few dB depend on floating-point summation order and would be flaky across targets.
     #[test]
     fn matches_the_reference_exactly() {
         let input = deinterleave(&f32s(include_bytes!("../../data/mode1_ref_in_f32.bin")));
@@ -133,9 +127,9 @@ mod tests {
         );
     }
 
-    /// The edges are the part a resampler is most likely to get subtly wrong,
-    /// and a mismatch there would put a transient on the derived fader at every
-    /// track boundary. Checked separately so a failure says which end.
+    /// A resampler is most likely to get the edges subtly wrong, and a mismatch there would put a
+    /// transient on the derived fader at every track boundary. Each end is checked separately, so a
+    /// failure names it.
     #[test]
     fn the_edges_match_too() {
         let input = deinterleave(&f32s(include_bytes!("../../data/mode1_ref_in_f32.bin")));
@@ -161,8 +155,8 @@ mod tests {
         }
     }
 
-    /// Length follows the ratio, so a converted stem carries the same duration
-    /// the client's own conversion of the track does.
+    /// The length follows the ratio, so a converted stem has the same duration as the client's own
+    /// conversion of the track.
     #[test]
     fn the_length_follows_the_ratio() {
         assert_eq!(out_frames(147), 320);
@@ -185,8 +179,8 @@ mod tests {
         assert_eq!(resample(&empty).frames(), 0);
     }
 
-    /// Being LTI is the property the extraction rested on, so hold it here too:
-    /// a scaled input must produce exactly the scaled output.
+    /// The taps were derived on the assumption that the converter is LTI, so this checks it too: a
+    /// scaled input gives exactly the scaled output.
     #[test]
     fn the_filter_is_linear() {
         let one: Vec<f32> = (0..1000)

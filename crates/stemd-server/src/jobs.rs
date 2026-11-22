@@ -1,8 +1,7 @@
 //! The table of live jobs and the result objects it hands back.
 //!
-//! A job is a handle, not storage: the stems it points at belong to
-//! [`crate::cache`], which is the only thing that governs disk. Two jobs can
-//! therefore share one separation.
+//! A job is a handle to stems that belong to [`crate::cache`], which alone manages disk space, so
+//! two jobs can share one separation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,10 +20,11 @@ use crate::output::Output;
 #[derive(Debug, Clone, Serialize)]
 pub struct StemFile {
     pub name: String,
-    /// Relative endpoint that streams the stem.
+    /// The relative URL that streams the stem.
     pub url: String,
     pub bytes: u64,
-    /// Scale applied before encoding, one per track; multiply by `1.0 / gain` to restore the level.
+    /// The scale applied before encoding, one per track; multiply by `1.0 / gain` to restore the
+    /// level.
     pub gain: f32,
 }
 
@@ -36,12 +36,11 @@ pub struct JobResult {
     /// Samples per channel, at the output rate.
     pub frames: usize,
     pub stems: Vec<StemFile>,
-    /// Level of `mix - sum(model sources)`, in dB relative to the mix.
-    /// Diagnostic: what the model failed to explain about the track. `None`
-    /// for stems a session stored.
+    /// The level of `mix - sum(model sources)`, in dB relative to the mix: a diagnostic of what the
+    /// model failed to explain. `None` for stems a session stored.
     pub model_residual_db: Option<f64>,
-    /// What the separation cost when it ran, which for a cache hit was some
-    /// earlier job; 0 for stems a session stored.
+    /// The time the separation took; for a cache hit, the time of the earlier job that made the
+    /// stems. 0 for stems a session stored.
     pub separation_secs: f64,
     pub realtime_factor: f64,
     /// True when these stems were already on disk and nothing was separated.
@@ -51,8 +50,8 @@ pub struct JobResult {
 impl JobResult {
     /// Describe a cache entry as the result of `job_id`.
     ///
-    /// The URLs are per job, so they are built here rather than stored: two
-    /// decks sharing one entry each poll their own id.
+    /// The URLs are built here because they differ per job: two decks sharing one entry each poll
+    /// their own id.
     pub fn from_entry(entry: &Entry, job_id: &str, cached: bool) -> Self {
         Self {
             output: crate::output::OutputView::of(&entry.output, None),
@@ -129,11 +128,10 @@ impl Job {
         *self.waiters.lock() += 1;
     }
 
-    /// Drop one waiter, returning how many are left.
+    /// Drop one waiter and return the number left.
     ///
-    /// `DELETE` from one client means "I stopped caring", not "cancel this for
-    /// everyone": a shared job is only cancelled once the last waiter lets go.
-    /// Saturates, so a repeated delete cannot resurrect a job.
+    /// A shared job is cancelled only when its last waiter releases it. The count saturates at
+    /// zero, so a repeated delete cannot bring a job back.
     pub fn release(&self) -> usize {
         let mut waiters = self.waiters.lock();
         *waiters = waiters.saturating_sub(1);
@@ -157,10 +155,8 @@ impl Job {
 
     /// Mark the job stopped at the client's request.
     ///
-    /// Terminal like [`Job::fail`], but with no error attached: nothing went
-    /// wrong, so there is nothing for a client to read back. It keeps a job that
-    /// outlives its removal from the table from looking like it is still
-    /// separating, which would let `claim` join it forever.
+    /// This is terminal like [`Job::fail`], but carries no error. A job that outlives its removal
+    /// from the table then no longer looks like it is separating, so `claim` cannot join it.
     pub fn cancelled(&self) {
         self.set_progress(Progress::new(Stage::Cancelled));
     }
@@ -205,7 +201,7 @@ impl From<crate::cache::TrackInfo> for MixShape {
 #[derive(Default)]
 struct Registry {
     by_id: HashMap<String, Arc<Job>>,
-    /// Cache key to the id of the job currently representing it.
+    /// Maps a cache key to the id of the job that currently represents it.
     by_key: HashMap<String, String>,
 }
 
@@ -258,12 +254,11 @@ impl Jobs {
             .unwrap_or_else(|existing| existing)
     }
 
-    /// Claim `key`, or join whoever already holds it.
+    /// Claim `key`, or join the job that already holds it.
     ///
-    /// `Ok` is a fresh job the caller now owns and must drive to a terminal stage;
-    /// `Err` is an existing one the caller has been added to as a waiter. Registering
-    /// happens under the same lock as the lookup, which makes concurrent submissions
-    /// of one track collapse to a single separation.
+    /// `Ok` is a new job that the caller owns and must drive to a terminal stage; `Err` is an
+    /// existing job that the caller now waits on. Registration happens under the same lock as the
+    /// lookup, so concurrent submissions of one track share a single separation.
     pub fn claim(&self, key: &str, mix: MixShape) -> Result<Arc<Job>, Arc<Job>> {
         let mut jobs = self.jobs.lock();
         if let Some(job) = jobs.in_flight(key) {
@@ -346,7 +341,7 @@ pub fn job_key(id: &str, output: &Output, cache_id: &str) -> String {
     )
 }
 
-/// Characters of a key worth putting in a log line.
+/// The number of key characters shown in a log line.
 const SHORT_KEY: usize = 12;
 
 /// The leading `SHORT_KEY` characters of a key, for logging.
@@ -356,12 +351,11 @@ pub fn short(key: &str) -> &str {
 
 /// A job id: the leading characters of the job key, then the attempt number.
 ///
-/// The same `name-discriminator` shape as `model_id`, and the leading half is what
-/// [`short`] prints in the logs, so a log line and a URL match by eye.
+/// It has the same `name-discriminator` shape as `model_id`, and its first part is what [`short`]
+/// prints in the logs, so a log line and a URL match by eye.
 ///
-/// The attempt suffix keeps ids unique. Without it two clients asking for the same
-/// track at different times share an id, and a `DELETE` from one would cancel the
-/// other's separation.
+/// The attempt number keeps ids unique: without it, two clients asking for the same track at
+/// different times would share an id, and a `DELETE` from one would cancel the other's separation.
 fn job_id(key: &str, attempt: u64) -> String {
     format!("{}-{attempt}", short(key))
 }
@@ -388,14 +382,15 @@ pub struct Entry {
     pub stems: Vec<CachedStem>,
     /// The output the stems are stored as.
     pub output: Output,
-    /// Scale applied to every stem before encoding; multiply by `1.0 / gain` to restore the level.
+    /// The scale applied to every stem before encoding; multiply by `1.0 / gain` to restore the
+    /// level.
     pub gain: f32,
     pub channels: usize,
     /// Samples per channel at the output rate.
     pub frames: usize,
-    /// Absent for stems a session stored.
+    /// The residual level in dB; absent for stems a session stored.
     pub model_residual_db: Option<f64>,
-    /// What the separation cost when it ran; 0 for stems a session stored.
+    /// The time the separation took when it ran; 0 for stems a session stored.
     pub separation_secs: f64,
     state: Mutex<State>,
 }
@@ -537,9 +532,8 @@ mod tests {
         let cache = cache(u64::MAX, Duration::from_secs(3600));
         let jobs = Jobs::new(Duration::from_secs(3600));
 
-        // A second request for a track already separated gets its own handle
-        // onto the same stems. Two handles only ever coexist once the first is
-        // terminal, while it is running, `claim` joins it instead.
+        // A second request for a track already separated gets its own handle to the same stems. Two
+        // handles coexist only once the first is terminal; while it runs, `claim` joins it instead.
         let entry = publish(&cache, "doubles", 32, 2.0);
         let dir = entry.dir.clone();
         let first = jobs.create("doubles".into());
@@ -589,8 +583,8 @@ mod tests {
         let result = job.result.lock().clone().unwrap();
         assert_eq!(result.separation_secs, 2.0);
         assert!(result.cached);
-        // 32 frames at 44100 Hz separated in 2 s: slower than realtime, and the
-        // ratio must describe the run that happened, not this instant answer.
+        // 32 frames at 44100 Hz separated in 2 s is slower than realtime: the ratio describes the
+        // original separation, which took 2 s.
         assert!(result.realtime_factor < 1.0);
     }
 
@@ -609,9 +603,8 @@ mod tests {
 
     #[test]
     fn concurrent_claims_on_one_key_collapse_to_a_single_job() {
-        // The reason `claim` registers under the lock that looks up. With the
-        // lookup and the insert apart, every thread here finds nothing in
-        // flight and starts its own separation.
+        // `claim` registers under the lookup's lock; with the lookup and the insert apart, every
+        // thread here would find nothing in flight and start its own separation.
         let jobs = Arc::new(Jobs::new(Duration::from_secs(3600)));
         let start = Arc::new(std::sync::Barrier::new(8));
         let created = Arc::new(Mutex::new(Vec::new()));
@@ -664,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_second_attempt_at_one_track_gets_its_own_id() {
-        // Two ids for one key is what stops the DELETE below from aliasing.
+        // Two ids for one key keep the DELETE below from hitting the wrong job.
         let jobs = Jobs::new(Duration::from_secs(3600));
         let first = jobs.create("same".into());
         first.fail("model exploded");
@@ -676,9 +669,8 @@ mod tests {
 
     #[test]
     fn a_finished_client_cannot_cancel_a_later_attempt_at_the_same_track() {
-        // The reason ids carry an attempt number. A client that finished and
-        // then DELETEs must not release the waiter of, and so cancel, the
-        // fresh separation someone else just started for the same track.
+        // Ids carry an attempt number so that a client that finished and then sends DELETE does not
+        // release, and so cancel, a new separation that another client started for the same track.
         let cache = cache(u64::MAX, Duration::from_secs(3600));
         let jobs = Jobs::new(Duration::from_secs(3600));
 

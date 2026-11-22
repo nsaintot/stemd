@@ -1,21 +1,20 @@
-//! Progress reporting.
+//! Reports separation progress.
 //!
-//! Separation is chunked, so progress is a real count of completed work rather
-//! than a spinner. The client polls `GET /v2/jobs/{id}` and sees the chunk
-//! counter advance.
+//! Separation runs in chunks, so progress is a count of completed work. The client polls `GET
+//! /v2/jobs/{id}` and sees the chunk counter advance.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
-    /// Accepted, not yet picked up by a worker.
+    /// Accepted, and not yet picked up by a worker.
     Queued,
     /// Decoding the uploaded PCM and computing the mix spectrogram.
     Analysing,
     /// Running the model, chunk by chunk. This is where the time goes.
     Separating,
-    /// Inverse STFT and residual.
+    /// Running the inverse STFT and computing the residual.
     Reconstructing,
     /// Writing stems to their temporary paths.
     Writing,
@@ -35,12 +34,12 @@ impl Stage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
     pub stage: Stage,
-    /// Units of work finished within the current stage.
+    /// The units of work finished within the current stage.
     pub completed: u32,
-    /// Total units for the current stage; 0 when the stage is not countable.
+    /// The total units for the current stage; 0 when the stage cannot be counted.
     pub total: u32,
-    /// Overall completion in 0.0..=1.0. Stage weights are rough by design:
-    /// separation dominates, so the others are given a token share.
+    /// Overall completion in 0.0..=1.0. The stage weights are rough: separation dominates, so the
+    /// other stages get a small share.
     pub fraction: f32,
     pub detail: Option<String>,
 }
@@ -102,16 +101,14 @@ const fn stage_ceiling(stage: Stage) -> f32 {
     }
 }
 
-/// Sink for progress updates, and the channel a caller uses to call a
-/// separation off. Implemented for closures.
+/// Receives progress updates, and lets a caller cancel a separation. Implemented for closures.
 pub trait ProgressSink: Send + Sync {
     fn update(&self, progress: Progress);
 
-    /// True once nobody is waiting for this separation any more.
+    /// True once nobody is waiting for this separation.
     ///
-    /// Polled by the backend between segments, so a caller that stops caring
-    /// frees the worker within one segment rather than one track. Defaults to
-    /// never, which is what a closure sink and [`Silent`] want.
+    /// The backend polls it between segments, so a caller that stops waiting frees the worker
+    /// within one segment. The default returns false, so closure sinks and [`Silent`] never cancel.
     fn cancelled(&self) -> bool {
         false
     }
@@ -125,15 +122,14 @@ impl<F: Fn(Progress) + Send + Sync> ProgressSink for F {
 
 /// A separation that stopped because its sink asked it to.
 ///
-/// A distinct type rather than a message, so a caller can tell a routine
-/// cancellation from a model failure without matching on strings.
+/// It is a distinct type, so a caller can tell a routine cancellation from a model failure without
+/// matching on strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 
 impl Cancelled {
-    /// True when `err` is a cancellation rather than a failure. Walks the chain,
-    /// so adding context later cannot turn a cancelled job into a reported
-    /// failure.
+    /// True when `err` is a cancellation. It walks the error chain, so context added later cannot
+    /// turn a cancelled job into a reported failure.
     pub fn caused(err: &anyhow::Error) -> bool {
         err.chain().any(|e| e.is::<Self>())
     }
@@ -160,9 +156,8 @@ mod tests {
 
     #[test]
     fn a_cancellation_is_recognised_through_a_context_layer() {
-        // The worker tells cancelled from failed by this alone, so a `.context`
-        // added anywhere on the way up must not turn a skip into a reported
-        // failure.
+        // The worker tells cancelled from failed by this alone, so a `.context` added anywhere on
+        // the way up must keep a cancellation from being reported as a failure.
         let wrapped = anyhow::Error::from(Cancelled).context("separating");
         assert!(Cancelled::caused(&wrapped));
         assert!(!Cancelled::caused(&anyhow::anyhow!("model exploded")));

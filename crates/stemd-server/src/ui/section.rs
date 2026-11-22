@@ -6,7 +6,7 @@ use super::theme::{self, Palette, Weight};
 
 pub const HEIGHT: f32 = 18.0;
 
-/// Left of the label, level with the icons in the list's rows.
+/// The label's left inset, level with the icons in the list's rows.
 const INSET: f32 = 14.0;
 
 pub fn heading(ui: &mut egui::Ui, palette: &Palette, label: &str, count: Option<String>) {

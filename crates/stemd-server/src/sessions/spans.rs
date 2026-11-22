@@ -52,7 +52,7 @@ impl Spans {
         self.0.iter().map(|r| [r.start, r.end]).collect()
     }
 
-    /// Samples in all spans together.
+    /// The number of samples in all spans together.
     pub fn total(&self) -> usize {
         self.0.iter().map(|r| r.end - r.start).sum()
     }

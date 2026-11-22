@@ -1,8 +1,7 @@
 //! One whole segment through the assembled model.
 //!
-//! Every component has its own passing null below this, so a failure here is in
-//! the wiring rather than the arithmetic: the interleaved encoder loops, the
-//! order the skips are consumed in, the per-branch normalisation, or the mask
+//! Every component passes its own null test, so a failure here is in the wiring: the interleaved
+//! encoder loops, the order the skips are consumed in, the per-branch normalisation, or the mask
 //! that puts the frequency branch back onto complex bins.
 
 mod common;
@@ -25,9 +24,8 @@ fn a_whole_segment_matches_the_reference() {
 
     let null = null_db(&got, &want);
     println!("whole segment null: {null:.1} dB");
-    // Looser than the per-layer tests on purpose: this is fifty-odd layers of
-    // accumulated float32, and the reference is itself only one ordering of
-    // those operations. Anything near this is the same model; -20 dB would be
-    // a wiring mistake wearing a plausible number.
+    // Looser than the per-layer tests on purpose: this is fifty-odd layers of accumulated float32,
+    // and the reference is itself only one ordering of those operations. A null near this bar means
+    // the port matches; a wiring mistake can null around -20 dB, which still looks plausible.
     assert!(null < -60.0, "the model nulls at only {null:.1} dB");
 }

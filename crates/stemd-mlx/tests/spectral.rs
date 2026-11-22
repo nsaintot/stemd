@@ -1,10 +1,9 @@
 //! Null the Rust spectrogram against the reference implementation's.
 //!
-//! The fixtures are the Python MLX model's own `_spec`, `_magnitude` and
-//! `_ispec` for a known input, dumped by `make_spec_fixture.py`. Nothing here
-//! checks that the transform is a *good* spectrogram: only that it is the same
-//! one the traced model was built around, which is the property every layer
-//! after this depends on.
+//! The fixtures are the Python MLX model's own `_spec`, `_magnitude` and `_ispec` for a known
+//! input, dumped by `make_spec_fixture.py`. The tests check that the transform is the one the
+//! traced model was built around, the property every later layer depends on, and say nothing about
+//! its quality as a spectrogram.
 
 mod common;
 
@@ -14,10 +13,9 @@ use stemd_mlx::spectral::Spectral;
 
 /// The forward transform, real and imaginary parts separately.
 ///
-/// A tolerance rather than equality: MLX's FFT is free to associate its
-/// butterflies differently from one call to the next, and this is two
-/// independent implementations of the surrounding framing. −100 dB is far below
-/// anything the model can notice and far above float32 noise.
+/// The test uses a tolerance: MLX's FFT may associate its butterflies differently between calls,
+/// and the surrounding framing is two independent implementations. −100 dB is far below anything
+/// the model can notice and far above float32 noise.
 #[test]
 fn the_spectrogram_matches_the_reference() {
     let _gpu = one_at_a_time();
@@ -41,9 +39,9 @@ fn the_spectrogram_matches_the_reference() {
 
 /// The inverse, including the trimming that makes it deliberately lossy.
 ///
-/// Checked against the reference's *output*, not against the original input:
-/// `_spec` drops the Nyquist bin and two frames, so a round trip loses about
-/// 28 dB by design. Comparing to the input would be measuring demucs, not this.
+/// Checked against the reference's output: `_spec` drops the Nyquist bin and two frames, so a round
+/// trip loses about 28 dB by design, and a comparison with the original input would measure that
+/// designed loss.
 #[test]
 fn the_inverse_matches_the_reference() {
     let _gpu = one_at_a_time();
@@ -62,9 +60,9 @@ fn the_inverse_matches_the_reference() {
     assert!(null < -80.0, "the inverse nulls at only {null:.1} dB");
 }
 
-/// `_magnitude` under `cac`: real and imaginary interleaved as channels rather
-/// than a modulus. Cheap to get subtly wrong: the two parts can be stacked in
-/// either order, and everything downstream reads it as the input image.
+/// `_magnitude` under `cac`: real and imaginary parts interleaved as channels, with no modulus. It
+/// is easy to get subtly wrong: the two parts can be stacked in either order, and everything
+/// downstream reads the result as the input image.
 #[test]
 fn complex_as_channels_interleaves_the_way_the_model_expects() {
     let _gpu = one_at_a_time();

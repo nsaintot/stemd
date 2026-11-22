@@ -1,45 +1,38 @@
 //! The fused normalisations, against the arithmetic they stand for.
 //!
-//! `fast::rms_norm` and `fast::layer_norm` are single kernels doing what four or
-//! five ops would do more slowly, and every backend picks the kernel by row width.
-//! That dispatch is where a backend gets a band of widths wrong, and it is silent
-//! when it does: the shapes still fit, nothing errors, and the model separates
-//! audio that is merely wrong.
+//! `fast::rms_norm` and `fast::layer_norm` are single kernels that replace four or five slower ops,
+//! and every backend picks the kernel by row width. A backend can get a band of widths wrong in
+//! that dispatch, silently: the shapes still fit, nothing errors, and the model separates audio
+//! that is merely wrong.
 //!
 //! MLX v0.31.2's CUDA RMSNorm gave one block two rows to reduce while sizing its
 //! shared storage for one, for widths 129 to 256 at f32 and 257 to 512 at f16: a
 //! band the ordinary suite only crosses from inside a loaded model.
 //!
-//! So this sweeps every width these kernels could be handed rather than the ones
-//! today's artefacts happen to hand them. It is deliberately not `#[ignore]`d: it
-//! needs a GPU and nothing else, no artefact and no fixture.
+//! So this sweeps every width these kernels could receive, beyond the widths today's artefacts use.
+//! It runs by default: it needs only a GPU, with no artefact and no fixture.
 //!
-//! `layer_norm` is swept too. Only `rms_norm` was ever wrong, and `layer_norm` has
-//! no dispatch-by-group in the version this pins, so today it can only pass.
+//! `layer_norm` is swept too, although the pinned version has no dispatch by group for it.
 
 mod common;
 
 use common::{null_db, one_at_a_time};
 use mlx_rs::{Array, Dtype, ops};
 
-/// Widths to sweep. Past what either model asks for: roformer normalises at
-/// `dim` 256 and 512, htdemucs at 384 and 512, and the point is the widths
-/// nobody has tried yet.
+/// The widths to sweep, beyond what either model uses: roformer normalises at `dim` 256 and 512,
+/// and htdemucs at 384 and 512.
 const WIDEST: i32 = 1024;
 
-/// The eps each caller passes, so a kernel is checked at the magnitude it is
-/// actually used at: roformer.rs asks for 1e-12, which is small enough to be
-/// doing nothing, and the layer norms ask for something that is not.
+/// The eps each caller passes, so a kernel is checked at the magnitude it is used at: roformer.rs
+/// asks for 1e-12, small enough to do nothing, and the layer norms ask for a larger value.
 const RMS_EPS: f32 = 1e-12;
 const LAYER_EPS: f32 = 1e-5;
 
-/// Four rows that disagree in scale by 4x a step.
+/// Four rows whose scales differ by 4x per step.
 ///
-/// One row would have caught nothing: the CUDA bug reduced *two* rows into one
-/// row's worth of storage, so it needs a neighbour to be wrong about, and rows
-/// that hold the same distribution would let it be wrong and still land within
-/// tolerance. Four rows spanning 64x in RMS means any merging of two of them
-/// misses by a factor, not by rounding.
+/// One row would catch nothing: a dispatch fault that reduces two rows into one row's storage needs
+/// a neighbouring row to show, and rows with the same distribution would let it land within
+/// tolerance. Four rows spanning 64x in RMS mean any merge of two of them misses by a large factor.
 const ROWS: i32 = 4;
 
 fn input(width: i32) -> Array {
@@ -57,16 +50,15 @@ fn input(width: i32) -> Array {
     Array::from_slice(&data, &[ROWS, width])
 }
 
-/// A weight that is not all ones, so a kernel that ignored it would fail here
-/// rather than pass and leave the affine untested.
+/// A weight that is not all ones, so a kernel that ignored it fails here and the affine is tested.
 fn gamma(width: i32) -> Array {
     let data: Vec<f32> = (0..width).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
     Array::from_slice(&data, &[width])
 }
 
-/// The reference is computed at f32 whatever the kernel ran at, because the
-/// kernels accumulate at f32 too. Writing the f16 reference in f16 would compare
-/// two different roundings and call the difference a kernel bug.
+/// The reference is computed at f32 whatever the kernel ran at, because the kernels accumulate at
+/// f32 too. An f16 reference computed in f16 would compare two different roundings and report the
+/// difference as a kernel bug.
 fn as_f32(a: &Array) -> Array {
     a.as_dtype(Dtype::Float32).expect("upcast to f32")
 }
@@ -101,20 +93,13 @@ fn layer_norm_written_out(x: &Array, eps: f32) -> Array {
     ops::multiply(&centred, &scale).expect("normalise")
 }
 
-/// Sweep one kernel at one dtype and assert the worst width still nulls.
-///
-/// Measured over all 1024 widths. Metal, M-series: rms_norm -137.2 dB at f32 and
-/// -65.8 at f16, layer_norm -95.1 and -72.4. CUDA, RTX 3090 Ti against the patched
-/// MLX: rms_norm -139.0 and -65.8, layer_norm -107.7 and -72.4. The floors sit
-/// 15 dB under the worst of either and some 60 dB above what the CUDA bug
-/// produced, so they are set for immunity to backend jitter rather than as tight
-/// as one machine allows.
-///
-/// The f32 floor looks slack against -137 dB because the binding case is
-/// conditioning, not the kernel: below about width 16 a random row can come out
-/// nearly constant, centring it cancels almost everything, and layer_norm's
-/// relative error grows accordingly. rms_norm subtracts no mean and shows none of
-/// it.
+/// Sweep one kernel at one dtype and assert that the worst width still nulls.
+// The floors sit 15 dB under the worst width measured on Metal and on CUDA, and about 60 dB above
+// the error a broken dispatch produces, so they tolerate backend jitter.
+//
+// The f32 floor looks slack because conditioning sets it: below about width 16 a random row can
+// come out nearly constant, centring it cancels almost everything, and layer_norm's relative error
+// grows accordingly. rms_norm subtracts no mean and shows none of this.
 fn sweep(
     what: &str,
     dtype: Dtype,

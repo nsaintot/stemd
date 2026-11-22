@@ -1,16 +1,14 @@
-//! Changing model at runtime.
+//! Switches the model at runtime.
 //!
-//! Switching can mean a 320 MB download, so it never happens on the UI thread: a
-//! request spawns a worker, publishes progress through [`SwitchState`], and hands
-//! the queue a recipe. The queue's worker builds it between jobs, so a switch
-//! during a separation takes effect once the track in flight is done.
+//! A switch can mean a 320 MB download, so it never runs on the UI thread: a request spawns a
+//! thread, which publishes progress through [`SwitchState`] and hands the queue a closure that
+//! builds the model. The queue's worker runs it between jobs, so a switch during a separation takes
+//! effect once the current track is done.
+//! The switch thread downloads but never builds: MLX weights must be allocated on the thread that
+//! evaluates them, so the separation worker does the last step. See
+//! [`crate::queue::BuildSeparator`].
 //!
-//! This thread fetches but never builds: MLX weights have to be allocated on the
-//! thread that will evaluate them, so the last step belongs to the separation
-//! worker. See [`crate::queue::BuildSeparator`].
-//!
-//! Nothing here cancels. A second request while one is running is refused rather
-//! than queued.
+//! Nothing here cancels. A second request while a switch runs is refused.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,26 +22,25 @@ use crate::precision::Precisions;
 use crate::queue::Queue;
 use crate::settings::SettingsFile;
 
-/// Live state of a model switch, shared between the window and the thread doing
-/// the work.
+/// The live state of a model switch, shared between the window and the switch thread.
 ///
-/// The window reads this to draw a progress dialog and to decide whether the
-/// model menu is interactive.
+/// The window reads it to draw a progress dialog and to decide whether the model menu accepts
+/// input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SwitchState {
     Idle,
-    /// Bytes of the artefact fetched so far.
+    /// The bytes of the artefact downloaded so far.
     Downloading {
         preset: Preset,
         file: String,
         done: u64,
         total: u64,
     },
-    /// Present already; hashing it before trusting it. About a second.
+    /// The artefact is on disk and being hashed before use, which takes about a second.
     Verifying(Preset),
-    /// Handed to the separation worker, which is the only thread that may build
-    /// it. Seconds on an idle server; on a busy one it also covers the track in
-    /// flight, which finishes on the old model first.
+    /// Handed to the separation worker, the only thread that may build the model. This takes
+    /// seconds on an idle server; on a busy one it also waits for the current track, which finishes
+    /// on the old model.
     Loading(Preset),
     Failed {
         preset: Preset,
@@ -60,26 +57,25 @@ impl SwitchState {
     }
 }
 
-/// Everything a switch needs that does not change once the server is up.
+/// The switch inputs that stay fixed once the server is up.
 pub struct SwitchConfig {
-    /// Searched in order, mirroring startup: `--models`, then next to the
-    /// executable, then the download cache.
+    /// The directories searched in order, as at startup: `--models`, then next to the executable,
+    /// then the download cache.
     pub dirs: Vec<PathBuf>,
     pub cache: PathBuf,
     pub overlap: f32,
     /// How each model's precision is decided; see [`crate::precision::Precisions`].
     pub precisions: Precisions,
     pub offline: bool,
-    /// `--demucs-model` as given. Identifies the weights when they are not one
-    /// of the presets, which have a pinned digest instead.
+    /// `--demucs-model` as given. It identifies weights that are not a preset's; presets have a
+    /// pinned digest instead.
     pub artefact: String,
 }
 
 pub struct Switcher {
     state: Mutex<SwitchState>,
-    /// `None` when `--demucs-model` names an artefact that is not one of the
-    /// two presets: a hand-traced variant, say. Switching still works; the
-    /// window simply shows nothing selected rather than claiming otherwise.
+    /// `None` when `--demucs-model` names an artefact that is not a preset, such as a hand-traced
+    /// variant. Switching still works, and the window shows no preset selected.
     current: Mutex<Option<Preset>>,
     queue: Arc<Queue>,
     settings: Arc<SettingsFile>,
@@ -110,12 +106,10 @@ impl Switcher {
         *self.current.lock()
     }
 
-    /// Everything that decides what a separation returns, for the server's own cache
-    /// key.
-    ///
-    /// A hand-traced artefact is identified by its filename, not by the manifest's
-    /// model name: several artefacts share one. Stays the full digest, since it is an
-    /// ingredient of a hash. What goes over the wire is [`Self::published_identity`].
+    /// Every input that decides what a separation returns, for the server's own cache key.
+    // A hand-traced artefact is identified by its file name, since several artefacts share one
+    // manifest model name. The digest stays full length, since it feeds a hash. Clients receive
+    // [`Self::published_identity`].
     pub fn identity(&self) -> String {
         identity_of(
             self.current(),
@@ -135,40 +129,36 @@ impl Switcher {
         )
     }
 
-    /// The same identity as clients see and store it.
-    ///
-    /// A client keys its own stem cache on this, so it becomes a directory name: the
-    /// artefact name plus [`ident::DIGEST_CHARS`] of digest, which keeps the property
-    /// the digest is here for. Always within [`ident`]'s portable charset and length.
-    ///
-    /// Narrower than [`Self::identity`]: it leaves out precision and overlap, which belong
-    /// to the machine and the command line, so the id stays the same when one server comes
-    /// up on another accelerator.
+    /// The model identity as clients see and store it. It leaves out precision and overlap, so it
+    /// stays the same when the server runs on another accelerator.
+    // A client keys its own stem cache on it, so it becomes a directory name: the artefact name
+    // plus `ident::DIGEST_CHARS` of digest, enough to tell artefacts apart. It always stays within
+    // the portable charset and length of `ident`. It is narrower than `Self::identity`, whose
+    // precision and overlap depend on the machine and the command line.
     pub fn published_identity(&self) -> String {
         let id = match self.current() {
-            // A digest of the model identity rather than a prefix of the
-            // weights', so the id moves when the arrangement moves and not only
-            // when the file does. Same shape either way: `<artefact>-<8 hex>`.
+            // The id uses a digest of the model identity, so it changes when the preset's
+            // arrangement changes as well as when the weights file does. The form is `<artefact>-<8
+            // hex>`.
             Some(preset) => format!(
                 "{}-{}",
                 preset.artefact(),
                 ident::short_digest(&model_identity(preset))
             ),
-            // `--demucs-model` is arbitrary input, so it is sanitised and
-            // shortened rather than interpolated.
+            // `--demucs-model` is arbitrary input, so it is sanitised and shortened before use.
             None => ident::tagged("custom", &self.config.artefact),
         };
         debug_assert!(ident::is_portable_id(&id), "unportable model_id: {id}");
         id
     }
 
-    /// True when the artefact is already on disk, i.e. switching is instant and
-    /// needs no network. The window uses this to decide whether to warn first.
+    /// True when the artefact is on disk, so switching is instant and needs no network. The window
+    /// uses this to decide whether to warn first.
     pub fn is_local(&self, preset: Preset) -> bool {
         models::locate(&self.config.dirs, preset).is_some()
     }
 
-    /// Clear a failure so the menu becomes interactive again.
+    /// Clear a failure so the menu accepts input again.
     pub fn dismiss_error(&self) {
         let mut state = self.state.lock();
         if matches!(*state, SwitchState::Failed { .. }) {
@@ -176,8 +166,7 @@ impl Switcher {
         }
     }
 
-    /// Begin switching. Returns false if a switch is already in flight or the
-    /// preset is already loaded.
+    /// Start a switch. Return false if a switch is already running or the preset is already loaded.
     pub fn request(self: &Arc<Self>, preset: Preset) -> bool {
         {
             let state = self.state.lock();
@@ -212,10 +201,9 @@ impl Switcher {
         let dir = self.stage_artefact(preset)?;
 
         *self.state.lock() = SwitchState::Loading(preset);
-        // Blocks until the worker has actually swapped, which is what makes
-        // everything below true rather than merely intended: the queue is the
-        // one publishing what the model says about itself, and a build that
-        // failed comes back here to become `Failed`.
+        // This blocks until the worker has swapped models, so the steps below happen only after a
+        // real swap: the queue publishes what the model reports about itself, and a failed build
+        // returns here and becomes `Failed`.
         self.queue.install(crate::models::builder(
             &dir,
             preset.artefact(),
@@ -225,9 +213,8 @@ impl Switcher {
         ))?;
 
         *self.current.lock() = Some(preset);
-        // Only once it has loaded. Saving the request instead would make a
-        // preset that cannot load on this machine the one every later launch
-        // tries first.
+        // Save the preset only after it loads; otherwise a preset that cannot load on this machine
+        // would be the first one every later launch tries.
         self.settings.set_preset(preset);
         tracing::info!(
             "model switch complete: {} ({:?})",
@@ -237,8 +224,8 @@ impl Switcher {
         Ok(())
     }
 
-    /// The directory holding a verified copy of `preset`, downloading it first
-    /// if this machine does not have one.
+    /// The directory holding a verified copy of `preset`, downloaded first if this machine has
+    /// none.
     fn stage_artefact(&self, preset: Preset) -> anyhow::Result<PathBuf> {
         if let Some(dir) = models::locate(&self.config.dirs, preset) {
             *self.state.lock() = SwitchState::Verifying(preset);
@@ -247,10 +234,7 @@ impl Switcher {
         }
 
         if self.config.offline {
-            anyhow::bail!(
-                "{} is not installed and --offline forbids fetching it",
-                preset.artefact()
-            );
+            anyhow::bail!("{} not installed; --offline set", preset.artefact());
         }
 
         *self.state.lock() = SwitchState::Downloading {
@@ -272,8 +256,8 @@ impl Switcher {
     }
 }
 
-/// The published model identity: the weights digest and the preset's recipe, nothing about
-/// the run. See [`Switcher::published_identity`].
+/// The published model identity: the weights digest and the preset's recipe, with nothing about the
+/// run. See [`Switcher::published_identity`].
 fn model_identity(preset: Preset) -> String {
     format!("m={};r={}", preset.digest(), preset.recipe())
 }
@@ -281,8 +265,8 @@ fn model_identity(preset: Preset) -> String {
 /// The cache identity: `m=` (the model), `p=` (precisions) and `o=` (overlap), `;`-separated.
 ///
 /// Every input that changes the samples belongs here, since a cache hit is served without
-/// separating again. Append new fields: only `m=` holds free-form text, so reading from the
-/// right stays unambiguous.
+/// separating again. Append new fields at the end: only `m=` holds free-form text, so parsing from
+/// the right stays unambiguous.
 fn identity_of(
     model: Option<Preset>,
     artefact: &str,
@@ -293,11 +277,12 @@ fn identity_of(
         Some(preset) => model_identity(preset),
         None => format!("m=custom:{artefact}"),
     };
-    //  `{}` on an f32 prints the shortest decimal that round-trips, so two overlaps
-    //  differing by one ulp differ here. A fixed number of places would round
-    //  neighbouring values onto one key.
-    //  One value when every model in the preset agrees; only a backend wanting
-    //  different precisions from different models produces the joined form.
+    // `{}` on an f32 prints the shortest decimal that round-trips, so two overlaps one ulp apart
+    // give different keys; a fixed number of decimal places would round neighbouring values to one
+    // key.
+    //
+    // The precision field is one value when every model in the preset agrees; only a backend that
+    // wants different precisions for different models produces the joined form.
     format!("{m};p={};o={overlap}", precisions.key(model))
 }
 
@@ -306,19 +291,15 @@ mod tests {
     use super::*;
     use stemd_core::{Accelerator, Precision};
 
-    /// A separation, a real preset switch, and a second separation, on the GPU this
-    /// machine actually has.
-    ///
-    /// Ignored because it wants several hundred megabytes of weights and a working
-    /// backend. It covers a bug nothing single-threaded can catch: a model built on
-    /// one thread and evaluated on another, which Metal permits and CUDA does not.
-    /// The unit tests in [`crate::queue`] pin the arrangement; this pins that the
-    /// arrangement is enough. Both paths that load a model are covered.
-    ///
-    /// ```text
-    /// STEMD_AB_MLX=<dir with every artefact> \
-    /// cargo test --release -p stemd-server -- --ignored across_a_preset_switch --nocapture
-    /// ```
+    /// A separation, a real preset switch, and a second separation, on this machine's GPU. It
+    /// catches a model built on one thread and evaluated on another, which Metal allows and CUDA
+    /// does not.
+    // Ignored by default: it needs several hundred megabytes of weights and a working backend. The
+    // unit tests in `crate::queue` check the threading arrangement; this test checks that the
+    // arrangement is enough, through both paths that load a model.
+    //
+    //     STEMD_AB_MLX=<dir with every artefact> \
+    //     cargo test --release -p stemd-server -- --ignored across_a_preset_switch --nocapture
     #[test]
     #[ignore]
     fn separating_works_across_a_preset_switch() {
@@ -335,11 +316,11 @@ mod tests {
         let cache = crate::testkit::cache(u64::MAX, std::time::Duration::from_secs(600));
         let jobs = Jobs::new(std::time::Duration::from_secs(600));
 
-        //  Eight seconds of tone and noise: long enough to cross a segment boundary,
-        //  short enough that Quality is not a coffee break. A bass note, a chord, a
-        //  vibrato lead and a twice-a-second noise burst give each branch something to
-        //  find. Not the same samples twice: a mix whose channels are identical has no
-        //  side content, and the BS-RoFormer standardises a band of it to NaN.
+        // Eight seconds of tone and noise: long enough to cross a segment boundary, short enough
+        // that Quality finishes quickly. A bass note, a chord, a vibrato lead and a noise burst
+        // twice a second give each branch something to find. The two channels differ: a mix with
+        // identical channels has no side content, and the BS-RoFormer standardises a band of it to
+        // NaN.
         let hz = 44100;
         let tau = 2.0 * std::f32::consts::PI;
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -347,10 +328,8 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            // 24 bits over 2^23, so this lands in [-1, 1). Getting the divisor
-            // wrong here is not a quieter test signal, it is samples in the
-            // hundreds, which htdemucs standardises away and the BS-RoFormer
-            // turns into NaN.
+            // 24 bits over 2^23 gives a value in [-1, 1). A wrong divisor gives samples in the
+            // hundreds, which htdemucs standardises away and the BS-RoFormer turns into NaN.
             (seed >> 40) as f32 / 8_388_608.0 - 1.0
         };
         let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -433,16 +412,16 @@ mod tests {
                 cache: dir,
                 overlap: 0.25,
                 precisions: Precisions::stated(None, Accelerator::Metal),
-                // Everything is on disk already; a download is not what is
-                // under test and its absence must fail rather than fetch.
+                // Every artefact is already on disk and the download is not under test, so a
+                // missing file fails the test.
                 offline: true,
                 artefact: from.artefact().to_owned(),
             },
         ));
         assert!(switcher.request(to), "the switch was refused");
 
-        // Waiting on `current` rather than on `busy`, because `request` returns
-        // before its thread has set a state and `Idle` would read as finished.
+        // Wait on `current`: `request` returns before its thread sets a state, so `busy` would read
+        // `Idle` as finished.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
         while switcher.current() != Some(to) {
             if let SwitchState::Failed { message, .. } = switcher.state() {
@@ -466,8 +445,8 @@ mod tests {
         separate(&queue, "after-the-switch");
     }
 
-    /// Every id a client can be handed has to survive its sanitiser unchanged,
-    /// or the value it stores differs from the value the server reported.
+    /// Every id a client can receive passes its sanitiser unchanged, so the stored value matches
+    /// what the server reported.
     #[test]
     fn every_preset_publishes_a_portable_identity() {
         for preset in Preset::ALL {
@@ -486,8 +465,8 @@ mod tests {
         }
     }
 
-    /// A cache hit is served without separating again, so precision and overlap must
-    /// each change the key.
+    /// A cache hit is served without separating again, so precision and overlap each change the
+    /// key.
     #[test]
     fn precision_and_overlap_each_change_the_identity() {
         let at = |forced, overlap| {
@@ -504,17 +483,14 @@ mod tests {
             "precision is not in the key"
         );
         assert_ne!(at(None, 0.25), at(None, 0.30), "overlap is not in the key");
-        // And the same configuration still lands on the same string, or the
-        // cache would never hit at all.
+        // The same configuration still gives the same string, or the cache would never hit.
         assert_eq!(at(None, 0.25), at(None, 0.25));
     }
 
-    /// The other half of the pair above, and the reason there are two
-    /// identities rather than one.
-    ///
-    /// What a client stores has to survive the server coming up on a different
-    /// accelerator, or on a machine where a library happened not to resolve. It
-    /// changes for the weights and for the arrangement, and for nothing else.
+    /// The id a client stores stays the same on another accelerator, or on a machine where a
+    /// library failed to resolve.
+    // It changes with the weights and the arrangement only; the server's own key changes with every
+    // input.
     #[test]
     fn what_is_published_survives_a_change_of_machine() {
         for preset in Preset::ALL {
@@ -523,14 +499,13 @@ mod tests {
                 for forced in [None, Some(Precision::F32)] {
                     for overlap in [0.25f32, 0.30, 0.5] {
                         let precisions = Precisions::stated(forced, accelerator);
-                        // The server's own key moves with all of it, as it must:
-                        // these are genuinely different audio.
+                        // The server's own key changes with every input, since the audio differs.
                         let internal = identity_of(Some(preset), "unused", precisions, overlap);
                         assert!(
                             internal.starts_with(&published),
                             "the internal key stopped covering the model: {internal}"
                         );
-                        // What the client sees does not.
+                        // The id the client sees does not change.
                         assert_eq!(
                             model_identity(preset),
                             published,
@@ -541,7 +516,7 @@ mod tests {
             }
         }
 
-        // And it still separates the things it is for.
+        // It still tells different presets apart.
         assert_ne!(
             model_identity(Preset::Fast),
             model_identity(Preset::Balanced),
@@ -549,13 +524,12 @@ mod tests {
         );
     }
 
-    /// docs/api.md prints a `model_id` for a default server, which is a digest of
-    /// [`identity_of`], so every field added there falsifies the documented example.
-    /// This pins the value; the shape is `every_preset_publishes_a_portable_identity`.
+    /// docs/api.md shows a `model_id` for a default server, which is a digest of [`identity_of`],
+    /// so a new field there changes the documented example. This test fixes the value;
+    /// `every_preset_publishes_a_portable_identity` checks the form.
     #[test]
     fn the_documented_model_id_is_what_a_default_server_reports() {
-        //  Derived the way `published_identity` derives it, not from the server's
-        //  own cache key.
+        // Derive the id as `published_identity` does, without the server's own cache key.
         let id = format!(
             "{}-{}",
             models::DEFAULT_PRESET.artefact(),
@@ -567,24 +541,20 @@ mod tests {
         );
     }
 
-    /// No two configurations may share a key. Stated as "distinct inputs,
-    /// distinct strings" rather than as a table of expected outputs, so the
-    /// next field is covered by widening the inputs rather than by rewriting
-    /// the expectations.
+    /// No two configurations share a key. The test asserts that distinct inputs give distinct
+    /// strings, so a new field is covered by adding inputs, with no expected outputs to rewrite.
     #[test]
     fn distinct_configurations_never_share_an_identity() {
-        // 0.25 and its neighbour one ulp up. A key that rounded the overlap to
-        // a fixed number of places would serve one separation's stems for the
-        // other.
+        // 0.25 and its neighbour one ulp up. A key that rounded the overlap to a fixed number of
+        // places would serve one separation's stems for the other.
         let overlaps = [0.25f32, 0.5, f32::from_bits(0.25f32.to_bits() + 1)];
-        // `--demucs-model` reaches this unfiltered, so the crafted names are
-        // the interesting half: one spelled as the fields that follow it is the
-        // shape a collision would take.
+        // `--demucs-model` reaches this unfiltered, so the crafted names matter most: a name that
+        // contains `;p=` could otherwise collide with a real field.
         let artefacts = ["htdemucs_seg10_mps", "a;p=f16;o=0.25", "a", ""];
 
-        //  Swept over every backend and both settings of the flag. What is asserted is
-        //  that an identity determines the configuration, not that every input is
-        //  distinct: the backend is deliberately absent from the key.
+        // Sweep every backend and both settings of the flag. The assertion is that an identity
+        // determines the configuration; the backend is left out of the key on purpose, so not every
+        // input is distinct.
         let mut seen: std::collections::HashMap<String, (String, String, String)> =
             std::collections::HashMap::new();
         let mut record = |id: String, what: (String, String, String)| {

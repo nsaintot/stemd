@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-/// Take the port before [`crate::startup::prepare`] loads the model, so a port
-/// in use fails in milliseconds.
+/// Bind the port before [`crate::startup::prepare`] loads the model, so a port in use fails in
+/// milliseconds.
 ///
-/// Non-blocking because tokio requires it of a listener adopted from std, and
-/// doing it here means [`crate::serve::listen`] cannot forget to.
+/// The listener is set non-blocking here, because tokio requires that of a listener adopted from
+/// std.
 pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     listener
@@ -20,7 +20,7 @@ pub fn bind(addr: SocketAddr) -> Result<std::net::TcpListener> {
     Ok(listener)
 }
 
-/// Bind `port` on every interface, else 8420, else any free port; return `port` after a fallback.
+/// Bind `port` on every interface, else 8420, else any free port. Returns `port` when it fell back.
 pub fn bind_saved(port: u16) -> Result<(std::net::TcpListener, Option<u16>)> {
     let any = |port: u16| SocketAddr::from(([0, 0, 0, 0], port));
     let err = match bind(any(port)) {
@@ -45,7 +45,8 @@ pub type Moves = UnboundedReceiver<std::net::TcpListener>;
 pub struct Endpoint {
     ip: std::net::IpAddr,
     port: AtomicU16,
-    /// The saved port another app held at launch, 0 for none. Cleared by a move.
+    /// The saved port that another app held at launch, or 0. Moving the server to another port
+    /// clears it.
     taken: AtomicU16,
     moves: UnboundedSender<std::net::TcpListener>,
 }

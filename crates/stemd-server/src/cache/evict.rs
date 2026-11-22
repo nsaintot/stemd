@@ -1,4 +1,4 @@
-//! The cache's age rules and byte budget, and emptying it.
+//! Applies the cache's age rules and byte budget, and empties the cache.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use super::{Cache, FILES, INFO, LOCK_FILE, SEPARATION, Stats, USED, files, subdirs};
 
 impl Cache {
-    /// The track directories jobs are writing or their results hold now.
+    /// The track directories that jobs are writing or that job results hold now.
     pub(super) fn held_dirs(&self) -> HashSet<PathBuf> {
         let mut dirs = self.writing.lock().clone();
         let mut holds = self.holds.lock();
@@ -24,8 +24,7 @@ impl Cache {
         dirs
     }
 
-    /// The number of track directories, counted at most once a second, the
-    /// bytes held and the cap.
+    /// The track count (recounted at most once a second), the bytes held and the byte cap.
     pub fn stats(&self) -> Stats {
         let mut counted = self.counted.lock();
         let tracks = match *counted {
@@ -60,7 +59,7 @@ impl Cache {
         (tracks, freed)
     }
 
-    /// Delete everything in the root but the lock file.
+    /// Delete everything in the root except the lock file.
     pub fn wipe(&self) {
         let _held = self.lock.lock();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
@@ -86,7 +85,7 @@ impl Cache {
         *self.counted.lock() = None;
     }
 
-    /// What may not be deleted now.
+    /// The tracks and directories in use now, which deletion must skip.
     pub(super) fn in_use(&self) -> InUseNow {
         InUseNow {
             tracks: self.in_use.lock().as_ref().map(|f| f()).unwrap_or_default(),
@@ -169,7 +168,7 @@ impl Cache {
     }
 }
 
-/// The tracks open sessions play and the directories job results hold.
+/// The tracks that open sessions play and the directories that job results hold.
 pub(super) struct InUseNow {
     tracks: HashSet<String>,
     dirs: HashSet<PathBuf>,
@@ -187,7 +186,7 @@ pub(super) struct TrackDir {
     id: String,
     bytes: u64,
     used: SystemTime,
-    /// Some stem is stored and every one is whole: no piece directory is left.
+    /// At least one stem is stored and every stored stem is whole, so no piece directory is left.
     whole: bool,
 }
 
@@ -201,8 +200,8 @@ pub(super) fn count_tracks(root: &Path) -> usize {
         .sum()
 }
 
-/// Every `<model_id>/<type>/<track>` directory under `root`. A directory without
-/// a `.used` file counts as used when its newest file was written.
+/// Every `<model_id>/<type>/<track>` directory under `root`. A directory without a `.used` file
+/// counts as last used when its newest file was written.
 pub(super) fn track_dirs(root: &Path) -> Vec<TrackDir> {
     let mut out = Vec::new();
     for model in subdirs(root) {

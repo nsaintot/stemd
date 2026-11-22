@@ -15,24 +15,24 @@ use crate::settings::SettingsFile;
 
 pub struct AppState {
     pub jobs: Arc<Jobs>,
-    /// The one cache of separated stems; the same as the sessions'.
+    /// The cache of separated stems, shared with the sessions.
     pub cache: Arc<Cache>,
     pub queue: Arc<Queue>,
     pub switcher: Arc<crate::switch::Switcher>,
     pub logs: LogBuffer,
-    /// Files dropped on the window, and what became of them.
+    /// Files dropped on the window, and their progress.
     pub drops: Arc<crate::drops::Drops>,
-    /// What a request that names no output format or rate gets. Live: the window
-    /// changes these while the server is running.
+    /// The output format and rate for a request that names none. The window changes these while the
+    /// server runs.
     pub settings: Arc<SettingsFile>,
-    /// Whether the API answers, and its mDNS advertisement. Shared so every
-    /// exit path can withdraw the advertisement: macOS skips Drop on Cmd-Q.
+    /// Whether the API answers, and its mDNS advertisement. It is shared so every exit path can
+    /// withdraw the advertisement, because macOS skips Drop on Cmd-Q.
     pub serving: crate::serving::Serving,
-    /// Conversion filters clients uploaded.
+    /// The conversion filters that clients uploaded.
     pub filters: Arc<Filters>,
-    /// Empty the cache at quit, from `--ephemeral`.
+    /// Whether to empty the cache at quit, from `--ephemeral`.
     pub ephemeral: bool,
-    /// Where the API listens.
+    /// The address the API listens on.
     pub endpoint: crate::endpoint::Endpoint,
 }
 
@@ -49,13 +49,13 @@ impl AppState {
     /// Queue `work` and return its position, or fail its job when the cache volume or the queue is full.
     pub fn queue_claimed(&self, work: QueuedWork) -> Result<usize, Refused> {
         let job = Arc::clone(&work.job);
-        // Stems are written to the cache before they are served, and a full disk
-        // also leaves the system no room to swap.
+        // Stems are written to the cache before they are served, and a full disk also leaves the
+        // system no room to swap.
         let queued = crate::disk::ensure_room(self.cache.root())
             .map_err(Refused::from)
             .and_then(|()| self.queue.submit(work).map_err(Refused::from));
-        // A job left at Queued would hold its key, and later requests for
-        // the track would join it and wait forever.
+        // Fail the job: a job left at Queued would hold its key, and later requests for the track
+        // would join it and wait forever.
         if let Err(err) = &queued {
             job.fail(err.to_string());
         }
@@ -68,15 +68,15 @@ impl AppState {
         self.jobs.remove(id);
         cancelled
     }
-    /// Longest track accepted: the saved length, never past what this machine's memory holds.
+    /// The longest track accepted: the saved length, capped by what this machine's memory holds.
     pub fn max_track_secs(&self) -> f64 {
         self.settings
             .get()
             .max_track_secs(crate::disk::longest_track_minutes())
     }
 
-    /// Turn the API on or off and save the choice. Turning it off cancels the API jobs, whose
-    /// clients can no longer collect them; returns how many it cancelled.
+    /// Turn the API on or off and save the choice, and return the number of API jobs cancelled.
+    /// Turning it off cancels the API jobs, since their clients can no longer collect them.
     pub fn set_serving(&self, on: bool) -> usize {
         self.serving.set(on, &self.queue.info().model);
         self.settings.set_serving(on);
@@ -113,7 +113,7 @@ impl AppState {
         });
     }
 
-    /// Largest request body to buffer: the longest track at the widest format.
+    /// The largest request body to buffer: the longest track at the widest format.
     pub fn max_body_bytes(&self) -> usize {
         max_body_bytes(
             self.max_track_secs(),
@@ -137,14 +137,11 @@ impl AppState {
     }
 }
 
-/// Bytes the longest permitted track can occupy, at the widest sample format the
-/// API accepts. `f32le`, the larger of the two. This bounds what axum buffers
-/// before the handler runs, so it has to be an upper bound.
-///
-/// Taken at the highest rate the API names rather than the model's, since an
-/// upload arrives at whatever rate the client holds and is converted here. Above
-/// that rate the body is refused by length; the duration limit still applies
-/// underneath it, so this only decides how far past 44.1 kHz an upload may go.
+/// The bytes that the longest permitted track occupies at `f32le`, the wider of the API's two
+/// sample formats. axum buffers at most this much before the handler runs.
+// It uses the highest rate the API names, since an upload arrives at the client's rate and is
+// converted here. Above that rate the body is refused by length; the duration limit still applies,
+// so this only decides how far past 44.1 kHz an upload may go.
 pub fn max_body_bytes(max_track_secs: f64, sample_rate: u32, channels: usize) -> usize {
     let per_second =
         f64::from(sample_rate) * channels as f64 * PcmFormat::F32le.bytes_per_sample() as f64;
@@ -209,10 +206,10 @@ mod tests {
 
     #[test]
     fn the_body_limit_admits_the_longest_track_at_every_rate_it_names() {
-        // The two limits are one number seen twice; the body limit must never
-        // reject audio the duration gate would have allowed, or a legal upload
-        // fails before the handler can explain why. An upload arrives at
-        // whatever rate the client holds, so it has to hold at each of them.
+        // The body limit and the duration limit must describe the same maximum length. The body
+        // limit must never reject audio that the duration limit allows, or a valid upload fails
+        // before the handler can explain why. Uploads arrive at the client's rate, so check every
+        // rate.
         let secs = 600.0;
         let limit = max_body_bytes(secs, highest_rate(), 2);
 
@@ -223,8 +220,8 @@ mod tests {
             assert!(limit >= s16_track);
         }
 
-        // And one second more at the highest of them must not fit, or the gate
-        // is the only thing holding the line.
+        // One second more at the highest rate does not fit, so the body limit also enforces the
+        // bound.
         let widest = f64::from(highest_rate()) * 2.0 * 4.0;
         assert!(limit < ((secs + 1.0) * widest) as usize);
     }

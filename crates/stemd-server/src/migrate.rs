@@ -1,6 +1,6 @@
-//! What stemd 0.2.0 left behind: its cache layout and its flag names.
+//! Cleans up after stemd 0.2.0: its cache layout and its flag names.
 //!
-//! Removed together with protocol 1, along with the `--pieces-max-gb` alias of
+//! This module goes when protocol 1 is removed, together with the `--pieces-max-gb` alias of
 //! `--cache-max-gb` in cli.rs.
 
 use std::path::Path;

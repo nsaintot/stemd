@@ -19,26 +19,19 @@ pub(crate) struct Health {
     backend: String,
     model: String,
     device: String,
-    /// The rate the model runs at. An upload at any other rate is converted to
-    /// this one on arrival, so this is what the model saw rather than what a
-    /// client has to send.
+    /// The rate the model runs at. An upload at any other rate is converted to this rate on
+    /// arrival.
     sample_rate: u32,
     channels: usize,
     /// Which of the window's two presets is loaded, if either.
     #[serde(skip_serializing_if = "Option::is_none")]
     preset: Option<&'static str>,
-    /// Exactly which weights are loaded and how they are arranged: the pinned
-    /// digest for a preset, or `custom:<artefact>` otherwise.
+    /// Which weights are loaded and how they are arranged: the pinned digest for a preset, or
+    /// `custom:<artefact>` otherwise.
     ///
-    /// Key a client-side cache on this, not on `model`: several artefacts share one
-    /// model name, so `model` cannot tell you whether stems on disk came from the
-    /// weights now loaded.
-    ///
-    /// It covers the model and nothing about this run, so it survives the same
-    /// server restarting on a different accelerator or at a different precision.
-    /// The server's own cache key is narrower in what it will accept and wider in
-    /// what it covers, since precision and overlap do change the audio; a client
-    /// keeping stems under this id is choosing not to distinguish those.
+    /// Clients key their caches on this, because several artefacts share one `model` name. It does
+    /// not cover precision or overlap, which change the audio and are part of the server's own
+    /// cache key.
     model_id: String,
     completed_jobs: usize,
     queue_depth: usize,
@@ -48,30 +41,30 @@ pub(crate) struct Health {
     cached_tracks: usize,
     cached_bytes: u64,
     cache_max_bytes: u64,
-    /// Longest track this server will accept. Check before uploading.
+    /// The longest track this server accepts. Check it before uploading.
     max_track_seconds: f64,
-    /// Rates `output_sample_rate` accepts. The model's own rate, 44100, is the
-    /// only one that costs no conversion.
+    /// The rates that `output_sample_rate` accepts. Only the model's own rate, 44100, needs no
+    /// conversion.
     output_sample_rates: Vec<u32>,
-    /// Values `dsp_mode` accepts. `0` is the default and converts any rate pair;
-    /// the rest are fixed filters covering one pair each, listed under
-    /// `dsp_mode_pairs`. The numbered modes are deprecated in favor of
-    /// `dsp_filter`.
+    /// The values that `dsp_mode` accepts. `0`, the default, converts any rate pair; each other
+    /// mode is a fixed filter for one pair, listed in `dsp_mode_pairs`. The numbered modes are
+    /// deprecated; clients use `dsp_filter` instead.
     dsp_modes: Vec<u8>,
-    /// The `[from, to]` a numbered mode is limited to, keyed by the mode. Mode 0
-    /// is absent because it has no such limit.
+    /// The `[from, to]` rate pair that each numbered mode is limited to, keyed by mode. Mode 0 has
+    /// no limit and is absent.
     dsp_mode_pairs: BTreeMap<u8, [u32; 2]>,
-    /// Parts a job can list in `parts`. Which one the player rebuilds follows from
-    /// the request: whatever it leaves out.
+    /// The parts a job can list in `parts`. The player rebuilds the part that the request leaves
+    /// out.
     parts: Vec<String>,
-    /// The output of a request that names no format, rate or parts. Format and rate
-    /// are set in the window and can change while the server runs.
+    /// The output a request gets when it names no format, rate or parts. The window sets the format
+    /// and rate, which can change while the server runs.
     default_output: OutputView,
-    /// Behaviors a client can test for, see [`FEATURES`].
+    /// Behaviors a client can test for; see [`FEATURES`].
     features: &'static [&'static str],
-    /// Median seconds the loaded model takes to run one segment, `null` until one ran.
+    /// The median time in seconds the loaded model takes to run one segment; `null` until a segment
+    /// has run.
     segment_run_seconds: Option<f64>,
-    /// How a session can upload, or `null` when the model cannot run segment by segment.
+    /// The ways a session can upload, or `null` when the model cannot run segment by segment.
     session: Option<SessionMethods>,
 }
 
@@ -81,12 +74,12 @@ pub(super) struct SessionMethods {
     methods: BTreeMap<&'static str, Method>,
 }
 
-/// What a method needs before a segment can run ahead of the upload's end.
+/// What an upload method needs before a segment can run ahead of the upload's end.
 #[derive(Debug, Serialize)]
 pub(super) struct Method {
-    /// Open parameters the method needs.
+    /// The open parameters the method needs.
     requires: Vec<&'static str>,
-    /// Open parameters that change the output but are never needed.
+    /// The open parameters that change the output but are never required.
     optional: Vec<&'static str>,
 }
 
@@ -123,9 +116,8 @@ impl SessionMethods {
 pub const FEATURES: &[&str] = &[];
 
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
-    // Asked of the queue rather than kept alongside it: the worker owns the
-    // separator, so it is the only thing that can say which one is loaded
-    // without racing a switch that has not been applied yet.
+    // Ask the queue: the worker owns the separator, so only the queue can name the loaded model
+    // without racing a pending switch.
     let info = state.queue.info();
     let cache = state.cache.stats();
     let defaults = state.settings.get();

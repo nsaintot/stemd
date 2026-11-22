@@ -15,7 +15,7 @@ VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 DMG="$DIST/stemd-$VERSION-macos-arm64.dmg"
 VOLNAME="Stemd $VERSION"
 
-# The image's window is the artwork's. resources/stemd-dmg.png is the 2x
+# The image's window matches the artwork. resources/stemd-dmg.png is the 2x
 # rendition of a 640 by 400 window with two placeholder squares drawn on it,
 # and the numbers below are where those squares are, as icon centres in
 # window points. Move a square in the artwork, move its number here.
@@ -53,8 +53,8 @@ if [ -z "$IDENTITY" ]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
 fi
 
-# Two v's: `codesign -dv` does not print Authority. Full grep, not -q: SIGPIPE
-# fails the pipeline under pipefail.
+# Two v's: `codesign -dv` does not print Authority. Use a full grep without -q:
+# SIGPIPE fails the pipeline under pipefail.
 AUTHORITY="$(codesign -dvv "$APP" 2>&1 | grep '^Authority=' | head -1 || true)"
 case "$AUTHORITY" in
   "Authority=Developer ID Application"*) ;;
@@ -113,8 +113,8 @@ mkdir -p "$VOL/.background"
 cp -R "$APP" "$VOL/"
 ln -s /Applications "$VOL/Applications"
 
-# Finder picks the rendition for the screen out of a TIFF that carries both,
-# and the artwork is the 2x one, so the 1x is derived here rather than kept.
+# Finder picks the rendition for the screen from a TIFF that carries both, and
+# the artwork is the 2x one, so the 1x rendition is derived here.
 sips -Z "$WINDOW_W" "$BACKGROUND" --out "$STAGE/background-1x.png" >/dev/null
 tiffutil -cathidpicheck "$STAGE/background-1x.png" "$BACKGROUND" \
   -out "$VOL/.background/stemd.tiff" 2>/dev/null
@@ -123,9 +123,9 @@ tiffutil -cathidpicheck "$STAGE/background-1x.png" "$BACKGROUND" \
 # root of the volume, and Finder is the only thing that writes one, so the
 # image is mounted and Finder is told what the window should look like.
 #
-# APFS rather than HFS+: on macOS 26 an HFS+ volume loses its .VolumeIcon.icns
-# and the custom-icon flag when it is unmounted, so the image would come out
-# with a plain disk icon. Every macOS the bundle runs on mounts APFS.
+# APFS, because on macOS 26 an HFS+ volume loses its .VolumeIcon.icns and the
+# custom-icon flag when unmounted, so the image would get a plain disk icon.
+# Every macOS the bundle runs on mounts APFS.
 RW="$STAGE/rw.dmg"
 hdiutil create -volname "$VOLNAME" -srcfolder "$VOL" -fs APFS -format UDRW \
   -ov -quiet "$RW"
@@ -169,10 +169,10 @@ on run argv
 end run
 LAYOUT
 
-# The mounted volume wears the app's icon on the desktop and in the sidebar.
-# After the layout, not before: Finder on macOS 26 deletes .VolumeIcon.icns
-# and clears the custom-icon flag when it writes the window's .DS_Store, and
-# an icon placed afterwards is left alone.
+# The mounted volume shows the app's icon on the desktop and in the sidebar.
+# This runs after the layout: Finder on macOS 26 deletes .VolumeIcon.icns and
+# clears the custom-icon flag when it writes the window's .DS_Store, and leaves
+# an icon placed afterwards alone.
 cp "$APP/Contents/Resources/stemd.icns" "$MOUNT/.VolumeIcon.icns"
 SetFile -a C "$MOUNT"
 

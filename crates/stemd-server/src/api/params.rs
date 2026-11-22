@@ -17,33 +17,32 @@ pub(crate) struct CreateParams {
     pub(crate) sample_rate: u32,
     #[serde(default = "default_channels")]
     pub(crate) channels: usize,
-    /// Encoding of the uploaded body.
+    /// The encoding of the uploaded body.
     #[serde(default)]
     pub(crate) format: Option<String>,
-    /// Container for the stems returned: `flac`, `s16le` or `f32le`. Defaults to
+    /// The container of the returned stems, such as `flac`, `s16le` or `f32le`. Defaults to
     /// `default_output.format` from `/v2/health`.
     #[serde(default)]
     pub(crate) output_format: Option<String>,
-    /// Rate the stems are converted to: 24000, 44100, 48000 or 96000. Defaults
-    /// to `default_output.sample_rate` from `/v2/health`.
+    /// The rate the stems are converted to: 24000, 44100, 48000 or 96000. Defaults to
+    /// `default_output.sample_rate` from `/v2/health`.
     #[serde(default)]
     pub(crate) output_sample_rate: Option<String>,
-    /// Ship the derived part as well. Off by default: a client holding the mix
-    /// can rebuild it for free, and not sending it keeps the transfer at two
-    /// stems.
+    /// Ship the derived part as well. Off by default, since a client holding the mix can rebuild
+    /// it.
     #[serde(default)]
     pub(crate) include_derived: Option<bool>,
     /// Comma-separated parts to ship, such as `bass,other,vocals`. Defaults to
-    /// `default_output.parts` from `/v2/health`. They must not overlap, and must leave out
-    /// one part or none: that part is the one `include_derived` adds.
+    /// `default_output.parts` from `/v2/health`. The parts must not overlap, and must leave out one
+    /// part or none; that part is the one `include_derived` adds.
     #[serde(default)]
     pub(crate) parts: Option<String>,
-    /// Filter the conversion to `output_sample_rate` runs through. `0`, the
-    /// default, converts any pair. See `dsp_modes` in `/v2/health`.
+    /// The filter for the conversion to `output_sample_rate`. `0`, the default, converts any rate
+    /// pair. See `dsp_modes` in `/v2/health`.
     #[serde(default)]
     pub(crate) dsp_mode: Option<String>,
-    /// Id of an uploaded filter the conversion runs through instead. See
-    /// `PUT /v2/filters/{id}`.
+    /// The id of an uploaded filter to convert with in place of `dsp_mode`. See `PUT
+    /// /v2/filters/{id}`.
     #[serde(default)]
     pub(crate) dsp_filter: Option<String>,
     /// The client's key for the file the audio came from, recorded against the track id.
@@ -59,8 +58,8 @@ pub(crate) const fn default_channels() -> usize {
     2
 }
 
-/// Duration of an upload, from its length. Exact for raw PCM, and available
-/// without decoding it.
+/// The duration of an upload, computed from its byte length, which is exact for raw PCM and needs
+/// no decoding.
 pub(super) fn track_seconds(bytes: usize, params: &CreateParams, format: PcmFormat) -> f64 {
     let stride = params.channels * format.bytes_per_sample();
     if stride == 0 || params.sample_rate == 0 {
@@ -69,13 +68,11 @@ pub(super) fn track_seconds(bytes: usize, params: &CreateParams, format: PcmForm
     (bytes / stride) as f64 / f64::from(params.sample_rate)
 }
 
-/// Whether `dsp` covers the conversion this job will actually run.
+/// Check that `dsp` covers the conversion this job runs.
 ///
-/// A mode that covers one rate pair is refused on any other rather than ignored:
-/// a client asks for one because it has to match that filter, and quietly giving
-/// it a different one is the failure it was trying to avoid. The uploaded rate
-/// does not enter into it, since the conversion starts from the model's rate
-/// whatever arrived.
+/// A mode for one rate pair is refused on any other pair, because a client asks for a mode to match
+/// that exact filter. The conversion starts from the model's rate whatever the upload rate, so the
+/// upload rate is not checked.
 pub(super) fn check_dsp(dsp: &Dsp, model_rate: u32, out_rate: OutputRate) -> Result<(), String> {
     let name = match dsp {
         Dsp::Mode(mode) => format!("dsp_mode {mode}"),
@@ -138,10 +135,10 @@ pub(super) struct Submission {
     pub(super) in_format: PcmFormat,
     pub(super) output: Output,
     pub(super) channels: usize,
-    /// Rate the body is at, which the model's need not match.
+    /// The rate of the body, which may differ from the model's.
     pub(super) sample_rate: u32,
-    /// Rate the model runs at, read once here so the whole request works from
-    /// one answer even if the window switches models underneath it.
+    /// The rate the model runs at, read once so the whole request uses one value even if the window
+    /// switches models during it.
     pub(super) model_rate: u32,
 }
 
@@ -152,9 +149,8 @@ pub(crate) fn parse_output(
     state: &AppState,
 ) -> Result<(PcmFormat, Output, u32), ApiError> {
     let in_format: PcmFormat = parse_param(params.format.as_deref().unwrap_or("s16le"))?;
-    // Read once: the window can change these between two requests, and a job
-    // whose format and rate came from different instants is not one anybody
-    // asked for.
+    // Read the defaults once: the window can change them at any time, and a job must not take its
+    // format and rate from two different moments.
     let defaults = state.settings.get();
     let out_format = match params.output_format.as_deref() {
         Some(s) => parse_param(s)?,
@@ -194,7 +190,8 @@ where
     s.parse().map_err(|e| ApiError::bad_request(format!("{e}")))
 }
 
-/// The parts a request names, or the default, each one the loaded model offers.
+/// The parts a request names, or the default parts, each checked against the parts the loaded model
+/// offers.
 fn parse_parts(params: &CreateParams, info: &stemd_core::BackendInfo) -> Result<Parts, ApiError> {
     let parts = match params.parts.as_deref() {
         Some(list) => Parts::parse(list).map_err(ApiError::bad_request)?,
@@ -211,13 +208,10 @@ fn parse_parts(params: &CreateParams, info: &stemd_core::BackendInfo) -> Result<
 
 /// Log a job that converts with the general resampler where a numbered mode covers the pair.
 fn note_general_resampler(dsp: &Dsp, model_rate: u32, out_rate: OutputRate) {
-    // Said out loud, because the way this goes wrong is inaudible from here
-    // and unmistakable at the other end. A client rebuilding the derived
-    // part subtracts these stems from a mix it resampled itself, and the two
-    // filters have to be the same one: mode 1 carries 64 samples of group
-    // delay that the general resampler does not, which at 1.5 kHz is a third
-    // of a cycle, so the vocals come back rather than cancelling. Not an
-    // error, because plenty of clients ask for a rate and subtract nothing.
+    // Log this: a client that rebuilds the derived part subtracts these stems from a mix it
+    // resampled itself, so both must use the same filter. Mode 1 has 64 samples of group delay that
+    // the general resampler lacks, a third of a cycle at 1.5 kHz, so the vocals come back instead
+    // of cancelling. This is not an error, since many clients ask for a rate and subtract nothing.
     if dsp.is_general()
         && let Some(other) = DspMode::for_pair(model_rate, out_rate.hz())
     {
@@ -232,8 +226,8 @@ fn note_general_resampler(dsp: &Dsp, model_rate: u32, out_rate: OutputRate) {
 
 /// A 400 unless `out_format` has a mode at `out_rate`.
 fn check_carries(out_format: StemFormat, out_rate: OutputRate) -> Result<(), ApiError> {
-    // Refused rather than quietly honoured at a rate the format can carry:
-    // a client that asked for 96 kHz mp3 and got 48 has no way to notice.
+    // Refuse the pair: a client that asked for 96 kHz mp3 and got 48 kHz would have no way to
+    // notice.
     if !out_format.carries(out_rate) {
         return Err(ApiError::bad_request(format!(
             "{out_format} has no {} Hz mode; it carries {}",
@@ -260,7 +254,7 @@ impl Submission {
         if body.is_empty() {
             return Err(ApiError::bad_request("empty payload"));
         }
-        // Validated before they are used as divisors below.
+        // Validate these before they are used as divisors below.
         if params.channels == 0 {
             return Err(ApiError::bad_request("channels must be at least 1"));
         }
@@ -268,8 +262,8 @@ impl Submission {
             return Err(ApiError::bad_request("sample_rate must be at least 1"));
         }
 
-        // Length is exact from the byte count, so an over-long track is refused
-        // before it is hashed or decoded rather than after it has been paid for.
+        // The byte count gives the exact length, so an over-long track is refused before it is
+        // hashed or decoded.
         let secs = track_seconds(body.len(), params, in_format);
         let max_secs = state.max_track_secs();
         if secs > max_secs {
@@ -324,9 +318,8 @@ mod tests {
         assert!((secs - 10.0).abs() < 1e-9, "got {secs}");
     }
 
-    /// Mode 0 fits every job. Mode 1 fits exactly one, and says which when it
-    /// does not, so a client that asked for the wrong output rate is told rather
-    /// than handed the general filter under the name it asked for.
+    /// Mode 0 fits every job. Mode 1 fits one rate pair, and the error names that pair when a job
+    /// asks for another.
     #[test]
     fn a_numbered_dsp_mode_is_refused_outside_its_own_rate_pair() {
         for rate in OutputRate::ALL {
@@ -340,8 +333,8 @@ mod tests {
         assert!(err.contains("44100 to 96000"), "{err}");
         assert!(err.contains("44100 to 48000"), "{err}");
 
-        // A model at another rate takes mode 1 out of reach entirely, and the
-        // message has to say so rather than blaming the output rate.
+        // With a model at another rate, mode 1 never fits, and the message names the model rate as
+        // the cause.
         let err = check_dsp(&DspMode::Mode1.into(), 48_000, OutputRate::Hz96000)
             .expect_err("mode 1 starts at 44.1 kHz");
         assert!(err.contains("48000 to 96000"), "{err}");
@@ -383,7 +376,7 @@ mod tests {
 
     #[test]
     fn a_zero_stride_cannot_divide_by_zero() {
-        // Both come straight off the query string, so both are attacker-chosen.
+        // Both values come straight from the query string, so a client controls them.
         assert_eq!(
             track_seconds(1024, &params(0, 44100), PcmFormat::S16le),
             0.0

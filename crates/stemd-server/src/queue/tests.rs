@@ -40,8 +40,8 @@ macro_rules! whole_tracks_only {
     };
 }
 
-/// A separator that records which model "ran", so a swap is observable
-/// without loading 300 MB of weights onto a GPU.
+/// A separator that records which model "ran", so a test can observe a swap without loading 300 MB
+/// of weights onto a GPU.
 struct Stub {
     name: &'static str,
     seen: Arc<Mutex<Vec<&'static str>>>,
@@ -73,9 +73,8 @@ impl Separate for Stub {
     }
 }
 
-/// A separator that is already built, wrapped as the recipe the worker
-/// takes. Fine here and nowhere real: a stub allocates nothing, so which
-/// thread it was made on is not a fact about it.
+/// Wrap an already built separator as the build closure the worker takes. Valid only for stubs,
+/// which allocate nothing on any thread.
 fn ready(separator: impl Separate + 'static) -> BuildSeparator {
     Box::new(move || Ok(Box::new(separator) as Box<dyn Separate>))
 }
@@ -127,9 +126,8 @@ fn traced(threads: &Threads) -> BuildSeparator {
     })
 }
 
-/// Poll until `seen` holds `count` names. `Stub` records under a plain mutex
-/// with nothing to wait on, and the deadline is what turns a swap that never
-/// happens into a failure rather than a hung suite.
+/// Poll until `seen` holds `count` names. `Stub` records under a plain mutex with nothing to wait
+/// on, so the deadline turns a swap that never happens into a test failure.
 fn ran(seen: &Arc<Mutex<Vec<&'static str>>>, count: usize) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while seen.lock().len() < count {
@@ -145,8 +143,8 @@ fn job(jobs: &crate::jobs::Jobs) -> Arc<Job> {
     job_for(jobs, "test-key")
 }
 
-/// Two jobs in one test need two keys: `claim` collapses a repeated key into
-/// the separation already in flight, which is the whole point of it.
+/// A job for `key`. Two jobs in one test need two keys, because `claim` joins a repeated key to the
+/// separation already in flight.
 fn job_for(jobs: &crate::jobs::Jobs, key: &str) -> Arc<Job> {
     jobs.create(key.into())
 }
@@ -159,13 +157,12 @@ struct Segments {
 
 type Shared = Arc<(Mutex<Segments>, Condvar)>;
 
-/// A separator shaped like the real one in the way that matters here: it
-/// works in segments and only checks for cancellation between them. Lets the
-/// plumbing be tested without 300 MB of weights on a GPU.
+/// A separator that, like the real one, works in segments and checks for cancellation only between
+/// them, so the queue can be tested without 300 MB of weights on a GPU.
 struct Segmented {
     state: Shared,
-    /// Segments before it would finish unaided. Deliberately long, so a test
-    /// waiting on the *next* job cannot pass by outlasting this one instead.
+    /// The number of segments before it finishes on its own. It is long, so a test waiting for the
+    /// next job cannot pass by outlasting this one.
     segments: usize,
 }
 
@@ -202,9 +199,8 @@ impl Separate for Segmented {
     }
 }
 
-/// Like [`Segmented`], but it reports progress as it goes, which is the
-/// thing under test here. `Segmented` only sleeps, so a job running on it
-/// looks identical whether its progress is being published or not.
+/// Like [`Segmented`], but it reports progress after each segment, so a test can tell whether
+/// progress is published.
 struct Reporting {
     state: Shared,
     segments: usize,
@@ -250,10 +246,7 @@ impl Separate for Reporting {
     }
 }
 
-/// A separator that unwinds instead of separating.
-///
-/// Which is what a panic inside a forward pass looks like from here, and the
-/// worker has no other way to leave its loop except being asked to.
+/// A separator that panics instead of separating, as a panic inside a forward pass would.
 struct Panics {
     state: Shared,
 }
@@ -284,8 +277,8 @@ impl Separate for Panics {
     }
 }
 
-/// One bad track has to cost that track and nothing else: a panic in a separation
-/// must not end the worker and leave the queue accepting work it will never run.
+/// A panic in a separation fails only that track; the worker keeps running and the queue keeps
+/// serving jobs.
 #[test]
 fn a_panic_in_one_separation_does_not_strand_the_jobs_behind_it() {
     let state = shared();
@@ -304,14 +297,13 @@ fn a_panic_in_one_separation_does_not_strand_the_jobs_behind_it() {
         "the worker never picked the first job up"
     );
 
-    // Told, rather than left waiting. A client polling this job has no other
-    // way to learn that the thing it is waiting for will never happen.
+    // The job is marked failed, so a client polling it learns that it will never finish.
     assert!(
         settled(&first, Duration::from_secs(5)),
         "the job that panicked never reached a terminal state"
     );
 
-    // And the queue is still a queue.
+    // The queue still runs the next job.
     let second = job_for(&jobs, "second");
     submit(&queue, Arc::clone(&second));
     assert!(
@@ -320,7 +312,7 @@ fn a_panic_in_one_separation_does_not_strand_the_jobs_behind_it() {
     );
 }
 
-/// Poll until the job stops being something a client would sit and wait on.
+/// Poll until the job reaches a terminal stage; false if `within` runs out first.
 fn settled(job: &Job, within: Duration) -> bool {
     let deadline = std::time::Instant::now() + within;
     loop {
@@ -347,9 +339,7 @@ fn bump(state: &Shared, change: impl FnOnce(&mut Segments)) {
     changed.notify_all();
 }
 
-/// Block until the counts satisfy `done`, or give up. Returns whether it
-/// happened: polling on a sleep would either be flaky or slow, and the
-/// timeouts here are what separate "cancelled promptly" from "eventually".
+/// Block until the counts satisfy `done`, or until `within` runs out; returns whether they did.
 fn wait_until(state: &Shared, within: Duration, done: impl Fn(&Segments) -> bool) -> bool {
     let (counts, changed) = &**state;
     let deadline = std::time::Instant::now() + within;
@@ -364,7 +354,7 @@ fn wait_until(state: &Shared, within: Duration, done: impl Fn(&Segments) -> bool
     true
 }
 
-/// Long enough (~10 s) that nothing below can pass by simply waiting it out.
+/// Enough segments (about 10 s) that no test below can pass by waiting for the job to finish.
 const NEVER_FINISHES: usize = 5_000;
 
 fn submit(queue: &Queue, job: Arc<Job>) {
@@ -385,12 +375,9 @@ fn submit(queue: &Queue, job: Arc<Job>) {
         .expect("queue has room");
 }
 
-/// Quitting during a separation must not end the process with the worker still
-/// inside the model. Stopping has to cost a segment, not a track: a shutdown that
-/// waits out a six-minute separation is a hang, and one that does not wait is a
-/// crash in GPU teardown.
+/// Quitting during a separation waits for the worker to leave the model, which takes one segment.
 #[test]
-fn stopping_costs_a_segment_rather_than_a_whole_track() {
+fn stopping_waits_for_at_most_one_segment() {
     let state = shared();
     let queue = start(
         Segmented {
@@ -423,9 +410,8 @@ fn stopping_costs_a_segment_rather_than_a_whole_track() {
     );
 }
 
-/// A switch requested mid-track must not stop the track reporting progress. The
-/// swap waits for the track, and the window's dialog sits over a bar that has to
-/// keep moving.
+/// A switch requested during a track does not stop the track's progress reports. The swap waits for
+/// the track, and the window shows the progress bar under the switch dialog.
 #[test]
 fn a_switch_staged_mid_track_does_not_freeze_its_progress() {
     let state = shared();
@@ -470,15 +456,15 @@ fn a_switch_staged_mid_track_does_not_freeze_its_progress() {
              track is still running, so the window would show a dialog over \
              a frozen bar"
         );
-        // Let the switch through, or the scope waits on a worker that is
-        // still separating a track with NEVER_FINISHES segments left.
+        // Stop the queue to let the switch through; otherwise the scope waits for a worker that
+        // still has NEVER_FINISHES segments left.
         queue.stop(Duration::from_secs(10));
         let _ = staged.join();
     });
 }
 
-/// `Drop` stops the queue too, so the ordinary path stops it twice. The
-/// second must be a no-op rather than a wait or a panic.
+/// `Drop` also stops the queue, so the normal path stops it twice. The second stop does nothing: it
+/// neither waits nor panics.
 #[test]
 fn stopping_an_already_stopped_queue_is_harmless() {
     let queue = start(
@@ -493,11 +479,11 @@ fn stopping_an_already_stopped_queue_is_harmless() {
     let began = std::time::Instant::now();
     assert!(queue.stop(Duration::from_secs(10)), "a second stop failed");
     assert!(began.elapsed() < Duration::from_millis(100));
-    // And a third, from `Drop`, as the queue goes out of scope here.
+    // `Drop` stops it a third time as the queue goes out of scope here.
 }
 
 #[test]
-fn a_running_job_stops_between_segments_rather_than_running_to_the_end() {
+fn a_running_job_stops_between_segments() {
     let state = shared();
     let queue = start(
         Segmented {
@@ -524,8 +510,7 @@ fn a_running_job_stops_between_segments_rather_than_running_to_the_end() {
         "the separator was never told to stop"
     );
 
-    // Terminal, and not a failure: nothing went wrong, so there is no error
-    // for a client to read back.
+    // A cancelled job is terminal and carries no error for the client.
     assert!(
         wait_until(&state, Duration::from_secs(5), |_| job
             .progress
@@ -540,10 +525,8 @@ fn a_running_job_stops_between_segments_rather_than_running_to_the_end() {
 
 #[test]
 fn an_abandoned_track_does_not_hold_up_the_one_cued_behind_it() {
-    // The reason cancellation covers the running job at all. Separation is
-    // serialised, so without it a deck that skips mid-analysis makes the
-    // track it actually wants wait out a full separation of the one it threw
-    // away: the entire latency budget, spent on stems nobody will fetch.
+    // Separation runs one job at a time, so without cancelling the running job, a deck that skips a
+    // track would wait for a full separation of the skipped track.
     let state = shared();
     let queue = start(
         Segmented {
@@ -564,8 +547,8 @@ fn an_abandoned_track_does_not_hold_up_the_one_cued_behind_it() {
         wait_until(&state, Duration::from_secs(5), |s| s.started == 1),
         "the first track never started"
     );
-    // Guards what this is actually testing: the skipped track must be out of
-    // `pending` and under way, or the cancel below takes the easy path.
+    // The skipped track must be running, out of `pending`, or the cancel below only drops a waiting
+    // job.
     assert_eq!(
         queue.running().as_deref(),
         Some(skipped_id.as_str()),
@@ -573,8 +556,7 @@ fn an_abandoned_track_does_not_hold_up_the_one_cued_behind_it() {
     );
     assert!(queue.cancel(&skipped_id));
 
-    // Well inside the ~10 s the abandoned track would otherwise take, so
-    // this fails rather than passes slowly if cancellation stops working.
+    // Well inside the 10 s the skipped track would take, so a broken cancel fails this assertion.
     assert!(
         wait_until(&state, Duration::from_secs(5), |s| s.started == 2),
         "the cued track waited for the abandoned one to finish"
@@ -626,10 +608,9 @@ fn a_job_after_an_install_runs_on_the_model_that_was_installed() {
     assert_eq!(&*seen.lock(), &["first", "second"]);
 }
 
-/// Whatever thread builds a separator is the thread that runs it, on both paths
-/// that install one. MLX's CUDA backend keeps its stream registry in thread-local
-/// storage, so weights allocated on one thread cannot be evaluated on another.
-/// Asserted as an arrangement rather than as a backend error, so it needs no GPU.
+/// The thread that builds a separator also runs it, on both paths that install one, because MLX's
+/// CUDA backend keeps its stream registry in thread-local storage. The test records thread ids, so
+/// it needs no GPU.
 #[test]
 fn the_thread_that_builds_a_model_is_the_thread_that_runs_it() {
     let jobs = crate::jobs::Jobs::new(Duration::from_secs(60));
@@ -674,10 +655,8 @@ fn the_thread_that_builds_a_model_is_the_thread_that_runs_it() {
     );
 }
 
-/// A model that will not load has to fail the caller rather than the first
-/// track to arrive. `startup::load_model` turns this error into a fallback
-/// to the default preset; a launch that "succeeded" onto a worker with no
-/// model would instead fail every separation for the life of the process.
+/// A model that does not load fails `Queue::start`, so `startup::load_model` can fall back to the
+/// default preset.
 #[test]
 fn a_model_that_will_not_load_fails_the_start() {
     let err = Queue::start(
@@ -690,9 +669,8 @@ fn a_model_that_will_not_load_fails_the_start() {
     assert!(format!("{err:#}").contains("no such weights"), "{err:#}");
 }
 
-/// A switch to a model that will not load leaves the one that does. The
-/// window reports the failure and offers "Keep current model", which is only
-/// truthful if the current model is in fact still there.
+/// A switch to a model that does not load keeps the current model, which the window's "Keep current
+/// model" button relies on.
 #[test]
 fn an_install_that_fails_keeps_the_model_that_was_running() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -717,9 +695,8 @@ fn an_install_that_fails_keeps_the_model_that_was_running() {
     assert_eq!(&*seen.lock(), &["first"]);
 }
 
-/// Quitting during a switch has to let the switch thread go. It is blocked on a
-/// reply channel that lives on the queue rather than the worker, so stopping only
-/// the worker would park it until the process ended.
+/// Quitting during a switch releases the switch thread, which waits on a reply channel owned by the
+/// queue.
 #[test]
 fn stopping_releases_a_switch_waiting_on_the_worker() {
     let state = shared();
@@ -763,11 +740,11 @@ fn stopping_releases_a_switch_waiting_on_the_worker() {
         .expect_err("a switch requested after the stop must be refused, not parked");
 }
 
-/// Two switches faster than the worker can take one. `Switcher::request`
-/// refuses that, so this is about the queue not leaving a caller blocked on
-/// a reply that will never come.
+/// When two switches arrive faster than the worker can take one, the first caller still gets an
+/// answer. `Switcher::request` refuses this case, but the queue must not leave a caller waiting
+/// forever.
 #[test]
-fn a_superseded_install_tells_the_caller_rather_than_leaving_it_waiting() {
+fn a_superseded_install_answers_its_caller() {
     let state = shared();
     let seen: Arc<Mutex<Vec<&'static str>>> = Arc::default();
     let queue = Arc::new(start(
@@ -786,8 +763,8 @@ fn a_superseded_install_tells_the_caller_rather_than_leaving_it_waiting() {
         "the worker never picked the job up"
     );
 
-    // Both stage rather than being taken, because the worker is in the
-    // model. Spawned, because the first would otherwise block the test.
+    // Both switches stay staged because the worker is in the model. Each runs on its own thread,
+    // since `install` blocks.
     let install = |name: &'static str| {
         let (queue, seen) = (Arc::clone(&queue), Arc::clone(&seen));
         thread::spawn(move || queue.install(ready(Stub { name, seen })))
@@ -803,8 +780,7 @@ fn a_superseded_install_tells_the_caller_rather_than_leaving_it_waiting() {
     }
     let second = install("c");
 
-    // Returns as soon as the second replaces it, without waiting for the
-    // worker, which is the whole claim.
+    // The first switch returns as soon as the second replaces it, without waiting for the worker.
     let err = first
         .join()
         .expect("the install thread panicked")
@@ -821,7 +797,7 @@ fn a_superseded_install_tells_the_caller_rather_than_leaving_it_waiting() {
 }
 
 #[test]
-fn a_stem_of_nan_fails_the_job_instead_of_being_published() {
+fn a_stem_of_nan_fails_the_job() {
     let cache = cache(u64::MAX, Duration::from_secs(60));
     let (mix, mut stems) = crate::testkit::stems(64);
     for (name, audio) in &mut stems.shipped {
@@ -845,7 +821,7 @@ fn a_stem_of_nan_fails_the_job_instead_of_being_published() {
         .expect_err("a stem of NaN must not be stored");
     let message = format!("{err:#}");
     assert!(
-        message.contains("vocals") && message.contains("not a finite"),
+        message.contains("vocals") && message.contains("expected a finite number"),
         "the failure has to name the stem: {message}"
     );
     assert_eq!(cache.stats().tracks, 0, "nothing is stored");

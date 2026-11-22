@@ -1,8 +1,8 @@
 //! The main region: the globe, what is happening, and the way to add a track.
 //!
-//! It takes whatever height the window has left. Idle it invites a drop, armed
-//! it lights up with a dashed edge, working it shows the track's progress. The
-//! container never changes, so the layout does not jump under the pointer.
+//! The zone takes whatever height the window has left. When idle, it invites a drop; while a file
+//! is held over it, it lights up with a dashed edge; while working, it shows the track's progress.
+//! The container stays the same in every state, so the layout does not jump under the pointer.
 
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, pos2, vec2};
 
@@ -14,30 +14,30 @@ use super::globe::{self, Motion};
 use super::theme::{self, Brushes, Palette, Tween, Weight, white};
 use super::widgets::{self, Column, Pill};
 
-/// Below this the zone stops shrinking.
+/// The height below which the zone stops shrinking.
 pub const MIN_HEIGHT: f32 = 300.0;
 
 const RADIUS: f32 = 22.0;
 
-/// Width of the progress bar.
+/// The width of the progress bar.
 const BAR_WIDTH: f32 = 260.0;
 const BAR_HEIGHT: f32 = 8.0;
 
-/// Room for the figure beside the bar.
+/// The width reserved for the percentage beside the bar.
 const PERCENT_WIDTH: f32 = 38.0;
 const PERCENT_GAP: f32 = 12.0;
 
 /// Seconds the fill takes to catch up with a track's progress.
 pub(super) const TRACK_EASE: f32 = 0.16;
-/// The same for a download, whose byte count arrives in uneven steps.
+/// Seconds the fill takes to catch up with a download, whose byte count arrives in uneven steps.
 const DOWNLOAD_EASE: f32 = 0.6;
 
-/// Height of the bar-and-figure row.
+/// The height of the row with the bar and the percentage.
 const BAR_ROW_HEIGHT: f32 = 16.0;
 
 const BUTTON_HEIGHT: f32 = 30.0;
 
-/// Longest title before it is cut short with an ellipsis.
+/// The widest title before it is cut short with an ellipsis.
 const TITLE_WIDTH: f32 = 420.0;
 
 /// The hint under the title, listing the ticked parts.
@@ -60,7 +60,7 @@ pub enum Switch<'a> {
         total: u64,
     },
     Verifying(Preset),
-    /// `waiting`: the worker finishes the track in flight first.
+    /// `waiting` is true while the worker finishes the track in flight.
     Loading {
         preset: Preset,
         waiting: bool,
@@ -79,7 +79,7 @@ pub struct Intro {
     pub from: Rect,
     /// How far its slices were spread there.
     pub spread: f32,
-    /// Progress, eased, 0 to 1.
+    /// The eased progress, from 0 to 1.
     pub t: f32,
 }
 
@@ -123,7 +123,7 @@ pub struct Zone<'a> {
     pub note: Option<&'a str>,
     /// Time left on the current drop, added to its caption.
     pub left: Option<&'a str>,
-    /// Quality is selected: the globe wears its halo.
+    /// True when Quality is selected, which shows the globe's halo.
     pub maxed: bool,
     pub switch: Option<Switch<'a>>,
     pub intro: Option<Intro>,
@@ -200,7 +200,7 @@ impl Zone<'_> {
             None => Some(("Choose a file", Action::ChooseFile)),
         };
 
-        // Each row's height and the gap under it, once; the block is centred.
+        // Measure each row's height and the gap under it once, so the block can be centred.
         let mut column = Column::default();
         let stage_at = column.add(globe::STAGE.y, 8.0);
         let title_at = column.add(title_h, 6.0);
@@ -247,7 +247,7 @@ impl Zone<'_> {
         );
 
         if let (Some((fraction, _)), Some(bar_at)) = (progress, bar_at) {
-            // The bar is centred; the figure hangs off its right end.
+            // The bar is centred, and the percentage sits past its right end.
             let row = Rect::from_min_size(
                 pos2(mid - BAR_WIDTH / 2.0, top + bar_at),
                 vec2(BAR_WIDTH + PERCENT_GAP + PERCENT_WIDTH, BAR_ROW_HEIGHT),
@@ -374,8 +374,8 @@ impl Zone<'_> {
             ),
             None => (stage, spread, halo),
         };
-        // The halo and rings stay inside the card. During the intro the globe
-        // can still be outside it, so its box is kept too.
+        // Clip the halo and rings to the card. During the intro the globe can still be outside the
+        // card, so the clip also covers the globe's box.
         let globe_painter = painter.with_clip_rect(rect.union(stage));
         globe::paint(
             &globe_painter,
@@ -485,7 +485,7 @@ fn switch_caption(switch: Switch) -> String {
     }
 }
 
-/// `cubic-bezier(.2, .9, .2, 1)`: the slices settling apart.
+/// The `cubic-bezier(.2, .9, .2, 1)` easing of the slices settling apart.
 fn ease_spread(t: f32) -> f32 {
     theme::cubic_bezier(0.2, 0.9, 0.2, 1.0, t)
 }
@@ -513,11 +513,11 @@ fn progress_of(item: &Dropped) -> (Option<f32>, String) {
     }
 }
 
-/// The bar and the figure beside it, in `row`.
+/// Draw the bar and the percentage beside it in `row`.
 ///
-/// The fill is the red, green and blue gradient anchored to the whole track, with
-/// a gloss and a moving shimmer. `None` is a stage that cannot be counted: an
-/// empty track with the shimmer running across it.
+/// The fill is a red, green and blue gradient anchored to the full length of the bar, with a gloss
+/// and a moving shimmer. A `None` fraction, for a stage that cannot be counted, draws an empty bar
+/// with the shimmer running across it.
 pub(super) fn progress_row(
     ui: &egui::Ui,
     row: Rect,
@@ -537,7 +537,7 @@ pub(super) fn progress_row(
     );
     let r = BAR_HEIGHT / 2.0;
     painter.rect_filled(track, r, theme::black(0.3));
-    // `inset 0 1px 2px` shade along the top, `0 1px 0` light under the bottom.
+    // A shade along the top (`inset 0 1px 2px`) and a light line under the bottom (`0 1px 0`).
     painter.line_segment(
         [
             pos2(track.left() + r, track.top() + 0.75),

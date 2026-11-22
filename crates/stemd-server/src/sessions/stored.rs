@@ -14,7 +14,7 @@ use super::view::spans_of;
 use super::{Excerpt, RESAMPLE_CONTEXT, Session, Sessions, Source, StemView, Track};
 
 impl Sessions {
-    /// The track directory of `session`'s output, once its track id is known or claimed.
+    /// The track directory of `session`'s output, once its track id is verified or claimed.
     pub fn track_dir(&self, session: &Session) -> Option<PathBuf> {
         let track = session.track();
         let type_dir = type_dir(&session.output, session.gain);
@@ -37,13 +37,13 @@ impl Sessions {
         )
     }
 
-    /// Encode and write the pieces near `touched` that are complete in `track`, once it is hashed.
+    /// Once `track` is hashed, encode and write the complete pieces near `touched`.
     pub fn store_pieces(&self, track: &Track, touched: Range<usize>) {
         let Some(id) = track.verified() else {
             return;
         };
         let cache = &self.cache;
-        // Pieces are a cache, so a nearly full disk skips them and the job goes on.
+        // Pieces are only a cache: on a nearly full disk, skip them and let the job go on.
         if crate::disk::low(cache.root()) {
             tracing::debug!(track = %id, "disk nearly full, not writing pieces");
             return;
@@ -103,7 +103,7 @@ impl Sessions {
         session.ensure_open()?;
         let output = &session.output;
         if !output.served().contains(&name) {
-            bail!("this session serves {:?}, not {name}", output.served());
+            bail!("stem: expected one of {:?}, got {name}", output.served());
         }
         let track = session.track();
         if from >= to || to > track.spec.frames {
@@ -127,7 +127,7 @@ impl Sessions {
             let audio = self.read_run(session, name, whole.as_ref(), &run, source, span)?;
             if audio.frames() != len {
                 bail!(
-                    "samples {}..{} read back {} samples, not {len}",
+                    "samples {}..{}: expected {len} samples, got {}",
                     run.start,
                     run.end,
                     audio.frames()
@@ -143,7 +143,8 @@ impl Sessions {
         })
     }
 
-    /// The chunks of `from..to` and where each is read from, consecutive memory or whole-file chunks merged.
+    /// The chunks of `from..to` and where each one is read from, with consecutive memory chunks or
+    /// whole-file chunks merged.
     fn runs(
         &self,
         session: &Session,
@@ -162,8 +163,8 @@ impl Sessions {
             Cache::lookup(dir.as_ref()?, name, k, output.format.extension()).map(Source::Piece)
         };
 
-        // A chunk comes from memory when it is ready with the context a rate
-        // conversion needs, else from disk, else from memory with less context.
+        // Read a chunk from memory when it is ready with the context a rate conversion needs,
+        // otherwise from disk, and as a last resort from memory with less context.
         let converts = output.rate.hz() != track.spec.sample_rate;
         let mut runs: Vec<(Range<usize>, Source)> = Vec::new();
         for k in from / stride..to.div_ceil(stride) {
@@ -197,7 +198,8 @@ impl Sessions {
         Ok(runs)
     }
 
-    /// Output-rate samples `span` of `name`, the part of the track `run` covers, read from `source`.
+    /// The output-rate samples `span` of `name`, within the part of the track that `run` covers,
+    /// read from `source`.
     fn read_run(
         &self,
         session: &Session,
@@ -246,14 +248,14 @@ impl Sessions {
                     .with_context(|| format!("decoding {}", path.display()))?;
                     if audio.frames() != piece_len {
                         bail!(
-                            "{} holds {} samples, not {piece_len}",
+                            "{}: expected {piece_len} samples, got {}",
                             path.display(),
                             audio.frames()
                         );
                     }
                     Ok(audio.excerpt(span.start - piece_at, span.end - piece_at))
                 }
-                // Stored whole since the lookup.
+                // The stem was stored whole after the lookup.
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => cut(&self
                     .whole(session, name)
                     .with_context(|| format!("{} went away", path.display()))?),
@@ -298,7 +300,7 @@ impl Sessions {
         Ok(())
     }
 
-    /// How each stem `session` serves is stored.
+    /// How each stem that `session` serves is stored.
     pub fn stems_for(&self, session: &Session) -> Vec<StemView> {
         use crate::output::{Storage, sources};
         let track = session.track();

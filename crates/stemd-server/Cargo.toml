@@ -26,7 +26,7 @@ thiserror.workspace = true
 # `persistence` saves the window's position and size between launches.
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 if-addrs = "0.15.0"
-# First-run model fetch: HTTP plus a pinned digest.
+# First-run model download: HTTP plus a pinned digest.
 ureq = "3.4.0"
 sha2 = "0.10"
 # The per-platform cache and data directories. See `cache::default_dir`.
@@ -36,26 +36,27 @@ dirs = "6"
 stemd-core = { path = "../stemd-core", features = ["toy"] }
 tower = { version = "0.5.3", features = ["util"] }
 
-# winit is eframe's window layer and otherwise an implementation detail. It is
-# named here for a single call: asking for the X11 backend, which is the only
-# one of the three winit implements file drag and drop on. See `ui::run`.
+# winit is eframe's window layer. It is named here for one call, which asks for
+# the X11 backend, the only one of winit's three that implements file drag and
+# drop. See `ui::run`.
 [target.'cfg(windows)'.build-dependencies]
-# Only reached when the host is Windows, which is where the icon is wanted and
-# the only place the resource compiler exists.
+# Only used when the host is Windows, where the icon is wanted and the resource
+# compiler exists.
 winresource = "0.1"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 winit = { version = "0.30.13", default-features = false, features = ["x11"] }
 
-# Unpacking NVIDIA's redistributable archives, which is the only zip this reads.
-# `default-features = false` keeps out bzip2, zstd, lzma and the encryption
-# support: these archives are deflate, and the rest is attack surface for a
-# format we only ever read from one host. Windows only, because CUDA is a
-# download only there. See `cuda`.
+# Unpacks NVIDIA's redistributable archives, the only zip files the server
+# reads. `default-features = false` leaves out bzip2, zstd, lzma and encryption:
+# these archives are deflate, and the other formats would add attack surface for
+# files read from one host. Windows only, because only there is CUDA downloaded
+# at run time. See `cuda`.
 [target.'cfg(windows)'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Free disk space, see `disk.rs`; ShellExecuteW starts the updater's Setup,
-# the registry gives its install mode and the token whether it can elevate.
+# Free disk space (see `disk.rs`); ShellExecuteW starts the updater's Setup; the
+# registry gives the install mode, and the token says whether the process can
+# elevate.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -73,15 +74,15 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString"] }
 
 [target.'cfg(unix)'.dependencies]
-# statvfs and sysctl, see `disk.rs`.
+# statvfs and sysctl; see `disk.rs`.
 libc = "0.2"
 
-# `default-features = false` above is what keeps wgpu and accesskit out, but it
-# also drops `x11` and `wayland`, and those are not extras — winit has no Linux
-# backend without one of them and stops the build with "the platform you're
-# compiling for is not supported". Both, because a session may be either, and
-# winit picks at run time. macOS and Windows have a single backend that is not
-# behind a feature, so this stays off their dependency graph.
+# `default-features = false` above keeps wgpu and accesskit out, but it also
+# drops `x11` and `wayland`, which winit needs: without one of them it has no
+# Linux backend and stops the build with "the platform you're compiling for is
+# not supported". Both are enabled because a session may use either, and winit
+# picks at run time. macOS and Windows have a single backend outside any
+# feature, so this stays off their dependency graph.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.35.0", default-features = false, features = [
     "glow",

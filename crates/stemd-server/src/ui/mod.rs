@@ -1,4 +1,4 @@
-//! The window: drop a track on it, and watch the server behind it.
+//! The window, which takes dropped tracks and shows the state of the server behind it.
 //!
 //! ```text
 //! header    the model, and what the stems come out as
@@ -49,15 +49,15 @@ use theme::{Brushes, Glass, Palette};
 const WINDOW_SIZE: [f32; 2] = [560.0, 600.0 + titlebar::HEIGHT];
 const MIN_WINDOW_SIZE: [f32; 2] = [480.0, 520.0 + titlebar::HEIGHT];
 
-/// Height the drop zone keeps; the Separated list and the log take the rest.
+/// The height the drop zone keeps; the Separated list and the log share the remaining height.
 const ZONE_HEIGHT: f32 = 320.0;
 
-/// The zone's height in a window `content` points tall with `clients` points of
-/// Clients list: [`ZONE_HEIGHT`], less when the window is too short to also show
-/// one row of the Separated list.
+/// The zone's height in a window `content` points tall whose Clients list takes `clients` points.
+/// It is [`ZONE_HEIGHT`], or less when the window is too short to also show one row of the
+/// Separated list.
 fn zone_height(content: f32, clients: f32) -> f32 {
-    // Header, status bar and their margins; the zone's and the sections' gaps;
-    // the "Separated" heading and one row.
+    // The header, the status bar and their margins, the gaps around the zone and the sections, and
+    // the "Separated" heading with one row.
     let around = f32::from(TOP)
         + header::HEIGHT
         + status::HEIGHT
@@ -70,9 +70,8 @@ fn zone_height(content: f32, clients: f32) -> f32 {
     (content - around).clamp(dropzone::MIN_HEIGHT, ZONE_HEIGHT)
 }
 
-/// Rows the Separated list takes: three sample rows while it is empty, two
-/// while the Clients list shows, else one per track up to
-/// [`recents::MAX_VISIBLE`].
+/// The number of rows the Separated list takes: three sample rows while it is empty, two while the
+/// Clients list shows, and otherwise one per track up to [`recents::MAX_VISIBLE`].
 fn separated_rows(tracks: usize, clients: bool) -> f32 {
     match tracks {
         0 if clients => 2.0,
@@ -81,10 +80,10 @@ fn separated_rows(tracks: usize, clients: bool) -> f32 {
     }
 }
 
-/// Space around the window's contents, and between its regions.
+/// The space around the window's contents and between its regions.
 const PAD: i8 = 14;
 
-/// Space above the header, clearing the title bar where the window draws its own.
+/// The space above the header, which clears the title bar where the window draws its own.
 const TOP: i8 = if titlebar::HEIGHT > 0.0 {
     titlebar::HEIGHT as i8 + 6
 } else {
@@ -92,15 +91,15 @@ const TOP: i8 = if titlebar::HEIGHT > 0.0 {
 };
 const GAP: i8 = 10;
 
-/// Poll interval at rest, for state written by other threads. While anything
+/// The repaint interval at rest, which picks up state written by other threads. While anything
 /// moves, the window repaints every frame.
 const REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The window's own icon, compiled in.
+/// The window's icon, compiled in.
 ///
-/// Two of them: macOS icons are a rounded body inset in a transparent square,
-/// Windows icons are the square. A bundled `.app` takes its icon from
-/// `Contents/Resources/stemd.icns`, but the app is not always bundled.
+/// There are two: a macOS icon is a rounded body inset in a transparent square, and a Windows icon
+/// fills the square. A bundled `.app` takes its icon from `Contents/Resources/stemd.icns`, but the
+/// app is not always bundled.
 #[cfg(target_os = "macos")]
 const WINDOW_ICON: &[u8] = include_bytes!("../../../../resources/stemd-icon-mac-256.png");
 #[cfg(not(target_os = "macos"))]
@@ -126,8 +125,7 @@ pub fn run(launch: Arc<Launch>) -> Result<(), eframe::Error> {
         viewport = viewport.with_decorations(false);
     }
 
-    // A window that will not decode its own icon is a window without one, not
-    // a reason to refuse to open.
+    // If the icon does not decode, open the window without an icon.
     match eframe::icon_data::from_png_bytes(WINDOW_ICON) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(err) => tracing::warn!("the window icon will not decode ({err}); running without one"),
@@ -147,11 +145,10 @@ pub fn run(launch: Arc<Launch>) -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    //  Ask for X11: winit implements file drag and drop on macOS, Windows and X11 and
-    //  has no Wayland implementation, so on a Wayland session `dropped_files` never
-    //  fills. Xwayland speaks XDND. Only when there is an X server to ask for: a
-    //  session without Xwayland has no DISPLAY, and forcing X11 there would trade a
-    //  window that cannot accept drops for no window at all.
+    // Ask for X11: winit implements file drag and drop on macOS, Windows and X11 but not on
+    // Wayland, so on a Wayland session `dropped_files` never fills. Xwayland speaks XDND. Ask only
+    // when an X server exists: a session without Xwayland has no DISPLAY, and forcing X11 there
+    // would open no window at all.
     #[cfg(all(unix, not(target_os = "macos")))]
     if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
         use winit::platform::x11::EventLoopBuilderExtX11 as _;
@@ -216,8 +213,8 @@ impl eframe::App for App {
             None => starting::show(ui, &self.launch, &mut self.first_run, &self.brushes),
         }
         let palette = Palette::of(ui.ctx());
-        // Idle: nothing running, queued or downloading, so Setup may close the
-        // window. Never while starting, which may be fetching the weights.
+        // The window is idle when nothing is running, queued or downloading, and Setup may then
+        // close it. It is never idle while starting, since startup may be downloading the weights.
         let idle = self.window.as_ref().is_some_and(|w| {
             w.state.queue.running().is_none()
                 && w.state.queue.depth() == 0
@@ -235,11 +232,11 @@ impl eframe::App for App {
         false
     }
 
-    /// The only shutdown the window ever gets.
+    /// The window's only shutdown hook.
     ///
-    /// Cmd-Q goes `[NSApp terminate:]` to `applicationWillTerminate:` to winit's
-    /// `LoopExiting` to here, and AppKit calls `exit()` as soon as that returns. It is
-    /// the last point at which the worker can be taken out of the model.
+    /// Cmd-Q goes from `[NSApp terminate:]` to `applicationWillTerminate:` to winit's `LoopExiting`
+    /// to here, and AppKit calls `exit()` as soon as this returns. This is the last chance to make
+    /// the worker leave the model.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         crate::update::run_installer();
         crate::shutdown::quit(&self.launch, "window closed")
@@ -251,14 +248,14 @@ struct Window {
     logs: logs::View,
     /// Whether the log pane is open.
     show_logs: bool,
-    /// Height the log pane took last frame, 0 when closed.
+    /// The height the log pane took last frame; 0 when closed.
     logs_height: Option<f32>,
     /// The settings sheet, open over the window or not.
     settings: settings_sheet::Sheet,
     /// The window's height, following what the Clients list, the Separated
     /// list and the log pane want, so they are not squeezed.
     fit: fit::Fit,
-    /// Height the sections had to lay out in.
+    /// The height available to the sections.
     sections_room: f32,
     /// The drop the zone is currently showing. Held so the zone keeps showing
     /// one track while a second is queued behind it.
@@ -273,13 +270,13 @@ struct Window {
     motion: globe::Motion,
     /// The preset the header showed last frame, to fire its effect on a change.
     shown: Option<Preset>,
-    /// Least window width the header fits in, as last sent to the viewport.
+    /// The narrowest window width the header fits in, as last sent to the viewport.
     min_width: f32,
     /// Whether a close is being held for a question. See [`quit`].
     quit: quit::Guard,
     /// The hand-over from the startup screen, while it plays.
     intro: Option<Intro>,
-    /// Its eased progress this frame.
+    /// The hand-over's eased progress this frame.
     reveal: Option<f32>,
     /// What the Clients list shows, and the time it was read.
     clients: (f64, activity::Snapshot),
@@ -329,8 +326,8 @@ impl Window {
     }
 }
 
-/// Phase speed and seconds per meridian turn, by preset: Fast spins quick,
-/// Quality slow.
+/// The phase speed and seconds per meridian turn for each preset: Fast spins quickly and Quality
+/// slowly.
 const fn pace(preset: Option<Preset>) -> (f32, f32) {
     match preset {
         Some(Preset::Fast) => (1.6, 1.6),
@@ -358,7 +355,8 @@ struct ZoneFrame<'a> {
     reveal: Option<f32>,
 }
 
-/// The switch the zone shows in place of the invitation to drop. `running`: a job is in flight.
+/// The switch the zone shows in place of the invitation to drop; `running` is true while a job is
+/// in flight.
 fn zone_switch(switch_state: &SwitchState, running: bool) -> Option<dropzone::Switch<'_>> {
     match switch_state {
         SwitchState::Downloading {
@@ -412,8 +410,8 @@ impl Window {
             );
         }
 
-        // Before the rest of the frame: a held close should put its question up
-        // now rather than a frame later, and the answer can end the process.
+        // Run this before the rest of the frame, so a held close shows its question on this frame;
+        // the answer can end the process.
         quit::guard(&mut self.quit, &self.state, &ctx, &palette, brushes);
 
         let shown = self.follow_preset(now);
@@ -496,12 +494,13 @@ impl Window {
         }
     }
 
-    /// Fire the globe's effect and the note when a preset switch lands; the preset the header shows.
+    /// Fire the globe's effect and the note when a preset switch lands. Returns the preset the
+    /// header shows.
     fn follow_preset(&mut self, now: f64) -> Option<Preset> {
         let shown = header::shown_preset(&self.state.switcher);
         if shown != self.shown {
-            // A switch landed, after its download and check. A failed one falls
-            // back to the old model, which is not a landing.
+            // A switch has landed after its download and check. A failed switch falls back to the
+            // old model and does not count.
             let failed = matches!(self.state.switcher.state(), SwitchState::Failed { .. });
             if let (Some(_), Some(preset), false) = (self.shown, shown, failed) {
                 let fx = fx_for(preset);
@@ -712,7 +711,7 @@ impl Window {
     /// The Separated list and, when open, the log. Returns the log pane's
     /// height, 0 when closed.
     fn sections(&mut self, ui: &mut egui::Ui, palette: &Palette, brushes: &Brushes) -> f32 {
-        // The glass's drop shadow reaches past the panel; let it.
+        // Widen the clip so the glass's drop shadow can reach past the panel.
         ui.set_clip_rect(ui.ctx().content_rect());
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
         self.sections_room = ui.available_height();
@@ -722,7 +721,7 @@ impl Window {
         let recent = self.state.drops.recent();
         let count = (!recent.is_empty()).then(|| recent.len().to_string());
         section::heading(ui, palette, "Separated", count);
-        // Room left once the log, as tall as it was last frame, is set aside.
+        // The room left after setting aside the log at its height from last frame.
         let logs = if self.show_logs {
             self.logs_height.unwrap_or(0.0) + 4.0 + 6.0
         } else {
@@ -751,7 +750,7 @@ impl Window {
             behind,
             brushes.glass_shape(frame.response.rect, 16.0, Glass::List),
         );
-        // Not logged: emptying the log and then writing to it would undo the click.
+        // Not logged, because writing to the log right after emptying it would undo the click.
         if clear_logs {
             self.state.logs.clear();
         }
@@ -760,9 +759,8 @@ impl Window {
 
     /// Hand anything dropped on the window to [`crate::drops`].
     ///
-    /// Everything that is not audio is refused here rather than after a decoder
-    /// has been pointed at it, so dropping a folder of artwork says what was
-    /// wrong instead of producing one failure per file.
+    /// Files that do not look like audio are refused here, before any decoding, so dropping a
+    /// folder of artwork gives one clear message instead of one failure per file.
     fn take_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -835,11 +833,11 @@ impl Window {
         self.batch_running = running;
     }
 
-    /// The click-to-choose path, for a track that is not convenient to drag.
+    /// Let the user choose a track in a file dialog, for a track that is hard to drag.
     ///
-    /// An in-process panel would need a crate and, on macOS, the main thread;
-    /// shelling out to the system's own dialog keeps this short and off the
-    /// event loop. See [`choose_file`].
+    /// The system's own dialog runs as a separate program, which keeps this short and off the event
+    /// loop; an in-process panel would need a crate and, on macOS, the main thread. See
+    /// [`choose_files`].
     fn pick_a_file(&self) {
         let drops = Arc::clone(&self.state.drops);
         let state = Arc::clone(&self.state);
@@ -870,9 +868,9 @@ fn set_height(ctx: &egui::Context, height: f32) {
 
 /// Ask the system for one or more files, blocking the thread it is called on.
 ///
-/// Every platform's answer is the same shape: hand the job to a program that
-/// already owns a file panel and read one path per line off its stdout. Empty
-/// means cancelled, which all three report as a non-zero exit or empty output.
+/// On every platform, a program that owns a file panel runs and prints one path per line on stdout.
+/// An empty result means cancelled; all three programs report a cancel as a non-zero exit or empty
+/// output.
 fn choose_files() -> Vec<std::path::PathBuf> {
     let Some(output) = picker().and_then(|mut cmd| cmd.output().ok()) else {
         return Vec::new();
@@ -892,10 +890,9 @@ fn paths_of(text: &str) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// The type list is `public.audio` and every extension this accepts.
-/// `public.audio` alone greyed out `.mp4`: an MPEG-4 file conforms to
-/// `public.movie` however little video is in it, while it is a container this
-/// decodes and accepts on a drop.
+/// The type list is `public.audio` plus every accepted extension. `public.audio` alone greys out
+/// `.mp4`, because an MPEG-4 file conforms to `public.movie` even with no video in it, and a drop
+/// accepts it.
 #[cfg(target_os = "macos")]
 fn picker() -> Option<std::process::Command> {
     let types = std::iter::once("public.audio")
@@ -927,19 +924,18 @@ fn picker() -> Option<std::process::Command> {
     Some(cmd)
 }
 
-/// `OpenFileDialog` out of WinForms, driven by PowerShell.
+/// The WinForms `OpenFileDialog`, driven by PowerShell.
 ///
-/// `-STA` is not optional: the common file dialog is an apartment-threaded COM
-/// object and PowerShell's default MTA makes it throw. The filter is one line of
-/// `label|patterns|...`, from the same extension list a drop is checked against.
+/// `-STA` is required: the common file dialog is an apartment-threaded COM object and throws under
+/// PowerShell's default MTA. The filter is one line of `label|patterns|...`, built from the
+/// extension list that drops are checked against.
 #[cfg(windows)]
 fn picker() -> Option<std::process::Command> {
     use std::os::windows::process::CommandExt;
 
-    //  `CREATE_NO_WINDOW`, and it is not cosmetic. The crate links for the windows
-    //  subsystem, so a launch from Explorer has no console, and starting a console
-    //  program from a process that has none hands the child a new console window that
-    //  would sit beside the file panel. The chosen path comes back over a pipe.
+    // `CREATE_NO_WINDOW` is required: the crate links for the windows subsystem, so a launch from
+    // Explorer has no console, and a console program started from a process without one gets a new
+    // console window beside the file panel. The chosen path comes back over a pipe.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let patterns = AUDIO_EXTENSIONS
@@ -961,11 +957,10 @@ fn picker() -> Option<std::process::Command> {
     Some(cmd)
 }
 
-/// zenity, which is what GTK desktops ship and what KDE's `kdialog` mirrors.
+/// The file picker: zenity, which GTK desktops ship, or KDE's `kdialog`, which takes the same role.
 ///
-/// `None` when neither is installed, which is a real possibility on a server
-/// install and is why this returns an `Option` rather than a `Command`: the
-/// caller treats it exactly like a cancelled dialog. Drag and drop still works.
+/// Returns `None` when neither is installed, as on a server install; the caller treats that like a
+/// cancelled dialog, and drag and drop still works.
 #[cfg(target_os = "linux")]
 fn picker() -> Option<std::process::Command> {
     let patterns = AUDIO_EXTENSIONS

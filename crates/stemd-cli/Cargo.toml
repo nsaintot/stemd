@@ -16,7 +16,8 @@ mdns-sd = "0.20.3"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
-# No stemd-core dependency: the client is HTTP plus audio I/O and reads stem
-# names from /v2/health. stemd-core would pull in MLX, which this crate never calls.
+# No stemd-core dependency: the client needs only HTTP and audio I/O, and reads
+# stem names from /v2/health. stemd-core would pull in MLX, which this crate
+# never calls.
 stemd-audio = { path = "../stemd-audio" }
 ureq = "3.4.0"

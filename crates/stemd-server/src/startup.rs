@@ -1,8 +1,8 @@
-//! Turning parsed arguments into a running set of services.
+//! Turns the parsed arguments into running services.
 //!
-//! Everything between "the command line is understood" and "the router can be
-//! mounted": locating and loading the model, opening the stem cache, starting
-//! the worker and the reaper, and advertising over mDNS.
+//! It covers every step between parsing the command line and mounting the router: locating and
+//! loading the model, opening the stem cache, starting the worker and the reaper, and advertising
+//! over mDNS.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,12 +44,11 @@ pub fn prepare(
     endpoint: crate::endpoint::Endpoint,
     launch: &Launch,
 ) -> Result<Server> {
-    // Asked once. The accelerator cannot change under a running server, and
-    // every model loaded from here on is chosen against the same answer.
+    // Detect once: the accelerator cannot change under a running server, so every model loaded
+    // later uses the same answer.
     let precisions = Precisions::detect(args.forced_precision());
-    // Said here rather than in `log_model`, which runs after a model has been
-    // loaded at CPU speed. A card whose runtime is missing looks exactly like
-    // no card in every later line, and only one of the two has a fix.
+    // Warn here, before a model loads at CPU speed: in every later log line, a GPU whose runtime is
+    // missing looks like no GPU, and only a missing runtime has a fix.
     warn_gpu_refused();
     let (stems, cache_summary) = open_stem_cache(args, &settings.get())?;
     let jobs = Arc::new(Jobs::new(args.unfetched_ttl()));
@@ -71,17 +70,16 @@ pub fn prepare(
     }
     log_model(&info, precisions, settings.get().max_track_secs(longest));
 
-    // Built before the app state so every exit path can reach it. Headless
-    // there is no switch to turn it back on, so it always serves.
+    // Build this before the app state so every exit path can reach it. A headless server has no
+    // switch to turn it back on, so it always serves.
     let serving = crate::serving::Serving::new(
         args.headless || settings.get().serving,
         announce(args, endpoint.port()),
         &info.model,
     );
 
-    // Both identities, once, at debug. The next time the published one moves
-    // when it should not, the question is which field did it, and that is not
-    // answerable from an eight-character digest.
+    // Log both identities once at debug, so when the published id changes unexpectedly, the log
+    // shows which field changed; an eight-character digest cannot.
     let switcher = Arc::new(Switcher::new(
         model.preset,
         Arc::clone(&queue),
@@ -142,9 +140,7 @@ fn warn_gpu_refused() {
 
 /// Open the settings file and apply the flags that override it for this run.
 ///
-/// The flags are parsed here rather than where they are used so a typo fails at
-/// launch with the flag quoted, instead of on the first request that would have
-/// needed it.
+/// The flags are parsed here, so a typo fails at launch and quotes the flag.
 pub fn open_settings(args: &Args) -> Result<SettingsFile> {
     let path = match args.settings.clone() {
         Some(path) => path,
@@ -177,29 +173,26 @@ pub fn open_settings(args: &Args) -> Result<SettingsFile> {
 
 /// Where the model was found, and what the switcher needs to replace it later.
 ///
-/// It holds no separator: the model itself belongs to the queue's worker, which
-/// is the only thread allowed to have built it.
+/// It holds no separator: the model belongs to the queue's worker, the only thread allowed to build
+/// it.
 struct LoadedModel {
     /// `None` when the artefact is not one of the presets.
     preset: Option<Preset>,
-    /// What was actually loaded, which is not always what was asked for.
+    /// The artefact that was loaded, which can differ from the one asked for.
     artefact: String,
     search_dirs: Vec<PathBuf>,
     download_cache: PathBuf,
 }
 
-/// Load the model this run should use: `--demucs-model` if given, otherwise
-/// whatever the window last selected.
-///
-/// A saved preset that will not load falls back to the default rather than failing
-/// the launch, since the window is the only way to choose differently. A model
-/// named on the command line is not covered.
-///
-/// Behind a window, a saved preset that is not on disk is not fetched: the window
-/// asks which model to download, and the answer is saved once it has loaded.
-///
-/// [`Queue::start`] does not return until the worker has a model or has failed to
-/// get one.
+/// Load the model for this run: `--demucs-model` if given, otherwise the one the window last
+/// selected.
+// A saved preset that does not load falls back to the default and the launch continues, since the
+// window is the only way to choose another. A model named on the command line gets no fallback.
+//
+// Behind a window, a saved preset that is not on disk is not downloaded: the window asks which
+// model to download, and saves the answer once it has loaded.
+//
+// [`Queue::start`] returns only once the worker has a model or has failed to get one.
 fn load_model(
     args: &Args,
     settings: &SettingsFile,
@@ -292,9 +285,9 @@ fn search_dirs(arg: &Path, cache: &Path) -> Vec<PathBuf> {
         dirs.push(dir.join("../Resources").join(arg));
     }
     dirs.push(cache.to_path_buf());
-    // `join` with an absolute argument returns it unchanged, so an absolute
-    // --models lands in the list three times and every error message repeats
-    // it. Order matters, so dedupe in place rather than sorting.
+    // `join` with an absolute argument returns it unchanged, so an absolute --models would appear
+    // three times and every error message would repeat it. Order matters, so dedupe in place
+    // without sorting.
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| seen.insert(d.clone()));
     dirs
@@ -302,9 +295,8 @@ fn search_dirs(arg: &Path, cache: &Path) -> Vec<PathBuf> {
 
 /// Find the artefact, downloading it if this is a first run.
 ///
-/// A preset is looked for by every file it needs, not just the one that names
-/// it: `Quality` is two artefacts, and a directory holding one of them is not
-/// a directory it can be loaded from.
+/// A directory counts only if it holds every file the preset needs, since a preset can span several
+/// files.
 fn resolve_models(
     dirs: &[PathBuf],
     cache: &Path,
@@ -319,9 +311,8 @@ fn resolve_models(
         None => dir.join(&marker).is_file(),
     };
     if let Some(dir) = dirs.iter().find(|d| present(d)) {
-        // Presence is not enough: a cached artefact can rot after the download
-        // that verified it, and loading damaged weights is not a failure mode
-        // worth saving a second on.
+        // Presence is not enough: a cached artefact can rot after the download that verified it,
+        // and hashing costs only about a second.
         if let Some(preset) = preset {
             launch.set(Stage::Verifying(preset));
             models::verify(dir, cache, preset, offline)?;
@@ -354,7 +345,7 @@ fn offline_refusal(dirs: &[PathBuf], cache: &Path, preset: Preset) -> String {
         .map(|f| f.name)
         .collect();
     format!(
-        "no model in {} and {} is missing {} — --offline forbids fetching it",
+        "no model in {}; {} missing {}; --offline set",
         joined(dirs),
         cache.display(),
         missing.join(", ")
@@ -363,8 +354,7 @@ fn offline_refusal(dirs: &[PathBuf], cache: &Path, preset: Preset) -> String {
 
 /// Download a preset into the cache and confirm it landed.
 ///
-/// Anything already there is skipped, so a machine with Balanced installed
-/// pays only for Quality's other half.
+/// Files already in the cache are skipped.
 fn fetch_preset(cache: &Path, preset: Preset, launch: &Launch) -> Result<PathBuf> {
     let wanted: u64 = preset
         .source()
@@ -430,7 +420,8 @@ fn open_stem_cache(
     if args.ephemeral {
         cache.wipe();
     }
-    // Only beside the default root: `--cache-dir` may name that old directory.
+    // Remove the old pieces directory only next to the default root, since `--cache-dir` may name
+    // that old directory.
     if args.cache_dir.is_none() {
         crate::migrate::remove_old_pieces_dir();
     }
@@ -489,8 +480,8 @@ fn spawn_reaper(cache: Arc<Cache>, jobs: Arc<Jobs>, queue: Arc<Queue>) {
                 if pruned > 0 {
                     tracing::debug!("dropped {pruned} job handles");
                 }
-                // Writes stop when the disk is low, so the budget has to apply
-                // from here too, or the cache never gives space back.
+                // Writes stop when the disk is low, so apply the budget here too, or the cache
+                // never gives space back.
                 cache.evict();
 
                 let busy =
@@ -501,9 +492,8 @@ fn spawn_reaper(cache: Arc<Cache>, jobs: Arc<Jobs>, queue: Arc<Queue>) {
                     continue;
                 }
                 let since = *idle_since.get_or_insert_with(Instant::now);
-                // After a minute idle: the gap between two tracks costs a
-                // fifth of the second one if the cache is empty when it starts;
-                // see `stemd_core::memory`. Once per idle spell.
+                // Release after a minute idle, once per idle spell: releasing in the gap between
+                // two tracks would slow the second track by a fifth; see `stemd_core::memory`.
                 if !released && since.elapsed() >= IDLE_RELEASE {
                     released = true;
                     let freed = stemd_core::memory::release();
@@ -536,17 +526,15 @@ fn spawn_session_reaper(queue: Arc<Queue>) {
         .expect("spawning the session reaper");
 }
 
-/// Idle time before MLX's allocator cache is handed back.
+/// The idle time before MLX's allocator cache is released.
 const IDLE_RELEASE: Duration = Duration::from_secs(60);
 
 /// How often the reaper looks at the queue.
 const IDLE_TICK: Duration = Duration::from_secs(5);
 
 fn log_model(info: &stemd_core::BackendInfo, precisions: Precisions, max_track_secs: f64) {
-    // The backend by name rather than `info.device`'s coarse "gpu": on a
-    // cross-platform build the difference between metal, cuda and a CPU
-    // fallback is the first thing worth knowing, and it decides the precision
-    // each model runs at.
+    // Log the backend by name (metal, cuda or a CPU fallback), since `info.device` only says "gpu".
+    // On a cross-platform build the backend matters most, and it decides each model's precision.
     tracing::info!(
         "loaded {} via {} on {} ({} Hz, {} ch)",
         info.model,
@@ -571,13 +559,12 @@ fn log_model(info: &stemd_core::BackendInfo, precisions: Precisions, max_track_s
 mod tests {
     use super::*;
 
-    /// Every preset ships the same two stems, so a client's rebuild never changes
-    /// with the preset.
+    /// Every preset ships the same two stems, so a client's rebuild does not change with the
+    /// preset.
     ///
-    /// The presets build `harmonics` in different ways, `Fast` as the model's
-    /// `bass + other` and the other two as `mix - vocals - drums`, and none of that
-    /// reaches the wire. What ships is `harmonics` and `vocals` under all three, so
-    /// `mix - harmonics - vocals` is the client's job under all three.
+    /// The presets build `harmonics` in different ways: `Fast` as the model's `bass + other`, the
+    /// other two as `mix - vocals - drums`. None of that reaches the client. All three ship
+    /// `harmonics` and `vocals`, and the client computes `mix - harmonics - vocals`.
     ///
     /// ```text
     /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with every artefact> \
@@ -612,7 +599,7 @@ mod tests {
                 .expect("separating");
             let shipped: Vec<&str> = stems.shipped.iter().map(|(n, _)| *n).collect();
 
-            // What the player would rebuild, and what it gets at unity.
+            // The stems the player would rebuild, at unity gain.
             let h = &stems
                 .shipped
                 .iter()
@@ -661,21 +648,14 @@ mod tests {
         }
     }
 
-    /// How much percussion each preset leaves in the vocals stem.
-    ///
-    /// Measured as how much of the vocals stem and the rebuilt drums is shared
-    /// content, `dot^2 / (|v|^2 |d|^2)`, squared cosine similarity, so lower is
-    /// better. It is symmetric: the directional quantity is `alpha = <v,d>/<d,d>`,
-    /// which `stemd_core::hybrid` reports beside it. Whatever is in both stems is in
-    /// the wrong one.
-    ///
-    /// The drums are the client's own `mix - harmonics - vocals`, so this is the
-    /// artefact as a player meets it.
-    ///
-    /// ```text
-    /// STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with every artefact> \
-    /// cargo test --release -p stemd-server -- --ignored leaves_in_the_vocals --nocapture
-    /// ```
+    /// How much percussion each preset leaves in the vocals stem, as the squared cosine similarity
+    /// `dot^2 / (|v|^2 |d|^2)` of the vocals stem and the rebuilt drums; lower is better.
+    // The measure is symmetric; `stemd_core::hybrid` reports the directional `alpha = <v,d>/<d,d>`
+    // beside it. Content present in both stems is bleed in one of them. The drums are the client's
+    // own `mix - harmonics - vocals`, so this measures the stems as a player receives them.
+    //
+    //     STEMD_AB_PCM=track.pcm STEMD_AB_MLX=<dir with every artefact> \
+    //     cargo test --release -p stemd-server -- --ignored leaves_in_the_vocals --nocapture
     #[test]
     #[ignore]
     fn what_each_preset_leaves_in_the_vocals() {
@@ -715,9 +695,9 @@ mod tests {
             };
             let (h, v) = (pick("harmonics"), pick("vocals"));
 
-            // Shared content, as squared cosine similarity. Symmetric by
-            // construction: `alpha^2 * bb / aa` with `alpha = dot / bb` is
-            // `dot^2 / (aa * bb)`, so there is one number here and not two.
+            // Shared content as squared cosine similarity. It is symmetric: `alpha^2 * bb / aa`
+            // with `alpha = dot / bb` equals `dot^2 / (aa * bb)`, so one number covers both
+            // directions.
             let shared = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| {
                 let (mut dot, mut bb, mut aa) = (0.0f64, 0.0f64, 0.0f64);
                 for (ca, cb) in a.iter().zip(b) {
@@ -746,8 +726,8 @@ mod tests {
 
     #[test]
     fn an_absolute_models_path_is_not_searched_twice() {
-        // `join` with an absolute path returns it unchanged, so without the
-        // dedupe every error message repeats the same directory.
+        // `join` with an absolute path returns it unchanged, so without the dedupe every error
+        // message would repeat the same directory.
         let dirs = search_dirs(Path::new("/opt/models"), Path::new("/var/cache"));
         let mut unique = dirs.clone();
         unique.dedup();

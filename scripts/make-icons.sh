@@ -1,9 +1,9 @@
 #!/bin/bash
 # Derive the icon assets the build uses, from the two hand-made sources.
 #
-# Run when the artwork changes, not on every build: the outputs are committed
-# so `bundle-app.sh` needs nothing but `sips` and `iconutil`, both of which are
-# part of macOS. This script needs ImageMagick, which is not.
+# Run it when the artwork changes; the outputs are committed, so `bundle-app.sh`
+# needs only `sips` and `iconutil`, which ship with macOS. This script needs
+# ImageMagick, which does not.
 #
 # Sources, both 2048 square:
 #   stemd-icon-mac.png  finished macOS icon: 1648 squircle body (824 pt at 2x,

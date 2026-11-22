@@ -62,7 +62,7 @@ impl Status {
         matches!(self, Self::Available(_))
     }
 
-    /// Whether the slot draws it in the update's gradient.
+    /// Whether the slot draws this status in the update gradient.
     pub fn sheen(&self) -> bool {
         matches!(self, Self::Available(_) | Self::Ready)
     }
@@ -221,7 +221,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn newer_compares_numbers_not_text() {
+    fn newer_compares_versions_numerically() {
         assert!(newer("v0.2.0", "0.1.4"));
         assert!(newer("0.1.10", "0.1.9"));
         assert!(newer("1.0.0", "0.99.99"));

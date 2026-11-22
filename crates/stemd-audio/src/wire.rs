@@ -3,19 +3,20 @@
 use anyhow::Result;
 use flacenc::error::Verified;
 
-/// Multiplier turning `[-1.0, 1.0]` into an `i16`, and the divisor that turns a 16-bit stem back.
-/// One less than 32768, so `+1.0` lands on `i16::MAX` and does not wrap.
+/// The multiplier that turns `[-1.0, 1.0]` into an `i16`, and the divisor that turns a 16-bit stem
+/// back. It is one less than 32768, so `+1.0` lands on `i16::MAX` and does not wrap.
 pub const FLOAT_TO_S16: f32 = 32767.0;
 
-/// Quantise one sample to 16-bit, clamping first: a separated stem can sit outside `[-1.0, 1.0]`.
+/// Quantise one sample to 16 bits, clamping first, since a separated stem can sit outside `[-1.0,
+/// 1.0]`.
 pub fn quantise_s16(v: f32) -> i16 {
     (v.clamp(-1.0, 1.0) * FLOAT_TO_S16).round() as i16
 }
 
-/// Bit depth FLAC stems are written at.
+/// The bit depth of FLAC stems.
 ///
-/// 16 rather than 24: the quantisation floor is already about 60 dB below the
-/// model's own error. FLAC has no float encoding, so `f32le` has no FLAC form.
+/// 16 bits suffice: the quantisation floor is already about 60 dB below the model's own error. FLAC
+/// has no float encoding, so `f32le` has no FLAC form.
 pub const FLAC_BITS: usize = 16;
 
 /// A FLAC encoder configuration at the crate defaults, with `lpc_order` when given.
@@ -31,7 +32,8 @@ pub fn flac_config(lpc_order: Option<usize>) -> Result<Verified<flacenc::config:
         .map_err(|e| anyhow::anyhow!("flac encoder config: {e:?}"))
 }
 
-/// Encode planar float to FLAC at [`FLAC_BITS`], each sample scaled by `gain` and quantised by [`quantise_s16`].
+/// Encode planar float to FLAC at [`FLAC_BITS`], each sample scaled by `gain` and quantised by
+/// [`quantise_s16`].
 pub fn encode_flac(
     planar: &[Vec<f32>],
     sample_rate: u32,

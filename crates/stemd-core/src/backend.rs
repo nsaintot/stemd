@@ -1,7 +1,7 @@
-//! Backend interface.
+//! The interface that every separation backend implements.
 //!
-//! [`MlxSeparator`](crate::mlx::MlxSeparator) is the only implementation; the
-//! trait exists so a second model can be added without touching the server.
+//! [`MlxSeparator`](crate::mlx::MlxSeparator) is the only implementation; the trait lets a second
+//! model be added without changes to the server.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -19,13 +19,12 @@ pub struct BackendInfo {
     pub model: String,
     pub sample_rate: u32,
     pub channels: usize,
-    /// Stems the backend ships, i.e. what crosses the wire. One fewer than
-    /// [`crate::stems::PARTS`]: the missing one is [`crate::stems::DERIVED`],
-    /// which the client reconstructs from the mix.
+    /// The stems the backend sends to the client, one fewer than [`crate::stems::PARTS`]. The
+    /// missing one is [`crate::stems::DERIVED`], which the client rebuilds from the mix.
     pub stems: Vec<String>,
-    /// Where the work runs: "gpu", "cpu".
+    /// Where the work runs: "gpu" or "cpu".
     pub device: String,
-    /// Parts a job may ask for, from [`crate::stems::PART_NAMES`].
+    /// The parts a job may ask for, from [`crate::stems::PART_NAMES`].
     pub parts: Vec<String>,
 }
 

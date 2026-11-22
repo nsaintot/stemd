@@ -22,7 +22,7 @@ use crate::stems::{Parts, Stems, all_parts};
 /// The model's output order.
 pub(crate) const STEMS: [&str; 4] = ["bass", "drums", "other", "vocals"];
 
-/// Index of `name` in [`STEMS`].
+/// The index of `name` in [`STEMS`].
 fn index(name: &str) -> i32 {
     STEMS.iter().position(|s| *s == name).expect("one of STEMS") as i32
 }
@@ -44,9 +44,9 @@ impl RoformerSeparator {
             .with_context(|| format!("loading {artefact} as a BS-RoFormer"))?;
         if model.stems() != STEMS.len() as i32 {
             bail!(
-                "{artefact} separates {} stems, not the {} this path expects",
-                model.stems(),
-                STEMS.len()
+                "{artefact}: expected {} stems, got {}",
+                STEMS.len(),
+                model.stems()
             );
         }
         Ok(Self {
@@ -66,7 +66,7 @@ impl RoformerSeparator {
 }
 
 impl Separate for RoformerSeparator {
-    /// Trained on raw audio, so no track normalisation.
+    /// Trained on raw audio, so it uses no track normalisation.
     fn normalises(&self) -> bool {
         false
     }

@@ -1,5 +1,5 @@
-//! What the window shows until the server is ready: on a first run the choice of
-//! model and its download, then the model loading, or why startup failed.
+//! The view the window shows until the server is ready: on a first run, the model choice and its
+//! download; then the model loading, or why startup failed.
 
 use eframe::egui::{self, Rect, Sense, Stroke, pos2, vec2};
 
@@ -16,7 +16,7 @@ const ROW_GAP: f32 = 8.0;
 const ROW_RADIUS: f32 = 18.0;
 const QUIT_HEIGHT: f32 = 32.0;
 
-/// State the first-run view keeps between frames.
+/// The state the first-run view keeps between frames.
 #[derive(Default)]
 pub struct View {
     motion: Motion,
@@ -24,12 +24,12 @@ pub struct View {
     /// model downloads and loads.
     offered: bool,
     picked: Option<Preset>,
-    /// The last stage drawn, for the main window to fade out over itself.
+    /// The last stage drawn, which the main window fades out over itself.
     pub(super) last: Option<Stage>,
     /// Where the globe sat and how far its slices were spread, for the main
     /// window's globe to start from.
     pub(super) globe: Option<(Rect, f32)>,
-    /// The main window draws the globe now; this view draws everything else.
+    /// True once the main window draws the globe; this view then draws everything else.
     pub(super) globe_handed_off: bool,
 }
 
@@ -216,8 +216,8 @@ pub(super) fn body(
     );
     let sub_height = sub_galley.size().y;
 
-    // Each row's height and the gap under it, once. Without the model rows,
-    // the block sits in the middle.
+    // Measure each row's height and the gap under it once. Without the model rows, the block sits
+    // in the middle.
     let mut column = Column::default();
     let stage_at = column.add(globe::STAGE.y, 6.0);
     let title_at = column.add(title_height, 6.0);

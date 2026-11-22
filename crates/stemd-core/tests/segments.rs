@@ -80,7 +80,7 @@ fn named(stems: &Stems) -> Vec<(&'static str, &Audio)> {
         .collect()
 }
 
-/// Every stem of `got` is bit for bit `want` over `from..to`.
+/// Assert that every stem of `got` matches `want` bit for bit over `from..to`.
 fn same_bits(label: &str, got: &Stems, want: &Stems, from: usize, to: usize) {
     let want = named(want);
     let got = named(got);
@@ -119,7 +119,7 @@ fn segments_in_any_order_match_the_whole_track() {
             .begin(mix.frames(), parts, Normalisation::of(&mix))
             .expect("beginning");
         let n = pass.segments();
-        // From the middle out, as a player that loaded the track at a cue would.
+        // Run from the middle out, as a player that loaded the track at a cue would.
         let order: Vec<usize> = (n / 2..n).chain((0..n / 2).rev()).collect();
         let (from, to) = (9 * 44_100, 11 * 44_100);
         let mut checked_early = false;

@@ -1,4 +1,4 @@
-//! Running a model over a whole track.
+//! Runs a model over a whole track.
 //!
 //! htdemucs sees 7.8 seconds at a time, so a track is cut into overlapping
 //! segments, each separated on its own, and the results crossfaded back together.
@@ -13,18 +13,17 @@ use mlx_rs::{Array, ops};
 
 use crate::htdemucs::HtDemucs;
 
-/// Fraction of a segment shared with its neighbour.
+/// The fraction of a segment shared with its neighbour.
 pub const DEFAULT_OVERLAP: f32 = 0.25;
 
 /// A model that separates one fixed-length chunk of audio.
 ///
-/// The segmenting and crossfade below are the same for any of them, and they
-/// are the part that took three attempts to get right, so a second model gets
-/// this trait rather than a second copy.
+/// The segmenting and crossfade below are the same for every model, so a second model implements
+/// this trait and reuses them.
 pub trait Chunked {
-    /// Samples the model runs on at once.
+    /// The number of samples the model runs on at once.
     fn chunk(&self) -> i32;
-    /// Stems it produces.
+    /// The number of stems it produces.
     fn sources(&self) -> i32;
     /// `[B, C, chunk] -> [B, sources, C, chunk]`.
     fn separate_chunk(&self, chunk: &Array) -> Result<Array>;
@@ -58,12 +57,11 @@ pub struct Grid {
 /// One segment's place on the track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    /// First output sample the segment contributes to.
+    /// The first output sample the segment contributes to.
     pub offset: i32,
-    /// Output samples it contributes, from `offset`.
+    /// The number of output samples it contributes, from `offset`.
     pub take: i32,
-    /// First input sample the model sees. Negative where the window starts
-    /// before the track.
+    /// The first input sample the model sees; negative where the window starts before the track.
     pub start: i32,
 }
 
@@ -77,7 +75,7 @@ impl Placement {
 /// The input samples one segment reads, and the zeros around them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
-    /// First track sample read.
+    /// The first track sample read.
     pub from: i32,
     /// One past the last track sample read.
     pub to: i32,
@@ -113,7 +111,7 @@ impl Grid {
         self.stride
     }
 
-    /// Number of segments.
+    /// The number of segments.
     pub const fn len(&self) -> usize {
         ((self.length + self.stride - 1) / self.stride) as usize
     }
@@ -131,11 +129,10 @@ impl Grid {
     /// Where segment `k` sits.
     pub fn placement(&self, k: usize) -> Placement {
         let offset = k as i32 * self.stride;
-        // A short final chunk is not zero-padded on the right. The window
-        // is centred on it and real audio pulled in from *before* the
-        // offset, with zeros only where that runs off the track. Padding at
-        // the end instead shifts the last segment by half the shortfall,
-        // which is inaudible on its own and nulls at -3 dB.
+        // A short final chunk is not zero-padded on the right. The window is centred on it and
+        // takes real audio from before the offset, with zeros only where that runs off the track.
+        // Padding at the end would shift the last segment by half the shortfall, which is inaudible
+        // on its own and nulls at -3 dB.
         let take = self.segment.min(self.length - offset);
         let delta = self.segment - take;
         Placement {
@@ -235,18 +232,17 @@ impl Accumulator {
         let placement = self.grid.placement(k);
         let (offset, take) = (placement.offset, placement.take);
 
-        // The window was centred on the chunk, so the output is centred
-        // too: sample `delta / 2` is the one that belongs at `offset`.
-        // Taking from zero instead shifts the tail segment half the
-        // shortfall early: inaudible on its own, and worth -4 dB.
+        // The window was centred on the chunk, so the output is centred too: sample `delta / 2`
+        // belongs at `offset`. Taking from zero would shift the tail segment half the shortfall
+        // early, which is inaudible on its own and nulls at -4 dB.
         let trim = offset - placement.start;
         let piece = separated.index((.., .., .., trim..trim + take));
         let w = self.weight.index(0..take).reshape(&[1, 1, 1, take])?;
 
-        //  Read the slice, add into it, write it back. Concatenating zero tensors either
-        //  side would allocate two whole-track tensors per segment: on a six-minute track,
-        //  sixty-eight rounds of half a gigabyte to place seven seconds of audio. The
-        //  scatter-add spelling corrupts strided slices on the MLX this was built against.
+        // Read the slice, add into it, and write it back. Concatenating zero tensors on either side
+        // would allocate two whole-track tensors per segment: on a six-minute track, sixty-eight
+        // rounds of half a gigabyte to place seven seconds of audio. Do not retry the scatter-add
+        // form: it corrupts strided slices in the pinned MLX version.
         let end = offset + take;
         let slice = self.out.index((.., .., .., offset..end));
         self.out.try_index_mut(
@@ -257,10 +253,9 @@ impl Accumulator {
         self.sum_weight
             .try_index_mut(offset..end, ops::add(&covered, self.weight.index(0..take))?)?;
 
-        // MLX is lazy. Without this the segments pile into one unevaluated
-        // expression and the memory it needs is every intermediate of the
-        // whole track at once rather than one segment's. Three segments
-        // would never show it; sixty-eight would.
+        // MLX is lazy. Without this, the segments pile into one unevaluated expression that holds
+        // every intermediate of the whole track in memory at once, which exhausts memory on a
+        // full-length track.
         mlx_rs::transforms::eval([&self.out, &self.sum_weight])?;
         self.done[k] = true;
         Ok(())
@@ -337,10 +332,9 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{Mutex, MutexGuard};
 
-    /// Metal trips on a second command encoder, so anything touching MLX takes
-    /// this first. The integration tests have their own copy of this; two
-    /// unit tests in one binary run in parallel by default and abort the
-    /// process rather than failing, which is a confusing way to find out.
+    /// Metal fails on a second command encoder, so anything that touches MLX takes this lock first.
+    /// The integration tests have their own copy; two unit tests in one binary run in parallel by
+    /// default and would abort the process with no clear failure.
     static GPU: Mutex<()> = Mutex::new(());
 
     fn one_at_a_time() -> MutexGuard<'static, ()> {
@@ -370,9 +364,8 @@ mod tests {
 
     /// A caller that refuses to continue stops the track where it is.
     ///
-    /// This is what cancellation is built on. A progress callback that returned
-    /// nothing would let a caller set a flag only readable after `over_track`
-    /// returned, by which point the whole track has been separated.
+    /// Cancellation relies on this return value; without it, a caller could stop only after
+    /// `over_track` returns, when the whole track has been separated.
     #[test]
     fn refusing_to_continue_stops_at_that_chunk() {
         let _gpu = one_at_a_time();
@@ -394,9 +387,8 @@ mod tests {
 
         assert!(result.is_err(), "over_track ran to completion anyway");
         assert_eq!(seen, 3, "it kept reporting past the refusal");
-        // Three chunks ran before the fourth was refused. The bug this guards
-        // against is not "a few too many" but "all of them", so the assertion
-        // is against the total rather than the exact count.
+        // Three chunks ran before the fourth was refused. The bug this guards against runs all of
+        // them, so the assertion compares against the total, with no exact count.
         assert_eq!(
             model.runs.get(),
             3,
