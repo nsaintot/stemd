@@ -113,6 +113,11 @@ model. The switch thread downloads the weights (up to 672 MB) and then waits for
 worker's answer, so a failed switch can be reported and `/v2/health` never names
 a model the worker has not loaded yet.
 
+The process turns App Nap (macOS) and power throttling (Windows) off for its
+whole run (`throttling.rs`), so the queue runs at full speed while the window
+is hidden or minimized. The hidden window itself does no work: eframe skips the
+UI of a covered or minimized window.
+
 ## API design notes
 
 The reasons behind the contract in [api.md](api.md).

@@ -56,7 +56,7 @@ winit = { version = "0.30.13", default-features = false, features = ["x11"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Free disk space (see `disk.rs`); ShellExecuteW starts the updater's Setup; the
 # registry gives the install mode, and the token says whether the process can
-# elevate.
+# elevate; SetProcessInformation turns power throttling off (see `throttling`).
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -68,10 +68,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Sparkle, through the Objective-C runtime. See `update::sparkle`.
+# Sparkle, through the Objective-C runtime (see `update::sparkle`), and the App
+# Nap opt-out (see `throttling`).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSProcessInfo", "NSString"] }
 
 [target.'cfg(unix)'.dependencies]
 # statvfs and sysctl; see `disk.rs`.
