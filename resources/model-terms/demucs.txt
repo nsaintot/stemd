@@ -1,0 +1,17 @@
+demucs pretrained weights
+
+These weights are a conversion of a demucs pretrained model:
+https://github.com/facebookresearch/demucs
+
+The demucs code is MIT. The weights are not covered by that licence. The
+demucs maintainer wrote: "The model weights are not covered by the MIT
+license, and are provided only for scientific purposes."
+https://github.com/facebookresearch/demucs/issues/327
+
+In https://github.com/facebookresearch/demucs/issues/267 the maintainer wrote:
+"One limitation is the license of the MusDB dataset, which means the
+pre-trained weights are mostly usable for research purpose. Making a real app
+of it is out of the scope of those terms, and so this is not something I can
+officially support through Facebook."
+
+https://github.com/nsaintot/stemd/blob/main/docs/models.md

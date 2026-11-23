@@ -1,0 +1,20 @@
+stemd_roformer
+Copyright 2026 Nicolas Saintot.
+
+The weights in stemd_roformer.safetensors are licensed under the Creative
+Commons Attribution-NonCommercial-ShareAlike 4.0 International licence
+(CC BY-NC-SA 4.0):
+https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+In short:
+
+- You may copy, redistribute, convert and fine-tune the weights.
+- Credit stemd, link to this licence, and say if you changed them.
+- You may not use the weights, or a model derived from them, for commercial
+  purposes.
+- Share a fine-tune or conversion of the weights under this same licence.
+
+The weights are provided as is, without warranty of any kind, as set out in
+section 5 of the licence.
+
+https://github.com/nsaintot/stemd/blob/main/docs/models.md

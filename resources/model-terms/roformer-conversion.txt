@@ -1,0 +1,9 @@
+BS-RoFormer conversion
+
+These weights are a conversion of a published BS-RoFormer checkpoint:
+bs_polarformer from ZFTurbo's model_bs_polarformer_float16.ckpt, and
+bs_roformer_viperx from viperx's model_bs_roformer_ep_317_sdr_12.9755.ckpt.
+
+Its authors publish no terms.
+
+https://github.com/nsaintot/stemd/blob/main/docs/models.md

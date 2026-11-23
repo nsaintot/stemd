@@ -16,12 +16,14 @@
 //! preset     the catalogue: which artefacts exist and their pinned digests
 //! integrity  hashing what is on disk against those digests
 //! download   fetching what is missing
+//! terms      the terms file written beside each model's weights
 //! ```
 
 mod download;
 mod integrity;
 mod load;
 mod preset;
+mod terms;
 
 use std::path::{Path, PathBuf};
 

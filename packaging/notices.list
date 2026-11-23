@@ -1,0 +1,12 @@
+# The notices and licence texts every package ships, one path per line,
+# relative to the repository root. scripts/bundle-app.sh,
+# scripts/package-windows.ps1 and packaging/linux/stage.sh copy them.
+LICENSE-MIT
+LICENSE-APACHE
+packaging/THIRD-PARTY
+packaging/THIRD-PARTY-CRATES
+packaging/licenses/MLX.txt
+packaging/licenses/LGPL-2.0.txt
+packaging/licenses/GPL-3.0.txt
+packaging/licenses/Sparkle.txt
+resources/fonts/InstrumentSans-OFL.txt

@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use super::{READ_CHUNK, download, preset::Preset};
+use super::{READ_CHUNK, download, preset::Preset, terms};
 
 /// A writer that hashes everything it passes to `inner`, so a download is verified as it is
 /// written.
@@ -81,14 +81,14 @@ pub fn mismatched(dir: &Path, preset: Preset) -> Vec<&'static str> {
         .collect()
 }
 
-/// Check `dir` against the pinned digests, repairing the cache if it can.
-///
-/// A downloaded file in the cache that no longer matches its digest is corrupt, so it is deleted
-/// and downloaded again. Outside the cache a mismatch is only reported, because a locally converted
-/// artefact is expected to differ from the published one.
+/// Check `dir` against the pinned digests. In the cache, re-download a mismatch (an error under
+/// `--offline`) and add any missing terms file; elsewhere, only report it.
 pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result<()> {
     let bad = mismatched(dir, preset);
     if bad.is_empty() {
+        if dir == cache {
+            add_missing_terms(dir, preset);
+        }
         return Ok(());
     }
     let what = describe(dir, &bad);
@@ -124,6 +124,15 @@ pub fn verify(dir: &Path, cache: &Path, preset: Preset, offline: bool) -> Result
         );
     }
     Ok(())
+}
+
+/// Write the terms file of each of `preset`'s files in `dir` that lacks one.
+fn add_missing_terms(dir: &Path, preset: Preset) {
+    for file in preset.source().files {
+        if let Err(err) = terms::ensure(dir, file.name) {
+            tracing::warn!("{err:#}");
+        }
+    }
 }
 
 /// Describe which files are missing and which are corrupt; both need replacing, but the causes

@@ -8,29 +8,71 @@ fail with a digest error, so publish a new tag instead.
 | release | files | preset |
 | --- | --- | --- |
 | [models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) | `htdemucs.safetensors`, `htdemucs_ft.safetensors` | Fast, Balanced |
+| [models-v2](https://github.com/nsaintot/stemd/releases/tag/models-v2) | `bs_polarformer.safetensors`, `bs_roformer_viperx.safetensors` | none |
 | [models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) | `stemd_roformer.safetensors` | Quality |
+
+## Terms
+
+stemd's code is MIT OR Apache-2.0, its own model `stemd_roformer` is CC BY-NC-SA
+4.0, and the other models keep the terms their authors give them.
+
+| model | terms |
+| --- | --- |
+| `stemd_roformer` | [CC BY-NC-SA 4.0](#terms-of-stemd_roformer) |
+| `htdemucs`, `htdemucs_ft`, the `models-v1` traces | [research use, from the demucs maintainer](#terms-of-the-demucs-weights) |
+| `bs_polarformer`, `bs_roformer_viperx` | [no published terms](#terms-of-the-roformer-conversions) |
+
+After a download verifies, stemd writes `<artefact>.LICENSE.txt` beside the
+weights with that model's terms, for example `stemd_roformer.LICENSE.txt`.
 
 ## `models-v2`
 
-demucs v4 in safetensors. The files are byte-for-byte copies of
+demucs v4 and two BS-RoFormer models in safetensors. The demucs files are
+byte-for-byte copies of
 [mlx-community's](https://huggingface.co/mlx-community/demucs-mlx) conversions.
 
 | file | preset | bytes | sha256 |
 | --- | --- | --- | --- |
 | `htdemucs.safetensors` | Fast | 168,005,865 | `339d267a7a6983a11eedbdc00413c602a65e9b9103f695fb5c2b2a481cd9d297` |
 | `htdemucs_ft.safetensors` | Balanced | 672,024,519 | `53f03b1ad4b4d211025a35da65460ba61a17547adf9c0544cad0ebcc8d7bbabb` |
+| `bs_polarformer.safetensors` | none | 102,201,832 | `9e08a5e075204e893a4eb393ae64d47177c76f11a306686db1343d7cc7c468f6` |
+| `bs_roformer_viperx.safetensors` | none | 639,109,056 | `fa296577206144929917601636b65ccdc407b6e6c2f209e4312d9d2b7b975a8a` |
 
 ### Provenance
 
-The conversions come from the
+The demucs conversions come from the
 [facebookresearch/demucs](https://github.com/facebookresearch/demucs) pretrained
 models `htdemucs` and `htdemucs_ft`.
 
-The demucs code is MIT. The pretrained weights are distributed separately from
-that repository and carry no explicit licence. The question was asked in
-[demucs#327](https://github.com/facebookresearch/demucs/issues/327) in 2022 and
-went unanswered, and the repository is now archived. These artefacts are
-derived works of those weights and are published on that understanding.
+`tools/export/convert_roformer.py` converts the two RoFormer checkpoints with
+the architecture and config from
+[ZFTurbo/Music-Source-Separation-Training](https://github.com/ZFTurbo/Music-Source-Separation-Training):
+`bs_polarformer` from ZFTurbo's `model_bs_polarformer_float16.ckpt`, and
+`bs_roformer_viperx` from viperx's `model_bs_roformer_ep_317_sdr_12.9755.ckpt`.
+No preset of this version loads them. stemd keeps both files, because 0.2.0's
+Quality preset loads `bs_polarformer` and older builds pin
+`bs_roformer_viperx`.
+
+### Terms of the demucs weights
+
+The demucs code is MIT. The weights are not covered by that licence. The demucs
+maintainer wrote:
+
+- [demucs#327](https://github.com/facebookresearch/demucs/issues/327): "The
+  model weights are not covered by the MIT license, and are provided only for
+  scientific purposes."
+- [demucs#508](https://github.com/facebookresearch/demucs/issues/508): "Weights
+  are provided for research purpose!"
+- [demucs#267](https://github.com/facebookresearch/demucs/issues/267):
+  "One limitation is the license of the MusDB dataset, which means the
+  pre-trained weights are mostly usable for research purpose. Making a real app
+  of it is out of the scope of those terms, and so this is not something I can
+  officially support through Facebook."
+
+### Terms of the RoFormer conversions
+
+The authors of `bs_polarformer` and `bs_roformer_viperx` publish no terms for
+these weights.
 
 ## `models-v3`
 
@@ -44,20 +86,20 @@ derived works of those weights and are published on that understanding.
 | Output | bass, drums, other, vocals; stemd ships drums and vocals and builds harmonics as the remainder |
 | Release | [models-v3](https://github.com/nsaintot/stemd/releases/tag/models-v3) |
 
-### Terms
+### Terms of `stemd_roformer`
 
 Copyright 2026 Nicolas Saintot.
 
 The weights in `stemd_roformer.safetensors` are licensed under the
-[Creative Commons Attribution-NonCommercial 4.0 International
-licence](https://creativecommons.org/licenses/by-nc/4.0/legalcode) (CC BY-NC
-4.0). In short:
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+licence](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode) (CC
+BY-NC-SA 4.0). In short:
 
 - You may copy, redistribute, convert and fine-tune the weights.
 - Credit stemd, link to this licence, and say if you changed them.
 - You may not use the weights, or a model derived from them, for commercial
-  purposes. Selling them, bundling them in a paid product, or offering a paid
-  service built on them needs written permission.
+  purposes.
+- Share a fine-tune or conversion of the weights under this same licence.
 
 These terms cover the model only. They place no restriction on the audio
 produced with it: stems separated by stemd, or by any other software running
@@ -69,16 +111,14 @@ at your choice; the other models stemd downloads carry their own terms, listed
 above.
 
 Training data includes MUSDB18-HQ (train split), MoisesDB, Slakh2100 and CC0
-recordings. Some of these datasets allow non-commercial research use only,
-which is why the weights are non-commercial. No MUSDB18-HQ test track was used
-for training.
+recordings. MoisesDB is CC BY-NC-SA 4.0 and MUSDB18-HQ contains CC BY-NC-SA
+tracks, so the weights carry the same terms. The training data allows
+non-commercial use only, so no commercial licence can be given. No MUSDB18-HQ
+test track was used for training.
 
 The weights are provided as is, without warranty of any kind, and the licensor
-is not liable for any damages arising from their use, as set out in sections 5
-and 6 of the licence.
-
-To ask about commercial use, open an issue on
-[nsaintot/stemd](https://github.com/nsaintot/stemd/issues).
+is not liable for any damages arising from their use, as set out in section 5
+of the licence.
 
 ## Retired
 
@@ -94,4 +134,4 @@ falls back to the default preset with an explanation.
 | `hdemucs_mmi_mps.json` | | 296 B | `00b131cc07b352f977c005485b991502d13f8c05a44813c3b3fe6169e2a18688` |
 
 They were traced from the demucs pretrained models `htdemucs` (v4) and
-`hdemucs_mmi`, under the same terms as `models-v2`.
+`hdemucs_mmi`, under the same terms as the demucs files in `models-v2`.

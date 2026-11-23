@@ -1,0 +1,89 @@
+Third-party components in stemd packages
+========================================
+
+stemd itself is under MIT or Apache-2.0, at your option: LICENSE-MIT and
+LICENSE-APACHE beside this file. The models are not covered by that licence.
+stemd's own model, stemd_roformer, is CC BY-NC-SA 4.0, and the other models
+keep the terms their authors give them. Each model's terms sit beside its
+weights as <artefact>.LICENSE.txt.
+
+Each entry names the packages that contain it:
+
+  all       every package
+  macOS     Stemd.app
+  Windows   the installer and the zip
+  Linux     the deb, the rpm and the AppImage
+
+Licence texts beside this file:
+
+  THIRD-PARTY-CRATES        the Rust crates and the text of each crate's licence
+  MLX.txt                   MLX and the libraries built into it
+  InstrumentSans-OFL.txt    SIL Open Font License 1.1
+  LGPL-2.0.txt              GNU Library General Public License version 2
+  GPL-3.0.txt               GNU General Public License version 3, which the
+                            LGPL-3.0 text in THIRD-PARTY-CRATES supplements
+  Sparkle.txt               Sparkle
+  LICENSE-APACHE            Apache License 2.0
+
+Rust crates (all), compiled into stemd-server and stemd-cli
+  Listed by licence, with each licence text, in THIRD-PARTY-CRATES.
+  scripts/crate-notices.sh generates that file with cargo-about.
+
+MLX 0.31.2 (all), compiled into stemd-server
+  Copyright 2023 Apple Inc. MIT. MLX builds in mlx-c, fmt, nlohmann/json and
+  gguf-tools (MIT) on every platform; metal-cpp (Apache-2.0) on macOS; NVIDIA
+  cudnn-frontend (MIT), NVTX (Apache-2.0 with LLVM exceptions) and CUTLASS
+  (BSD-3-Clause) on Windows and Linux; and dlfcn-win32 (MIT) on Windows. The
+  texts are in MLX.txt.
+
+Instrument Sans (all), compiled into stemd-server
+  Copyright 2022 The Instrument Sans Project Authors. SIL Open Font License
+  1.1, text in InstrumentSans-OFL.txt.
+
+LAME 3.100 (all), statically linked into stemd-server
+  LGPL-2.0 (GNU Library General Public License version 2), text in
+  LGPL-2.0.txt. Source: https://lame.sourceforge.io/
+  The Rust bindings, mp3lame-sys and mp3lame-encoder, are LGPL-3.0; see
+  THIRD-PARTY-CRATES. The source of stemd is at https://github.com/nsaintot/stemd,
+  and docs/building.md there shows how to rebuild stemd-server, so it can be
+  relinked against a modified LAME.
+
+Sparkle 2.10.0 (macOS), Contents/Frameworks/Sparkle.framework
+  MIT, with the notices of the code it includes. Text in Sparkle.txt.
+
+NVIDIA CUDA runtime libraries (Linux: lib/libcudart*, libcublas*, libcufft*,
+libnvrtc*, libnvJitLink*) and CUDA headers (Windows and Linux: cuda/include)
+  Copyright NVIDIA Corporation. Redistributed unmodified under the CUDA
+  Toolkit End User License Agreement:
+  https://docs.nvidia.com/cuda/eula/index.html
+  On Windows, install-cuda.cmd downloads the runtime libraries from NVIDIA.
+
+NVIDIA cuDNN (Linux: lib/libcudnn*)
+  Copyright NVIDIA Corporation. Redistributed unmodified under the NVIDIA cuDNN
+  Software License Agreement:
+  https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html
+  For use on systems with NVIDIA GPUs only.
+
+NVIDIA CCCL (Windows and Linux: include/cccl)
+  Apache License 2.0 with LLVM exceptions:
+  https://github.com/NVIDIA/cccl/blob/main/LICENSE
+
+OpenBLAS (Windows: libopenblas.dll; Linux: lib/libopenblas*)
+  BSD-3-Clause.
+
+LAPACK and the GNU Fortran runtime (Linux: lib/libblas*, liblapack*,
+libgfortran*, libquadmath*)
+  LAPACK: BSD-3-Clause (modified). libgfortran and libquadmath: GPL-3.0 with
+  the GCC Runtime Library Exception. Taken from Ubuntu 22.04.
+
+Microsoft Visual C++ runtime (Windows: msvcp140*.dll, vcruntime140*.dll,
+concrt140.dll, vccorlib140.dll)
+  Copyright Microsoft Corporation. Redistributed unmodified under the
+  Microsoft Visual Studio licence terms for distributable code.
+
+Avahi compatibility library (Linux: lib/libdns_sd*, libavahi-*)
+  LGPL-2.1-or-later. Taken from Ubuntu 22.04.
+
+crates/stemd-core/data/mode1_*.bin (all), compiled into stemd-server
+  Filter coefficients recovered by measurement of third-party hardware rather
+  than authored, so the stemd licence does not purport to cover them.
