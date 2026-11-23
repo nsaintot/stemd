@@ -48,6 +48,7 @@ mod state;
 mod switch;
 #[cfg(test)]
 mod testkit;
+mod throttling;
 mod ui;
 mod update;
 mod whole;
@@ -78,6 +79,8 @@ fn main() -> Result<()> {
         Some(addr) => (endpoint::bind(addr)?, None),
         None => endpoint::bind_saved(settings.get().port)?,
     };
+    // Held for the whole run, so a hidden window never slows the server down.
+    let _full_speed = throttling::opt_out();
     if config.headless {
         serve::headless(&config, logs, settings, listener, taken)
     } else {
