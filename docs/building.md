@@ -248,7 +248,7 @@ a prebuilt copy of MLX instead.
 
 On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
 
-`mlx-sys` patches MLX's CUDA backend in three places:
+`mlx-sys` patches MLX's CUDA backend in four places:
 
 - the allocator and events, so that a CUDA build also runs on the CPU of a
   machine without a CUDA device. CD checks this with a CPU separation on the
@@ -257,6 +257,8 @@ On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
   machine with two GPU generations does not load the other one's kernels.
 - cuSOLVER, which is left out: MLX uses it for Cholesky alone, and it would add
   about 340 MB of libraries to each package. Cholesky runs on the CPU.
+- the MXFP8 quantize kernel for Blackwell, left out on Windows because MSVC
+  cannot compile it. Windows uses the fallback kernel.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
 compiler, nvcc, cuDNN and the GPU architectures. On Windows it records only
@@ -271,9 +273,7 @@ re-running the failed job picks up where it stopped.
 GPU architectures: Linux and Windows x86_64 use `75;80;86;89;90a;120` (Turing
 through Blackwell), and Linux aarch64 uses `90a;100;121` (Grace Hopper, Grace
 Blackwell, DGX Spark). The list has `90a` in place of `90` because MLX builds
-its Hopper-only kernels for `90a` alone. Windows skips the Hopper quantized
-matmul kernels (`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile, so
-Hopper GPUs use the sm80 kernels there.
+its Hopper-only kernels for `90a` alone.
 
 ### macOS bundle
 
