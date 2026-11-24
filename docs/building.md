@@ -248,7 +248,7 @@ a prebuilt copy of MLX instead.
 
 On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
 
-`mlx-sys` patches MLX's CUDA backend in four places:
+`mlx-sys` patches MLX's CUDA backend in five places:
 
 - the allocator and events, so that a CUDA build also runs on the CPU of a
   machine without a CUDA device. CD checks this with a CPU separation on the
@@ -259,6 +259,9 @@ On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
   about 340 MB of libraries to each package. Cholesky runs on the CPU.
 - the MXFP8 quantize kernel for Blackwell, left out on Windows because MSVC
   cannot compile it. Windows uses the fallback kernel.
+- the allocator cache, which keeps host and device buffers apart on Windows.
+  Without this, kernels end up reading buffers from system memory, and a
+  server gets slower with every track.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
 compiler, nvcc, cuDNN and the GPU architectures. On Windows it records only
