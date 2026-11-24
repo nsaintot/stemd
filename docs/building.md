@@ -246,18 +246,22 @@ a prebuilt copy of MLX instead.
 | `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
-On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
-and `dl.lib`.
+On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
 
-`mlx-sys` patches MLX's CUDA allocator so that a CUDA build also runs on the CPU
-of a machine without a CUDA device. CD checks this with a CPU separation on the
-Linux and Windows runners, which have no GPU.
+`mlx-sys` patches MLX's CUDA backend in three places:
+
+- the allocator and events, so that a CUDA build also runs on the CPU of a
+  machine without a CUDA device. CD checks this with a CPU separation on the
+  Linux and Windows runners, which have no GPU.
+- the kernel cache, which gets one directory per GPU architecture, so that a
+  machine with two GPU generations does not load the other one's kernels.
+- cuSOLVER, which is left out: MLX uses it for Cholesky alone, and it would add
+  about 340 MB of libraries to each package. Cholesky runs on the CPU.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
-compiler, nvcc, cuDNN, the GPU architectures and the RMSNorm patch. On Windows
-it records only `msvc` as the compiler, because newer MSVC toolsets link
-libraries built by older ones. `mlx-sys` refuses a prebuilt that does not match
-its own build.
+compiler, nvcc, cuDNN and the GPU architectures. On Windows it records only
+`msvc` as the compiler, because newer MSVC toolsets link libraries built by
+older ones. `mlx-sys` refuses a prebuilt that does not match its own build.
 
 To make a new prebuilt, bump `MLX_PREBUILT_TAG`, push that tag, and copy the
 SHA-256 lines from the run summary into `mlx-prebuilt.env`. A runner can hit its

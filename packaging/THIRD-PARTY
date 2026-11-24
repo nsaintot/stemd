@@ -29,7 +29,7 @@ Rust crates (all), compiled into stemd-server and stemd-cli
   Listed by licence, with each licence text, in THIRD-PARTY-CRATES.
   scripts/crate-notices.sh generates that file with cargo-about.
 
-MLX 0.31.2 (all), compiled into stemd-server
+MLX 0.32.4 (all), compiled into stemd-server
   Copyright 2023 Apple Inc. MIT. MLX builds in mlx-c, fmt, nlohmann/json and
   gguf-tools (MIT) on every platform; metal-cpp (Apache-2.0) on macOS; NVIDIA
   cudnn-frontend (MIT), NVTX (Apache-2.0 with LLVM exceptions) and CUTLASS

@@ -26,8 +26,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-24.04, platform: linux/amd64 }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64 }
+          - { arch: x86_64, runner: ubuntu-24.04, platform: linux/amd64, jobs: 3 }
+          # The arm runner dies at 3 parallel CUDA compiles.
+          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64, jobs: 2 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 355
     steps:
@@ -59,7 +60,7 @@ jobs:
           timeout --signal=TERM -k 2m 300m docker run --rm --init --name mlx -v "$PWD:/work" \
               -e CCACHE_DIR=/work/.ccache -e CCACHE_MAXSIZE=3G \
               -e CMAKE_CUDA_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -e CMAKE_BUILD_PARALLEL_LEVEL=3 -e CARGO_BUILD_JOBS=3 \
+              -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} -e CARGO_BUILD_JOBS=${{ matrix.jobs }} \
               stemd-linux "packaging/prebuilt.sh build /work/dist && ccache -s"
       - name: Own the cache
         if: always()
