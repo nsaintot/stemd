@@ -87,6 +87,10 @@ Stemd is two things in one program:
 Every link opens the latest release. The first run downloads the model
 weights, 168 MB to 672 MB depending on the preset.
 
+On Windows and Linux x86_64, the GPU must be an NVIDIA card of compute
+capability 7.5 or later: the GTX 16 and RTX 20 series and newer. Older cards
+run on the CPU.
+
 **macOS.** Open the disk image and drag Stemd to Applications. The app is
 signed and notarized, and the ticket is stapled, so the first launch needs no
 network.

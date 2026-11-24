@@ -99,8 +99,8 @@ packaging/linux/build.sh         # Linux: .deb, .rpm and .AppImage from it
 `MLX_CUDA_ARCHITECTURES` sets which GPUs the result runs on, and it has the
 largest effect on package size and build time. When it is unset, MLX builds only
 for the GPU in the build machine, and the package starts nowhere else. The
-released artefacts use the lists in `packaging/mlx-prebuilt.env`; five
-architectures take about two and a half hours on sixteen cores.
+released artefacts use the lists in `packaging/mlx-prebuilt.env`; six
+architectures take about three hours on sixteen cores.
 
 The Windows installer offers two modes. The default, Just for me, installs into
 `%LOCALAPPDATA%\Programs\Stemd`; the all-users mode installs into Program Files.
@@ -264,7 +264,7 @@ SHA-256 lines from the run summary into `mlx-prebuilt.env`. A runner can hit its
 6 h limit before the kernels are compiled. The compile goes through ccache, so
 re-running the failed job picks up where it stopped.
 
-GPU architectures: Linux and Windows x86_64 use `80;86;89;90a;120` (Ampere
+GPU architectures: Linux and Windows x86_64 use `75;80;86;89;90a;120` (Turing
 through Blackwell), and Linux aarch64 uses `90a;100;121` (Grace Hopper, Grace
 Blackwell, DGX Spark). The list has `90a` in place of `90` because MLX builds
 its Hopper-only kernels for `90a` alone. Windows skips the Hopper quantized
