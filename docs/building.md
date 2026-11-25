@@ -246,18 +246,27 @@ a prebuilt copy of MLX instead.
 | `MLX_PREBUILT_OUT` | `mlx-sys` copies the MLX libraries and a manifest there after a build |
 | `MLX_PREBUILT_DIR` | `mlx-sys` links from there and skips CMake |
 
-On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`)
-and `dl.lib`.
+On Windows, the prebuilt also carries OpenBLAS (`libopenblas.lib` and `.dll`).
 
-`mlx-sys` patches MLX's CUDA allocator so that a CUDA build also runs on the CPU
-of a machine without a CUDA device. CD checks this with a CPU separation on the
-Linux and Windows runners, which have no GPU.
+`mlx-sys` patches MLX's CUDA backend in five places:
+
+- the allocator and events, so that a CUDA build also runs on the CPU of a
+  machine without a CUDA device. CD checks this with a CPU separation on the
+  Linux and Windows runners, which have no GPU.
+- the kernel cache, which gets one directory per GPU architecture, so that a
+  machine with two GPU generations does not load the other one's kernels.
+- cuSOLVER, which is left out: MLX uses it for Cholesky alone, and it would add
+  about 340 MB of libraries to each package. Cholesky runs on the CPU.
+- the MXFP8 quantize kernel for Blackwell, left out on Windows because MSVC
+  cannot compile it. Windows uses the fallback kernel.
+- the allocator cache, which keeps host and device buffers apart on Windows.
+  Without this, kernels end up reading buffers from system memory, and a
+  server gets slower with every track.
 
 The manifest records the `mlx-sys` version, the MLX tag, the target, the C++
-compiler, nvcc, cuDNN, the GPU architectures and the RMSNorm patch. On Windows
-it records only `msvc` as the compiler, because newer MSVC toolsets link
-libraries built by older ones. `mlx-sys` refuses a prebuilt that does not match
-its own build.
+compiler, nvcc, cuDNN and the GPU architectures. On Windows it records only
+`msvc` as the compiler, because newer MSVC toolsets link libraries built by
+older ones. `mlx-sys` refuses a prebuilt that does not match its own build.
 
 To make a new prebuilt, bump `MLX_PREBUILT_TAG`, push that tag, and copy the
 SHA-256 lines from the run summary into `mlx-prebuilt.env`. A runner can hit its
@@ -267,9 +276,7 @@ re-running the failed job picks up where it stopped.
 GPU architectures: Linux and Windows x86_64 use `75;80;86;89;90a;120` (Turing
 through Blackwell), and Linux aarch64 uses `90a;100;121` (Grace Hopper, Grace
 Blackwell, DGX Spark). The list has `90a` in place of `90` because MLX builds
-its Hopper-only kernels for `90a` alone. Windows skips the Hopper quantized
-matmul kernels (`MLX_DISABLE_SM90A_KERNELS`), which MSVC cannot compile, so
-Hopper GPUs use the sm80 kernels there.
+its Hopper-only kernels for `90a` alone.
 
 ### macOS bundle
 

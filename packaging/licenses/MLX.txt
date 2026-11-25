@@ -3,7 +3,7 @@ stemd-cli. metal-cpp (macOS) and NVTX (Windows, Linux) are Apache-2.0, whose
 text is in LICENSE-APACHE.
 
 ==============================================================================
-MLX 0.31.2, all platforms. https://github.com/ml-explore/mlx
+MLX 0.32.4, all platforms. https://github.com/ml-explore/mlx
 ==============================================================================
 
 MIT License
